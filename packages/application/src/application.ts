@@ -402,14 +402,22 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteGrant(grantId: string, provenance: Provenance): Promise<void> {
+    if (!this.orgRoot) {
+      // Inspect before touching: org-domain rows are not ours to delete, and
+      // a delete-then-undo would leave a window where the row is missing.
+      const target = (await this.storage.listGrants()).find(
+        (r) => r.id === grantId,
+      );
+      if (!target) {
+        throw new ProviderWriteRejectedError("grant not found", "not_found");
+      }
+      if (isGlobalScope(target.scope)) {
+        this.requireOrgRoot("a global-scope grant");
+      }
+    }
     const row = await this.storage.deleteGrant(grantId);
     if (!row) {
       throw new ProviderWriteRejectedError("grant not found", "not_found");
-    }
-    if (isGlobalScope(row.scope) && !this.orgRoot) {
-      // Undo before anyone observes: org-domain rows are not ours to delete.
-      await this.storage.insertGrant(row);
-      this.requireOrgRoot("a global-scope grant");
     }
     await this.audit(provenance, "grant.delete", grantId, {
       subject: row.subject,
@@ -455,13 +463,20 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteRevoke(revokeId: string, provenance: Provenance): Promise<void> {
+    if (!this.orgRoot) {
+      const target = (await this.storage.listRevokes()).find(
+        (r) => r.id === revokeId,
+      );
+      if (!target) {
+        throw new ProviderWriteRejectedError("revoke not found", "not_found");
+      }
+      if (isGlobalScope(target.scope)) {
+        this.requireOrgRoot("a global-scope revoke");
+      }
+    }
     const row = await this.storage.deleteRevoke(revokeId);
     if (!row) {
       throw new ProviderWriteRejectedError("revoke not found", "not_found");
-    }
-    if (isGlobalScope(row.scope) && !this.orgRoot) {
-      await this.storage.insertRevoke(row);
-      this.requireOrgRoot("a global-scope revoke");
     }
     await this.audit(provenance, "revoke.delete", revokeId, {
       userId: row.userId,
@@ -493,6 +508,20 @@ export class AlfizApplication implements AlfizProvider {
           `role ${JSON.stringify(role.name)} is not requestable`,
           "validation",
         );
+      }
+      const scope = input.scope ?? GLOBAL_SCOPE;
+      if (!isGlobalScope(scope)) {
+        // Approval writes the row without re-validation, so the same
+        // grantability rule as createGrant must hold at submission.
+        const grantable = role.patterns.some(
+          (p) => this.catalog.validateGrantableAt(p, scope) === null,
+        );
+        if (!grantable) {
+          throw new ProviderWriteRejectedError(
+            `role ${JSON.stringify(role.name)} has no pattern grantable at ${scope}`,
+            "validation",
+          );
+        }
       }
       return {
         prompts: role.requestable.prompts ?? [],

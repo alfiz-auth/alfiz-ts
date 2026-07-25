@@ -268,6 +268,27 @@ describe("scope-type (pattern) requests", () => {
     ).rejects.toThrow(/missing answer/);
   });
 
+  it("role requests at a scope validate grantability at submission (approval skips re-validation)", async () => {
+    const { app } = await setup();
+    // A role whose only pattern is global-only (docs.admin.* declares no scopes).
+    const globalOnly = await app.createRole(
+      {
+        name: "Settings",
+        patterns: ["docs.admin.manage_settings"],
+        requestable: { stages: [{ kind: "management" }] },
+      },
+      admin,
+    );
+    await expect(
+      app.submitRequest({
+        requesterUserId: "requester",
+        roleId: globalOnly.id,
+        scope: "docs.folder:9",
+        justification: {},
+      }),
+    ).rejects.toThrow(/no pattern grantable/);
+  });
+
   it("rejects requests at scope types that never declared requestability", async () => {
     const { app } = await setup();
     await expect(

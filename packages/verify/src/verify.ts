@@ -154,7 +154,12 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
     const gatedFunctions = new Set<ts.Node>();
     const exportedAsyncFunctions: Array<{ node: ts.Node; name: string }> = [];
 
-    const enclosingFunction = (node: ts.Node): ts.Node | null => {
+    /**
+     * Every function enclosing the node, innermost outward: a gate inside a
+     * transaction callback still gates the exported action that runs it.
+     */
+    const enclosingFunctions = (node: ts.Node): ts.Node[] => {
+      const out: ts.Node[] = [];
       let current: ts.Node | undefined = node.parent;
       while (current) {
         if (
@@ -163,11 +168,11 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
           ts.isArrowFunction(current) ||
           ts.isMethodDeclaration(current)
         ) {
-          return current;
+          out.push(current);
         }
         current = current.parent;
       }
-      return null;
+      return out;
     };
 
     const visit = (node: ts.Node): void => {
@@ -184,8 +189,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
       if (ts.isCallExpression(node)) {
         const name = calleeName(node.expression);
         if (name !== null && (gates.has(name) || visibility.has(name))) {
-          const fn = enclosingFunction(node);
-          if (fn) gatedFunctions.add(fn);
+          for (const fn of enclosingFunctions(node)) gatedFunctions.add(fn);
 
           for (const arg of node.arguments) {
             for (const literal of literalsIn(arg)) {

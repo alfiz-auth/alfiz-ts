@@ -141,6 +141,7 @@ describe("org-root gating", () => {
       provenance: admin,
     });
     expect(scoped.scope).toBe("docs.folder:9");
+    await app.deleteGrant(scoped.id, admin);
     const revoke = await app.createRevoke({
       userId: "u1",
       pattern: "docs.*",
@@ -150,6 +151,35 @@ describe("org-root gating", () => {
     expect(revoke.scope).toBe("docs.folder:9");
     const caps = await app.capabilities();
     expect(caps.orgRoot).toBe(false);
+  });
+
+  it("non-root deletion of a global row is rejected without disturbing the row", async () => {
+    const { app, storage } = makeApp({ orgRoot: false });
+    // A synced global row (as the read model would hold it).
+    await storage.insertGrant({
+      id: "synced-1",
+      subject: "user:u1",
+      pattern: "docs.files.read",
+      scope: "*",
+      provenance: { kind: "system", note: "synced from org root" },
+      createdAt: 0,
+    });
+    await expect(app.deleteGrant("synced-1", admin)).rejects.toMatchObject({
+      code: "not_org_root",
+    });
+    expect((await app.listGrants({ subject: "user:u1" })).length).toBe(1);
+    await storage.insertRevoke({
+      id: "synced-r1",
+      userId: "u1",
+      pattern: "docs.*",
+      scope: "*",
+      provenance: { kind: "system" },
+      createdAt: 0,
+    });
+    await expect(app.deleteRevoke("synced-r1", admin)).rejects.toMatchObject({
+      code: "not_org_root",
+    });
+    expect((await app.listRevokes({ userId: "u1" })).length).toBe(1);
   });
 });
 

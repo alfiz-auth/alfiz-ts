@@ -130,6 +130,21 @@ describe("ungated-action", () => {
     });
     expect(byRule(report.issues, "ungated-action")).toEqual([]);
   });
+
+  it("a gate inside a nested callback still gates the enclosing action", () => {
+    const report = run({
+      "app/actions.ts": `
+        "use server";
+        export async function moveThing(id: string) {
+          return withTransaction(async (tx) => {
+            await gateAction("docs.files.update_file");
+            return tx.save(id);
+          });
+        }
+      `,
+    });
+    expect(byRule(report.issues, "ungated-action")).toEqual([]);
+  });
 });
 
 describe("unreferenced-leaf", () => {
