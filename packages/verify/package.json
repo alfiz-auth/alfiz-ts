@@ -1,0 +1,32 @@
+{
+  "name": "@alfiz/verify",
+  "version": "0.1.0",
+  "description": "Static verification for Alfiz deployments: call-site keys checked against the catalog, gate-shape linting, coverage linting, catalog linting, and the client-reach guard for service keys. The four-point checklist enforced by tooling, not discipline.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "alfiz-verify": "./dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@alfiz/core": "0.1.0"
+  },
+  "peerDependencies": {
+    "typescript": ">=5.5"
+  }
+}

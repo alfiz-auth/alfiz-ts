@@ -146,7 +146,11 @@ type KeysUnder<G, Prefix extends string> =
       : never)
   | (G extends { groups?: infer S }
       ? S extends Record<string, unknown>
-        ? { [K in StringKeys<S>]: KeysUnder<S[K], `${Prefix}.${K}`> }[StringKeys<S>]
+        ? string extends StringKeys<S>
+          ? `${Prefix}.${string}` // broad (non-literal) input: stop recursing
+          : {
+              [K in StringKeys<S>]: KeysUnder<S[K], `${Prefix}.${K}`>;
+            }[StringKeys<S>]
         : never
       : never);
 
@@ -154,9 +158,11 @@ type GroupPathsUnder<G, Prefix extends string> =
   | Prefix
   | (G extends { groups?: infer S }
       ? S extends Record<string, unknown>
-        ? {
-            [K in StringKeys<S>]: GroupPathsUnder<S[K], `${Prefix}.${K}`>;
-          }[StringKeys<S>]
+        ? string extends StringKeys<S>
+          ? `${Prefix}.${string}` // broad (non-literal) input: stop recursing
+          : {
+              [K in StringKeys<S>]: GroupPathsUnder<S[K], `${Prefix}.${K}`>;
+            }[StringKeys<S>]
         : never
       : never);
 
@@ -646,6 +652,32 @@ export function defineCatalog<const C extends CatalogInput>(
     groups: sortedGroups,
     scopeTypes,
     navigation: buildNav(input.navigation ?? []),
+  });
+}
+
+/**
+ * Rebuilds a Catalog from its published wire shape — the read-model side of
+ * catalog publishing: registries, tooling, and the static verifier consume
+ * documents, not source modules. Derived types are erased to `string`
+ * (a document is data, not a literal), hence `AnyCatalog`.
+ */
+export function catalogFromDocument(document: CatalogDocument): AnyCatalog {
+  if (document.formatVersion !== 1) {
+    throw new CatalogError([
+      {
+        severity: "error",
+        path: String(document.namespace),
+        message: `unknown catalog format ${String(document.formatVersion)}`,
+      },
+    ]);
+  }
+  return new Catalog({
+    namespace: document.namespace,
+    namespaces: [...document.namespaces],
+    leaves: new Map(document.leaves.map((l) => [l.key, l])),
+    groups: new Map(document.groups.map((g) => [g.path, g])),
+    scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
+    navigation: document.navigation,
   });
 }
 

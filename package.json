@@ -8,11 +8,10 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build --workspaces --if-present",
+    "build": "tsc -b packages/core packages/application packages/prisma packages/verify",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "npm run typecheck --workspaces --if-present",
-    "lint": "npm run lint --workspaces --if-present"
+    "typecheck": "npm run build"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
