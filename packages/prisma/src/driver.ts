@@ -1,0 +1,537 @@
+/**
+ * The Prisma storage driver: implements the storage seam over the structural
+ * delegate surface in delegates.ts, so it runs against any generated Prisma
+ * client (Postgres, MySQL, SQLite, …) without depending on `@prisma/client`.
+ *
+ * Mapping rules, applied uniformly at this boundary:
+ *   - Optional core fields (`field?: T | undefined`) ↔ nullable columns:
+ *     `null` becomes `undefined` on read, `undefined` becomes `null` (or an
+ *     omitted Json field) on write.
+ *   - Epoch-ms `number` fields ↔ BigInt columns, converted losslessly with
+ *     `BigInt()` / `Number()` (epoch ms sit well inside 2^53).
+ *   - Json columns round-trip the core payloads (provenance, patterns,
+ *     stages, …) through two typed helpers; no `any` reaches the surface.
+ *   - Edge tables (AlfizMembership, AlfizGroupParent) are reconciled on
+ *     upsert: rows no longer present are deleted, new ones inserted.
+ *
+ * Like every driver, this one stores and retrieves; it never interprets.
+ * Ids and semantics are the Application's.
+ */
+
+import type {
+  AccessRequest,
+  ApprovalStage,
+  AuditEvent,
+  CatalogDocument,
+  GrantRow,
+  Provenance,
+  RequestDecision,
+  RevokeRow,
+  RoleRecord,
+  UserGroup,
+} from "@alfiz/core";
+import type {
+  AuditFilter,
+  GrantFilter,
+  RequestStorageFilter,
+  StorageDriver,
+  StoredUser,
+} from "@alfiz/application";
+import type {
+  AlfizAuditCreateData,
+  AlfizAuditRecord,
+  AlfizGrantCreateData,
+  AlfizGrantRecord,
+  AlfizGrantWhere,
+  AlfizGroupRecord,
+  AlfizPrismaDelegates,
+  AlfizRequestData,
+  AlfizRequestRecord,
+  AlfizRoleCreateData,
+  AlfizRoleRecord,
+  AlfizUserRecord,
+  JsonValue,
+} from "./delegates.js";
+
+export interface PrismaDriverOptions {
+  /**
+   * Cross-node serialization for graph writes. In-process, the default
+   * promise-chain mutex is enough; a MULTI-NODE deployment must pass a
+   * database advisory lock here (e.g. Postgres:
+   * `SELECT pg_advisory_xact_lock(hashtext($key))` inside a transaction
+   * wrapping `fn`), or two nodes can jointly write a graph cycle that each
+   * would have rejected alone.
+   */
+  lock?: (<T>(key: string, fn: () => Promise<T>) => Promise<T>) | undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Boundary helpers — the only casts in the package, kept in one place.
+// ---------------------------------------------------------------------------
+
+/** Core payloads (provenance, stages, …) are JSON-shaped by contract. */
+const toJson = (value: unknown): JsonValue => value as JsonValue;
+const fromJson = <T>(value: unknown): T => value as T;
+
+const toBig = (value: number): bigint => BigInt(value);
+const optToBig = (value: number | undefined): bigint | null =>
+  value === undefined ? null : BigInt(value);
+const optFromBig = (value: bigint | null): number | undefined =>
+  value === null ? undefined : Number(value);
+const optFromStr = (value: string | null): string | undefined =>
+  value === null ? undefined : value;
+
+// ---------------------------------------------------------------------------
+// Row mappings
+// ---------------------------------------------------------------------------
+
+const grantToDb = (row: GrantRow): AlfizGrantCreateData => ({
+  id: row.id,
+  subject: row.subject,
+  roleId: row.roleId ?? null,
+  pattern: row.pattern ?? null,
+  scope: row.scope,
+  expiresAt: optToBig(row.expiresAt),
+  provenance: toJson(row.provenance),
+  createdAt: toBig(row.createdAt),
+});
+
+const grantFromDb = (row: AlfizGrantRecord): GrantRow => ({
+  id: row.id,
+  subject: row.subject,
+  roleId: optFromStr(row.roleId),
+  pattern: optFromStr(row.pattern),
+  scope: row.scope,
+  expiresAt: optFromBig(row.expiresAt),
+  provenance: fromJson<Provenance>(row.provenance),
+  createdAt: Number(row.createdAt),
+});
+
+const revokeFromDb = (row: {
+  id: string;
+  userId: string;
+  pattern: string;
+  scope: string;
+  provenance: unknown;
+  createdAt: bigint;
+}): RevokeRow => ({
+  id: row.id,
+  userId: row.userId,
+  pattern: row.pattern,
+  scope: row.scope,
+  provenance: fromJson<Provenance>(row.provenance),
+  createdAt: Number(row.createdAt),
+});
+
+const roleToDb = (role: RoleRecord): AlfizRoleCreateData => ({
+  id: role.id,
+  name: role.name,
+  description: role.description ?? null,
+  patterns: toJson(role.patterns),
+  ...(role.requestable === undefined
+    ? {}
+    : { requestable: toJson(role.requestable) }),
+});
+
+const roleFromDb = (row: AlfizRoleRecord): RoleRecord => ({
+  id: row.id,
+  name: row.name,
+  description: optFromStr(row.description),
+  patterns: fromJson<string[]>(row.patterns),
+  requestable:
+    row.requestable === null
+      ? undefined
+      : fromJson<RoleRecord["requestable"]>(row.requestable),
+});
+
+const groupFromDb = (row: AlfizGroupRecord, parents: string[]): UserGroup => ({
+  id: row.id,
+  name: row.name,
+  description: optFromStr(row.description),
+  parents,
+  virtual: row.virtual ? true : undefined,
+});
+
+const userFromDb = (row: AlfizUserRecord, groupIds: string[]): StoredUser => ({
+  userId: row.userId,
+  active: row.active,
+  groupIds,
+  orgIds: fromJson<string[]>(row.orgIds),
+  managerUserId: row.managerUserId,
+});
+
+const requestToDb = (r: AccessRequest): AlfizRequestData & { id: string } => ({
+  id: r.id,
+  requesterUserId: r.requesterUserId,
+  roleId: r.roleId ?? null,
+  pattern: r.pattern ?? null,
+  scope: r.scope,
+  proposedExpiresAt: optToBig(r.proposedExpiresAt),
+  justification: toJson(r.justification),
+  state: r.state,
+  stageIndex: r.stageIndex,
+  stages: toJson(r.stages),
+  decisions: toJson(r.decisions),
+  createdAt: toBig(r.createdAt),
+  decidedAt: optToBig(r.decidedAt),
+});
+
+const requestFromDb = (row: AlfizRequestRecord): AccessRequest => ({
+  id: row.id,
+  requesterUserId: row.requesterUserId,
+  roleId: optFromStr(row.roleId),
+  pattern: optFromStr(row.pattern),
+  scope: row.scope,
+  proposedExpiresAt: optFromBig(row.proposedExpiresAt),
+  justification: fromJson<Record<string, string>>(row.justification),
+  state: fromJson<AccessRequest["state"]>(row.state),
+  stageIndex: row.stageIndex,
+  stages: fromJson<readonly ApprovalStage[]>(row.stages),
+  decisions: fromJson<readonly RequestDecision[]>(row.decisions),
+  createdAt: Number(row.createdAt),
+  decidedAt: optFromBig(row.decidedAt),
+});
+
+const auditToDb = (event: AuditEvent): AlfizAuditCreateData => ({
+  id: event.id,
+  at: toBig(event.at),
+  actor: event.actor,
+  action: event.action,
+  target: event.target,
+  // `undefined` and `null` detail both map to SQL NULL (Prisma writes NULL
+  // into a Json column via a sentinel, not a plain null — so we omit).
+  ...(event.detail === undefined || event.detail === null
+    ? {}
+    : { detail: toJson(event.detail) }),
+});
+
+const auditFromDb = (row: AlfizAuditRecord): AuditEvent => ({
+  id: row.id,
+  at: Number(row.at),
+  actor: row.actor,
+  action: row.action,
+  target: row.target,
+  ...(row.detail === null || row.detail === undefined
+    ? {}
+    : { detail: row.detail }),
+});
+
+// ---------------------------------------------------------------------------
+// The driver
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a StorageDriver over a Prisma client (or anything satisfying
+ * {@link AlfizPrismaDelegates} structurally):
+ *
+ * ```ts
+ * const prisma = new PrismaClient();
+ * const storage = prismaDriver(prisma);
+ * const app = createApplication({ storage, ... });
+ * ```
+ *
+ * `runExclusive` uses `options.lock` when provided, else an in-process
+ * promise-chain mutex per key (the memory driver's approach). That mutex
+ * only serializes within one process: multi-node deployments MUST supply a
+ * database advisory lock (e.g. Postgres `pg_advisory_xact_lock`) via
+ * `options.lock` so concurrent graph writes on different nodes cannot
+ * jointly form a cycle.
+ */
+export function prismaDriver(
+  db: AlfizPrismaDelegates,
+  options?: PrismaDriverOptions,
+): StorageDriver {
+  const externalLock = options?.lock;
+  const locks = new Map<string, Promise<unknown>>();
+
+  /** Diff an edge set keyed on `userId`/`childId` into deletes + inserts. */
+  const diff = (
+    current: readonly string[],
+    desired: readonly string[],
+  ): { toRemove: string[]; toAdd: string[] } => {
+    const have = new Set(current);
+    const want = new Set(desired);
+    return {
+      toRemove: [...have].filter((x) => !want.has(x)),
+      toAdd: [...want].filter((x) => !have.has(x)),
+    };
+  };
+
+  return {
+    // -- grants ---------------------------------------------------------------
+    async insertGrant(row) {
+      await db.alfizGrant.create({ data: grantToDb(row) });
+    },
+    async deleteGrant(id) {
+      // Read first, then deleteMany: Prisma's `delete` throws when the row is
+      // absent, and the contract wants `null` back instead.
+      const existing = await db.alfizGrant.findUnique({ where: { id } });
+      if (existing === null) return null;
+      await db.alfizGrant.deleteMany({ where: { id } });
+      return grantFromDb(existing);
+    },
+    async listGrants(filter?: GrantFilter) {
+      const where: AlfizGrantWhere = {};
+      if (filter?.subject !== undefined && filter.subjects !== undefined) {
+        // Both filters present: their conjunction is the intersection.
+        if (!filter.subjects.includes(filter.subject)) return [];
+        where.subject = filter.subject;
+      } else if (filter?.subject !== undefined) {
+        where.subject = filter.subject;
+      } else if (filter?.subjects !== undefined) {
+        where.subject = { in: [...filter.subjects] };
+      }
+      if (filter?.scope !== undefined) where.scope = filter.scope;
+      if (filter?.roleId !== undefined) where.roleId = filter.roleId;
+      const rows = await db.alfizGrant.findMany({ where });
+      return rows.map(grantFromDb);
+    },
+
+    // -- revokes --------------------------------------------------------------
+    async insertRevoke(row) {
+      await db.alfizRevoke.create({
+        data: {
+          id: row.id,
+          userId: row.userId,
+          pattern: row.pattern,
+          scope: row.scope,
+          provenance: toJson(row.provenance),
+          createdAt: toBig(row.createdAt),
+        },
+      });
+    },
+    async deleteRevoke(id) {
+      const existing = await db.alfizRevoke.findUnique({ where: { id } });
+      if (existing === null) return null;
+      await db.alfizRevoke.deleteMany({ where: { id } });
+      return revokeFromDb(existing);
+    },
+    async listRevokes(filter) {
+      const rows = await db.alfizRevoke.findMany(
+        filter?.userId !== undefined
+          ? { where: { userId: filter.userId } }
+          : {},
+      );
+      return rows.map(revokeFromDb);
+    },
+
+    // -- roles ----------------------------------------------------------------
+    async upsertRole(role) {
+      // delete + create, not upsert: clearing the nullable `requestable` Json
+      // column on downgrade would need Prisma's DbNull sentinel, which this
+      // package cannot reference without depending on @prisma/client. The
+      // Application serializes organizational writes, so the window is benign.
+      await db.alfizRole.deleteMany({ where: { id: role.id } });
+      await db.alfizRole.create({ data: roleToDb(role) });
+    },
+    async getRole(id) {
+      const row = await db.alfizRole.findUnique({ where: { id } });
+      return row === null ? null : roleFromDb(row);
+    },
+    async listRoles() {
+      return (await db.alfizRole.findMany()).map(roleFromDb);
+    },
+    async deleteRole(id) {
+      await db.alfizRole.deleteMany({ where: { id } });
+    },
+
+    // -- groups ---------------------------------------------------------------
+    async upsertGroup(group) {
+      const data = {
+        name: group.name,
+        description: group.description ?? null,
+        virtual: group.virtual ?? false,
+      };
+      await db.alfizGroup.upsert({
+        where: { id: group.id },
+        create: { id: group.id, ...data },
+        update: data,
+      });
+      const existing = await db.alfizGroupParent.findMany({
+        where: { childId: group.id },
+      });
+      const { toRemove, toAdd } = diff(
+        existing.map((e) => e.parentId),
+        group.parents,
+      );
+      if (toRemove.length > 0) {
+        await db.alfizGroupParent.deleteMany({
+          where: { childId: group.id, parentId: { in: toRemove } },
+        });
+      }
+      if (toAdd.length > 0) {
+        await db.alfizGroupParent.createMany({
+          data: toAdd.map((parentId) => ({ childId: group.id, parentId })),
+        });
+      }
+    },
+    async getGroup(id) {
+      const row = await db.alfizGroup.findUnique({ where: { id } });
+      if (row === null) return null;
+      const edges = await db.alfizGroupParent.findMany({
+        where: { childId: id },
+      });
+      return groupFromDb(
+        row,
+        edges.map((e) => e.parentId),
+      );
+    },
+    async listGroups() {
+      const [rows, edges] = await Promise.all([
+        db.alfizGroup.findMany(),
+        db.alfizGroupParent.findMany(),
+      ]);
+      const parentsByChild = new Map<string, string[]>();
+      for (const edge of edges) {
+        const list = parentsByChild.get(edge.childId);
+        if (list === undefined) parentsByChild.set(edge.childId, [edge.parentId]);
+        else list.push(edge.parentId);
+      }
+      return rows.map((row) => groupFromDb(row, parentsByChild.get(row.id) ?? []));
+    },
+    async deleteGroup(id) {
+      // The parent edges compose the group's own record; edges where other
+      // groups name this one as parent are their records, left untouched
+      // (matching the memory driver's semantics).
+      await db.alfizGroupParent.deleteMany({ where: { childId: id } });
+      await db.alfizGroup.deleteMany({ where: { id } });
+    },
+
+    // -- users ----------------------------------------------------------------
+    async getUser(userId) {
+      const row = await db.alfizUser.findUnique({ where: { userId } });
+      if (row === null) return null;
+      const memberships = await db.alfizMembership.findMany({
+        where: { userId },
+      });
+      return userFromDb(
+        row,
+        memberships.map((m) => m.groupId),
+      );
+    },
+    async upsertUser(user) {
+      const data = {
+        active: user.active,
+        orgIds: toJson(user.orgIds),
+        managerUserId: user.managerUserId,
+      };
+      await db.alfizUser.upsert({
+        where: { userId: user.userId },
+        create: { userId: user.userId, ...data },
+        update: data,
+      });
+      const existing = await db.alfizMembership.findMany({
+        where: { userId: user.userId },
+      });
+      const { toRemove, toAdd } = diff(
+        existing.map((m) => m.groupId),
+        user.groupIds,
+      );
+      if (toRemove.length > 0) {
+        await db.alfizMembership.deleteMany({
+          where: { userId: user.userId, groupId: { in: toRemove } },
+        });
+      }
+      if (toAdd.length > 0) {
+        await db.alfizMembership.createMany({
+          data: toAdd.map((groupId) => ({ userId: user.userId, groupId })),
+        });
+      }
+    },
+    async listUsers() {
+      const [rows, memberships] = await Promise.all([
+        db.alfizUser.findMany(),
+        db.alfizMembership.findMany(),
+      ]);
+      const groupsByUser = new Map<string, string[]>();
+      for (const m of memberships) {
+        const list = groupsByUser.get(m.userId);
+        if (list === undefined) groupsByUser.set(m.userId, [m.groupId]);
+        else list.push(m.groupId);
+      }
+      return rows.map((row) => userFromDb(row, groupsByUser.get(row.userId) ?? []));
+    },
+    async listUsersInGroup(groupId) {
+      const memberships = await db.alfizMembership.findMany({
+        where: { groupId },
+      });
+      return memberships.map((m) => m.userId);
+    },
+
+    // -- requests -------------------------------------------------------------
+    async insertRequest(request) {
+      await db.alfizRequest.create({ data: requestToDb(request) });
+    },
+    async updateRequest(request) {
+      const data = requestToDb(request);
+      await db.alfizRequest.upsert({
+        where: { id: request.id },
+        create: data,
+        update: data,
+      });
+    },
+    async getRequest(id) {
+      const row = await db.alfizRequest.findUnique({ where: { id } });
+      return row === null ? null : requestFromDb(row);
+    },
+    async listRequests(filter?: RequestStorageFilter) {
+      const rows = await db.alfizRequest.findMany({
+        where: {
+          ...(filter?.state !== undefined ? { state: filter.state } : {}),
+          ...(filter?.requesterUserId !== undefined
+            ? { requesterUserId: filter.requesterUserId }
+            : {}),
+        },
+      });
+      return rows.map(requestFromDb);
+    },
+
+    // -- catalog --------------------------------------------------------------
+    async putCatalog(version, document) {
+      await db.alfizCatalog.upsert({
+        where: { id: 1 },
+        create: { id: 1, version, document: toJson(document) },
+        update: { version, document: toJson(document) },
+      });
+    },
+    async getCatalog() {
+      const row = await db.alfizCatalog.findUnique({ where: { id: 1 } });
+      if (row === null) return null;
+      return {
+        version: row.version,
+        document: fromJson<CatalogDocument>(row.document),
+      };
+    },
+
+    // -- audit ----------------------------------------------------------------
+    async appendAudit(event) {
+      await db.alfizAudit.create({ data: auditToDb(event) });
+    },
+    async listAudit(filter?: AuditFilter) {
+      const limit = filter?.limit;
+      if (limit !== undefined && limit <= 0) return [];
+      // The contract wants the LAST `limit` events in log order: ascending by
+      // `at`, taking from the end (Prisma's negative-take convention).
+      const rows = await db.alfizAudit.findMany({
+        ...(filter?.target !== undefined
+          ? { where: { target: filter.target } }
+          : {}),
+        orderBy: { at: "asc" },
+        ...(limit !== undefined ? { take: -limit } : {}),
+      });
+      return rows.map(auditFromDb);
+    },
+
+    // -- serialization --------------------------------------------------------
+    async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
+      if (externalLock !== undefined) return externalLock(key, fn);
+      const previous = locks.get(key) ?? Promise.resolve();
+      const next = previous.then(fn, fn);
+      locks.set(
+        key,
+        next.catch(() => undefined),
+      );
+      return next;
+    },
+  };
+}

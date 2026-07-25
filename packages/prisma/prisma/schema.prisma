@@ -1,0 +1,130 @@
+// ---------------------------------------------------------------------------
+// Alfiz storage schema — a FRAGMENT, not a standalone schema.
+//
+// Copy (or merge) these models into your application's own schema.prisma:
+// they deliberately ship without datasource/generator blocks so they inherit
+// yours. All models are prefixed `Alfiz` to avoid colliding with the host
+// application's models.
+//
+// Semantics live in the Application layer (@alfiz/application), not here:
+//   - Every id is an opaque string ASSIGNED BY THE APPLICATION. No
+//     autoincrement, no cuid() — the driver stores rows verbatim.
+//   - No relations or cascades are declared. Referential integrity between
+//     Alfiz rows (grants ↔ roles, memberships ↔ groups, …) is enforced by
+//     the Application above the storage seam.
+//   - Timestamps (createdAt, expiresAt, at, …) are epoch MILLISECONDS stored
+//     as BigInt, for lossless round-tripping with the core types' `number`
+//     fields across the full JS safe-integer range.
+// ---------------------------------------------------------------------------
+
+/// The atomic grant tuple: (subject, role-or-pattern, scope, expiry?).
+/// Exactly one of roleId / pattern is set — validated by the Application.
+model AlfizGrant {
+  id         String  @id
+  subject    String
+  roleId     String?
+  pattern    String?
+  scope      String
+  expiresAt  BigInt?
+  provenance Json
+  createdAt  BigInt
+
+  @@index([subject])
+  @@index([scope])
+  @@index([roleId])
+}
+
+/// Personal revoke — the single negative layer; only users hold revokes.
+model AlfizRevoke {
+  id         String @id
+  userId     String
+  pattern    String
+  scope      String
+  provenance Json
+  createdAt  BigInt
+
+  @@index([userId])
+}
+
+/// A named bundle of permission patterns, plus its requestability policy.
+model AlfizRole {
+  id          String  @id
+  name        String
+  description String?
+  patterns    Json
+  requestable Json?
+}
+
+/// A user group node; its parent edges live in AlfizGroupParent.
+model AlfizGroup {
+  id          String  @id
+  name        String
+  description String?
+  virtual     Boolean @default(false)
+}
+
+/// Group parentage edges (the group DAG).
+model AlfizGroupParent {
+  childId  String
+  parentId String
+
+  @@id([childId, parentId])
+  @@index([parentId])
+}
+
+/// The authorization-relevant user record; identity stays in the IdP.
+model AlfizUser {
+  userId        String  @id
+  active        Boolean
+  orgIds        Json
+  managerUserId String?
+}
+
+/// Explicit user → group membership edges.
+model AlfizMembership {
+  userId  String
+  groupId String
+
+  @@id([userId, groupId])
+  @@index([groupId])
+}
+
+/// An access request: a proposed grant tuple plus justification and
+/// workflow state, with the policy stages snapshotted at submission.
+model AlfizRequest {
+  id                String  @id
+  requesterUserId   String
+  roleId            String?
+  pattern           String?
+  scope             String
+  proposedExpiresAt BigInt?
+  justification     Json
+  state             String
+  stageIndex        Int
+  stages            Json
+  decisions         Json
+  createdAt         BigInt
+  decidedAt         BigInt?
+
+  @@index([state])
+  @@index([requesterUserId])
+}
+
+/// The published catalog — a versioned singleton (always id = 1).
+model AlfizCatalog {
+  id       Int  @id @default(1)
+  version  Int
+  document Json
+}
+
+/// Append-only audit log, ordered by `at` (epoch ms).
+model AlfizAudit {
+  id     String @id
+  at     BigInt
+  actor  String
+  action String
+  target String
+  detail Json?
+
+  @@index([target])
+}
