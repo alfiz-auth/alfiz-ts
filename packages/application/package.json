@@ -1,0 +1,26 @@
+{
+  "name": "@alfiz/application",
+  "version": "0.1.0",
+  "description": "The Alfiz Application: a library-embedded provider implementing the Alfiz contract against your own database, with no external dependency. Standalone, it is the org root and the complete system for one organization.",
+  "license": "UNLICENSED",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@alfiz/core": "0.1.0"
+  }
+}
