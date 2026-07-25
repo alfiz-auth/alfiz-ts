@@ -1,0 +1,22 @@
+{
+  "name": "alfiz-ts",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Alfiz — the authorization layer. Client, Application provider, and tooling.",
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspaces --if-present",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.3",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.10"
+  }
+}
