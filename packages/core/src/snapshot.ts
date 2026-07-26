@@ -34,6 +34,17 @@
  *     truncated chain — a truncated chain would miss ancestor grants
  *     (fail-closed) and ancestor revokes (fail-OPEN), and the second is the
  *     direction a mistake here must never take.
+ *   - A hierarchical LIST page cannot know its row ids until it has
+ *     queried, which inverts that order. `await snap.resolve(rowScopes)`
+ *     extends an existing snapshot in place — no second closure fetch, so
+ *     the data instant and clock are unchanged. Guard the page, query,
+ *     resolve, then check rows. (For large result sets, push the filter
+ *     into the database instead — `grantedScopes` + `planListing` — rather
+ *     than resolving a chain per row.)
+ *
+ * Checks are verified against the catalog, exactly as on the client: an
+ * undeclared key or pattern raises `UnknownPermissionError` instead of
+ * being evaluated.
  */
 
 import type { CheckContext, CheckExplanation } from "./access.js";
@@ -45,9 +56,10 @@ import {
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
-import type { AnyCatalog } from "./catalog.js";
-import { AccessDeniedError } from "./errors.js";
-import type { LooseKey, PermissionKey } from "./grammar.js";
+import type { AnyCatalog, KeyOf, PatternOf } from "./catalog.js";
+import { suggestPattern } from "./catalog.js";
+import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
+import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
 import type { PrincipalRef, SubjectAccessData } from "./provider.js";
 import type { ScopeId } from "./scopes.js";
@@ -73,7 +85,14 @@ export interface SnapshotInit {
   data: SubjectAccessData;
   ctx: CheckContext;
   /** Resolved object closures: every granted/revoked scope, plus requested ones. */
-  chains: ReadonlyMap<ScopeId, readonly ScopeId[]>;
+  chains: Map<ScopeId, readonly ScopeId[]>;
+  /**
+   * Resolves one scope's ancestor chain — the client's cached resolver,
+   * bound to this snapshot's `fresh` setting. Backs `resolve()`, which
+   * extends the snapshot WITHOUT re-fetching subject data, so the
+   * consistency guarantee survives.
+   */
+  resolveChain: (scope: ScopeId) => Promise<readonly ScopeId[]>;
 }
 
 const GLOBAL_CLOSURE: readonly ScopeId[] = [GLOBAL_SCOPE];
@@ -95,7 +114,8 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
 
   private readonly catalog: AnyCatalog;
   private readonly ctx: CheckContext;
-  private readonly chains: ReadonlyMap<ScopeId, readonly ScopeId[]>;
+  private readonly chains: Map<ScopeId, readonly ScopeId[]>;
+  private readonly resolveChain: (scope: ScopeId) => Promise<readonly ScopeId[]>;
   private held: Set<PermissionKey> | null = null;
 
   constructor(init: SnapshotInit) {
@@ -105,7 +125,73 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
     this.active = init.data.active;
     this.ctx = init.ctx;
     this.chains = init.chains;
+    this.resolveChain = init.resolveChain;
     this.at = init.ctx.now;
+  }
+
+  /**
+   * Resolves more scope chains INTO this snapshot — no second closure
+   * fetch, so the data instant and the evaluation clock are unchanged and
+   * every check still sees one consistent instant.
+   *
+   * This is the shape hierarchical list pages want, because the page cannot
+   * know its row ids until after it has queried:
+   *
+   * ```ts
+   * const snap = await alfiz.snapshot(principal);   // guard the page
+   * snap.require("docs.files.read");
+   * const rows = await db.docs.findMany(...);       // now the ids exist
+   * await snap.resolve(rows.map((r) => `docs.doc:${r.id}`));
+   * rows.filter((r) => snap.can("docs.files.update_file", `docs.doc:${r.id}`));
+   * ```
+   *
+   * For a LARGE result set, prefer pushing the filter into the database —
+   * `grantedScopes` + `planListing` + the query helpers in listing.ts —
+   * rather than resolving a chain per row; per-row checks are the N+1 this
+   * library is explicit about avoiding. `resolve` is for the tens-of-rows
+   * case and for enriching a snapshot mid-request.
+   *
+   * Already-resolved scopes are skipped; returns this snapshot for
+   * chaining.
+   */
+  async resolve(scopes: readonly ScopeId[]): Promise<this> {
+    const missing = [
+      ...new Set(
+        scopes.filter((s) => s !== GLOBAL_SCOPE && !this.chains.has(s)),
+      ),
+    ];
+    await Promise.all(
+      missing.map(async (scope) => {
+        this.chains.set(scope, await this.resolveChain(scope));
+      }),
+    );
+    return this;
+  }
+
+  /** Scopes whose ancestor chain this snapshot can already evaluate. */
+  get resolvedScopes(): ReadonlySet<ScopeId> {
+    return new Set(this.chains.keys());
+  }
+
+  /** See `AlfizClient`'s: checks are verified against the catalog first. */
+  private assertKeys(keys: readonly PermissionKey[]): void {
+    for (const key of keys) {
+      if (this.catalog.hasKey(key)) continue;
+      throw new UnknownPermissionError({
+        permission: key,
+        expected: "key",
+        suggestion: suggestPattern(this.catalog, key),
+      });
+    }
+  }
+
+  private assertPattern(pattern: PermissionPattern): void {
+    if (this.catalog.isKnownPattern(pattern)) return;
+    throw new UnknownPermissionError({
+      permission: pattern,
+      expected: "pattern",
+      suggestion: suggestPattern(this.catalog, pattern),
+    });
   }
 
   /**
@@ -129,7 +215,8 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
         (meta
           ? `scope type ${JSON.stringify(type)} is hierarchical`
           : `scope type ${JSON.stringify(type)} is not declared in the catalog`) +
-        ` — pre-resolve it with client.snapshot(principal, { scopes: [${JSON.stringify(scope)}] }), or use the async client.can`,
+        `. Pre-resolve it — client.snapshot(principal, { scopes: [...] }) up front, or ` +
+        `await snapshot.resolve([...]) once the ids are known (list pages) — or use the async client.can.`,
     );
   }
 
@@ -158,10 +245,11 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
 
   /** Synchronous `can`: agrees with `client.can` for every resolvable scope. */
   can(key: K | readonly K[], scope?: ScopeId): boolean {
-    if (!this.active) return false;
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
+    this.assertKeys(keys);
+    if (!this.active) return false;
     const closure = this.closureOf(scope);
     for (const k of keys) {
       if (checkKey(this.ctx, k, closure)) return true;
@@ -180,12 +268,16 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
    * time. Never a gate — same rule as the client's.
    */
   canAny(pattern: P): boolean {
+    this.assertPattern(pattern);
     if (!this.active) return false;
     return checkAny(this.ctx, pattern, this.catalog.keys, this.chains);
   }
 
   /** Throwing form of `can`. */
   require(key: K | readonly K[], scope?: ScopeId): void {
+    this.assertKeys(
+      (Array.isArray(key) ? key : [key]) as readonly PermissionKey[],
+    );
     if (!this.active) {
       throw new AccessDeniedError({
         reason: "inactive",
@@ -204,6 +296,7 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
 
   /** Throwing form of `canAny` — project-root visibility. */
   requireAny(pattern: P): void {
+    this.assertPattern(pattern);
     if (!this.canAny(pattern)) {
       throw new AccessDeniedError({
         reason: this.active ? "forbidden" : "inactive",
@@ -235,6 +328,7 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
    * when the concrete scope is not yet known. Never a gate.
    */
   holds(key: LooseKey<K>): boolean {
+    this.assertKeys([key as PermissionKey]);
     if (!this.active) return false;
     return keyHeldAnywhere(this.ctx, key as PermissionKey);
   }
@@ -244,6 +338,7 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
     granted: Set<ScopeId>;
     revoked: Set<ScopeId>;
   } {
+    this.assertKeys([key as PermissionKey]);
     if (!this.active) return { granted: new Set(), revoked: new Set() };
     return {
       granted: grantedScopesFor(this.ctx, key as PermissionKey),
@@ -261,6 +356,7 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
     /** Allowed only through §7.5 ancestor implication, not a direct match. */
     implied: boolean;
   } {
+    this.assertKeys([key as PermissionKey]);
     const closure = this.closureOf(scope);
     const explanation = explainKey(this.ctx, key as PermissionKey, closure);
     let allowed = explanation.allowed && this.active;
@@ -284,3 +380,11 @@ export class AlfizSnapshot<K extends string = string, P extends string = string>
     };
   }
 }
+
+/**
+ * The snapshot type for a catalog — `SnapshotOf<typeof catalog>` — so a
+ * snapshot stored on a request-context or actor object needs no
+ * hand-written type parameters. Completes the derived-type family with
+ * `KeyOf` / `PatternOf` / `ClientOf`.
+ */
+export type SnapshotOf<Cat> = AlfizSnapshot<KeyOf<Cat>, PatternOf<Cat>>;

@@ -78,6 +78,123 @@ describe("createGrants (bulk)", () => {
   });
 });
 
+describe("provenance validation", () => {
+  // Provenance was the one required input nobody checked: a missing
+  // actorUserId sailed through the write path and died inside the audit
+  // writer, as a driver-level error naming a column the caller never wrote.
+  const bad = { kind: "admin" } as never; // actorUserId lost upstream
+
+  it("rejects at the write path, with the field named", async () => {
+    const { app } = makeApp();
+    await expect(
+      app.createGrant({ subject: "user:u1", pattern: "docs.files.read", provenance: bad }),
+    ).rejects.toMatchObject({ code: "validation" });
+    await expect(
+      app.createGrant({ subject: "user:u1", pattern: "docs.files.read", provenance: bad }),
+    ).rejects.toThrow('provenance.actorUserId is required for kind "admin"');
+  });
+
+  it("rejects BEFORE any row is written — no row without its audit entry", async () => {
+    const { app, storage } = makeApp();
+    await expect(
+      app.createGrant({ subject: "user:u1", pattern: "docs.files.read", provenance: bad }),
+    ).rejects.toThrow(/provenance/);
+    expect(await storage.listGrants()).toEqual([]);
+    expect(await storage.listAudit()).toEqual([]);
+  });
+
+  it("covers every write, not just the grant path", async () => {
+    const { app } = makeApp();
+    const group = await app.createGroup({ name: "G" }, admin);
+    await expect(
+      app.createRole({ name: "R", patterns: ["docs.files.read"] }, bad),
+    ).rejects.toThrow(/provenance/);
+    await expect(app.updateGroup(group.id, { name: "X" }, bad)).rejects.toThrow(
+      /provenance/,
+    );
+    await expect(app.setUserActive("u1", false, bad)).rejects.toThrow(/provenance/);
+    await expect(app.deleteSubject("user:u1", bad)).rejects.toThrow(/provenance/);
+    await expect(app.deleteScope("docs.folder:9", bad)).rejects.toThrow(/provenance/);
+    await expect(app.createGrants([], bad)).rejects.toThrow(/provenance/);
+    await expect(app.setReportingEdge("u1", "u2", bad)).rejects.toThrow(/provenance/);
+    // The group survived every rejected write.
+    expect((await app.listGroups()).map((g) => g.name)).toEqual(["G"]);
+  });
+
+  it("names the missing field for every kind", async () => {
+    const { app } = makeApp();
+    const reject = (provenance: unknown) =>
+      expect(
+        app.createGrant({
+          subject: "user:u1",
+          pattern: "docs.files.read",
+          provenance: provenance as never,
+        }),
+      ).rejects;
+    await reject({ kind: "import" }).toThrow(/provenance.source is required/);
+    await reject({ kind: "reconciler" }).toThrow(/provenance.integrationId is required/);
+    await reject({ kind: "request" }).toThrow(/provenance.requestId is required/);
+    await reject({ kind: "dissolution", virtualParentId: "v" }).toThrow(
+      /provenance.originalGrantId is required/,
+    );
+    await reject({ kind: "wat" }).toThrow(/unknown provenance kind "wat"/);
+    await reject(undefined).toThrow(/provenance is required/);
+    await reject({}).toThrow(/provenance.kind is required/);
+  });
+
+  it("accepts every valid kind, including the optional-field forms", async () => {
+    const { app } = makeApp();
+    const provenances = [
+      { kind: "admin", actorUserId: "root" },
+      { kind: "system" },
+      { kind: "system", note: "seeded" },
+      { kind: "import", source: "okta" },
+      { kind: "merge", source: "acme" },
+      { kind: "reconciler", integrationId: "zoom" },
+      { kind: "request", requestId: "req1" },
+      { kind: "request", requestId: "req1", approvedBy: "boss" },
+      { kind: "dissolution", virtualParentId: "v", originalGrantId: "g" },
+    ] as const;
+    for (const provenance of provenances) {
+      await app.createGrant({
+        subject: "user:u1",
+        pattern: "docs.files.read",
+        provenance,
+      });
+    }
+    expect((await app.listGrants()).length).toBe(provenances.length);
+  });
+});
+
+describe("grant queries by role", () => {
+  it("listGrants and countGrants filter by roleId — no full scan for a count", async () => {
+    const { app } = makeApp();
+    const role = await app.createRole(
+      { name: "Editor", patterns: ["docs.files.update_file"] },
+      admin,
+    );
+    const other = await app.createRole(
+      { name: "Reader", patterns: ["docs.files.read"] },
+      admin,
+    );
+    await app.createGrants(
+      [
+        { subject: "user:u1", roleId: role.id },
+        { subject: "user:u2", roleId: role.id },
+        { subject: "group:staff", roleId: other.id },
+        { subject: "user:u3", pattern: "docs.files.read" },
+      ],
+      admin,
+    );
+    expect((await app.listGrants({ roleId: role.id })).length).toBe(2);
+    expect(await app.countGrants({ roleId: role.id })).toBe(2);
+    expect(await app.countGrants({ roleId: other.id })).toBe(1);
+    expect(await app.countGrants()).toBe(4);
+    // Filters compose.
+    expect(await app.countGrants({ roleId: role.id, subject: "user:u1" })).toBe(1);
+  });
+});
+
 describe("unknown-pattern near-miss", () => {
   it("write paths name the group→pattern fix", async () => {
     const { app } = makeApp();

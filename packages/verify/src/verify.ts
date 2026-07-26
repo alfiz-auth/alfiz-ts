@@ -101,42 +101,109 @@ export const DEFAULT_SERVER_FILE_PATTERNS: readonly RegExp[] = [
   /pages\/api\//,
 ];
 
+/** A found `alfiz-verify-ignore-file` pragma and whether it takes effect. */
+export interface IgnorePragma {
+  /** The reason text; `""` when the pragma carried none. */
+  reason: string;
+  /** 1-based line the pragma sits on. */
+  line: number;
+  /**
+   * False when the pragma sits past the header region and is therefore
+   * inert. Reported as a warning rather than silently ignored: a security
+   * tool that quietly drops its own escape hatch is the wrong failure
+   * direction — the adopter sees an unchanged error count and concludes the
+   * pragma does not work.
+   */
+  effective: boolean;
+}
+
 /**
- * The out-of-domain escape hatch: a line comment
- * `// alfiz-verify-ignore-file <reason>` in a file's LEADING comment region
- * (before the first statement or import) skips the whole file. For surfaces
- * that authenticate outside the catalog by design — the trust domain
- * SPECIFICATION §2.7 endorses, which must survive a database outage and
- * cannot gate on catalog keys by construction — where "no gate" is the
- * architecture, not an omission. The reason is required: an unexplained
- * exemption in a security tool is how exemptions rot.
+ * The out-of-domain escape hatch: `// alfiz-verify-ignore-file <reason>` in
+ * a file's header — the leading comments, plus anywhere inside the
+ * directive prologue — skips the whole file. For surfaces that authenticate
+ * outside the catalog by design (the trust domain SPECIFICATION §2.7
+ * endorses, which must survive a database outage and cannot gate on catalog
+ * keys by construction), where "no gate" is the architecture, not an
+ * omission. The reason is required: an unexplained exemption in a security
+ * tool is how exemptions rot.
  *
- * Returns `null` when absent, else the reason text ("" when none given).
+ * The header region follows JavaScript's own rule rather than a stricter
+ * one. A directive prologue (`"use server"`, `"use client"`, `"use strict"`)
+ * is a run of string-literal statements at the top of a file, and the
+ * language permits comments both BEFORE and BETWEEN them — so both of these
+ * are the header, and both count:
+ *
+ * ```ts
+ * // alfiz-verify-ignore-file reason      "use server";
+ * "use server";                           // alfiz-verify-ignore-file reason
+ * ```
+ *
+ * Every React Server Components file starts with that directive on line 1;
+ * requiring the pragma above it would make the natural placement the broken
+ * one. Scanning stops at the first statement that is not part of the
+ * prologue.
+ *
+ * Recognized inside line comments and block comments (including the ` * `
+ * continuation of a JSDoc header), and only when the pragma STARTS the
+ * comment's text — so prose that merely mentions the pragma is not one.
  */
-export function ignoreFilePragma(sourceText: string): string | null {
-  const pragma = /^\/\/\s*alfiz-verify-ignore-file\b[ \t]*(.*)$/;
-  let inBlockComment = false;
-  for (const rawLine of sourceText.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (inBlockComment) {
-      const end = line.indexOf("*/");
-      if (end === -1) continue;
-      inBlockComment = false;
-      if (line.slice(end + 2).trim() !== "") return null; // code after */
-      continue;
-    }
-    if (line === "") continue;
-    const match = pragma.exec(line);
-    if (match) return match[1]!.trim();
-    if (line.startsWith("//")) continue;
+export function findIgnorePragma(sourceText: string): IgnorePragma | null {
+  const PRAGMA = /^alfiz-verify-ignore-file\b[ \t]*(.*)$/;
+  const DIRECTIVE = /^(?:"[^"]*"|'[^']*')\s*;?\s*$/;
+
+  /** Comment text on this line, with its marker stripped; null if none. */
+  const commentText = (line: string, inBlock: boolean): string | null => {
+    if (inBlock) return line.replace(/^\*+[ \t]?/, "");
+    if (line.startsWith("//")) return line.slice(2).trim();
     if (line.startsWith("/*")) {
-      if (!line.includes("*/")) inBlockComment = true;
-      else if (line.slice(line.indexOf("*/") + 2).trim() !== "") return null;
+      return line.replace(/^\/\*+[ \t]?/, "").replace(/\*\/.*$/, "").trim();
+    }
+    return null;
+  };
+
+  const lines = sourceText.split(/\r?\n/);
+  let inBlock = false;
+  let inHeader = true;
+  let fallback: IgnorePragma | null = null;
+
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!;
+    const line = raw.trim();
+    const text = commentText(line, inBlock);
+
+    if (text !== null) {
+      const match = PRAGMA.exec(text);
+      if (match) {
+        const found: IgnorePragma = {
+          reason: match[1]!.trim(),
+          line: i + 1,
+          effective: inHeader,
+        };
+        // An effective pragma wins immediately; a misplaced one is
+        // remembered so the caller can say where it is.
+        if (inHeader) return found;
+        fallback ??= found;
+      }
+    }
+
+    if (inBlock) {
+      if (line.includes("*/")) {
+        inBlock = false;
+        if (line.slice(line.indexOf("*/") + 2).trim() !== "") inHeader = false;
+      }
       continue;
     }
-    return null; // first real code line: the leading region is over
+    if (line === "" || line.startsWith("//")) continue;
+    if (line.startsWith("/*")) {
+      if (!line.includes("*/")) inBlock = true;
+      else if (line.slice(line.indexOf("*/") + 2).trim() !== "") inHeader = false;
+      continue;
+    }
+    // A directive-prologue statement keeps the header open; anything else
+    // ends it — but keep scanning, so a misplaced pragma can be reported.
+    if (!DIRECTIVE.test(line)) inHeader = false;
   }
-  return null;
+  return fallback;
 }
 
 const calleeName = (expr: ts.Expression): string | null => {
@@ -197,21 +264,34 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
 
   for (const file of options.files) {
     const text = read(file);
-    const ignoreReason = ignoreFilePragma(text);
-    if (ignoreReason !== null) {
-      if (ignoreReason === "") {
+    const pragma = findIgnorePragma(text);
+    if (pragma !== null && !pragma.effective) {
+      // Inert, so the file IS scanned (the safe direction) — but say so,
+      // rather than leaving the adopter to infer it from an error count
+      // that did not move.
+      issues.push({
+        severity: "warning",
+        rule: "ignored-file",
+        file,
+        line: pragma.line,
+        message:
+          "alfiz-verify-ignore-file found here, but it is not in the file header, so it does nothing — move it above the first statement (comments before or between `use server`/`use client` directives are fine)",
+      });
+    }
+    if (pragma !== null && pragma.effective) {
+      if (pragma.reason === "") {
         issues.push({
           severity: "warning",
           rule: "ignored-file",
           file,
-          line: 1,
+          line: pragma.line,
           message:
             "alfiz-verify-ignore-file without a reason — say why this surface is out of the catalog's domain (e.g. \"system trust domain, authenticates by deploy key\")",
         });
       }
       skippedFiles.push({
         file,
-        reason: ignoreReason === "" ? "(no reason given)" : ignoreReason,
+        reason: pragma.reason === "" ? "(no reason given)" : pragma.reason,
       });
       continue;
     }

@@ -62,6 +62,81 @@ export interface RoleDef {
   patterns: PermissionPattern[];
 }
 
+/** Every provenance kind, for validation and error messages. */
+export const PROVENANCE_KINDS = [
+  "admin",
+  "request",
+  "dissolution",
+  "merge",
+  "import",
+  "reconciler",
+  "system",
+] as const;
+
+/**
+ * Provenance is a required input on every write, and the one that used to
+ * go unchecked: a missing `actorUserId` (a JS caller, a wrapper whose
+ * argument went missing, an `as any` upstream) sailed through the write
+ * path and failed deep inside the audit writer, as a driver-level error
+ * naming a column the developer never wrote. Validated here so it is
+ * rejected where patterns, scopes, and role references are — with a
+ * message naming the field.
+ *
+ * Returns `null` when valid, else the human-readable reason.
+ */
+export function validateProvenance(provenance: Provenance): string | null {
+  if (provenance === null || typeof provenance !== "object") {
+    return `provenance is required: an object with a kind of ${PROVENANCE_KINDS.join(" | ")}`;
+  }
+  const kind = (provenance as { kind?: unknown }).kind;
+  if (typeof kind !== "string") {
+    return `provenance.kind is required (${PROVENANCE_KINDS.join(" | ")})`;
+  }
+  const required = (field: string, value: unknown): string | null =>
+    typeof value === "string" && value !== ""
+      ? null
+      : `provenance.${field} is required for kind ${JSON.stringify(kind)}`;
+
+  switch (kind) {
+    case "admin":
+      return required("actorUserId", (provenance as { actorUserId?: unknown }).actorUserId);
+    case "request": {
+      const p = provenance as { requestId?: unknown; approvedBy?: unknown };
+      const issue = required("requestId", p.requestId);
+      if (issue) return issue;
+      return p.approvedBy === undefined || typeof p.approvedBy === "string"
+        ? null
+        : `provenance.approvedBy must be a user id when present`;
+    }
+    case "dissolution": {
+      const p = provenance as {
+        virtualParentId?: unknown;
+        originalGrantId?: unknown;
+      };
+      return (
+        required("virtualParentId", p.virtualParentId) ??
+        required("originalGrantId", p.originalGrantId)
+      );
+    }
+    case "merge":
+    case "import":
+      return required("source", (provenance as { source?: unknown }).source);
+    case "reconciler":
+      return required(
+        "integrationId",
+        (provenance as { integrationId?: unknown }).integrationId,
+      );
+    case "system": {
+      const note = (provenance as { note?: unknown }).note;
+      return note === undefined || typeof note === "string"
+        ? null
+        : "provenance.note must be a string when present";
+    }
+    default:
+      return `unknown provenance kind ${JSON.stringify(kind)} (expected ${PROVENANCE_KINDS.join(" | ")})`;
+  }
+}
+
 export interface GrantRowIssue {
   rowId: string;
   reason: string;

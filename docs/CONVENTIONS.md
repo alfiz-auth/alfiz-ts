@@ -67,6 +67,20 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
   grants (the button exists; the action still gates at its concrete scope).
   Never a gate.
 
+Every check is verified against the catalog before it is evaluated. A key
+or pattern the catalog does not declare raises `UnknownPermissionError` —
+a PROGRAMMING error; map it to 500, never 403. This is what the typed keys
+and the verifier do for literal call sites, extended to the runtime-string
+paths they cannot see (nav tables, config, generic wrappers):
+
+- Gates take a concrete key. A group path (`"admin"`) or a wildcard
+  (`"docs.*"`) is not a key — gate on a leaf.
+- `canAny`/`requireAny` take a key, a `<group>.*` pattern, or `*`. A bare
+  group path matches nothing, so it is rejected with the correction.
+- Never "probe" with a key that might not exist: an undeclared key used to
+  pass for anyone holding a covering wildcard, which is why this is
+  enforced rather than warned.
+
 ## Server-rendered pages: one snapshot per request
 
 Render paths perform many checks inside helpers and `.map()` callbacks that
@@ -89,6 +103,11 @@ snap.heldKeys / snap.holds(key)                     // "held anywhere" probes
   `alfiz.snapshot(principal, { scopes: [docScope] })` — an unresolved
   hierarchical scope throws rather than guessing (a guessed chain would
   miss ancestor revokes: fail-open).
+- Hierarchical LIST pages cannot know row ids before querying: guard the
+  page, query, then `await snap.resolve(rowScopes)` — it extends the same
+  snapshot with no second fetch, so the data instant is unchanged. Past a
+  few dozen rows, stop checking per row and push the filter into the
+  database (`grantedScopes` + `planListing`) instead.
 - Server actions and route handlers still gate with `can`/`can.fresh` —
   the snapshot is the read/render surface.
 
@@ -110,6 +129,11 @@ snap.heldKeys / snap.holds(key)                     // "held anywhere" probes
 - Bulk writes (migrations, imports) use `createGrants(inputs, provenance)`:
   all inputs validated before any row is written, one audit entry, one
   invalidation per distinct subject. Never loop `createGrant` for an import.
+- Every write carries a valid provenance — `{kind:"admin", actorUserId}`,
+  `{kind:"import", source}`, and so on. It is validated up front and
+  rejected as a `ProviderWriteRejectedError` naming the missing field.
+- Counting role holders is `countGrants({ roleId })`, never `listGrants()`
+  filtered in memory — the latter reads every grant in the organization.
 - Migration SQL and runtime agree on identity by passing YOUR ids:
   `createRole({ id: "role_x", ... })`, `createGroup({ id: "cohort_y", ... })`.
   A taken id is a conflict, never an overwrite.
@@ -182,5 +206,8 @@ what catches the rest.
   options on `verifyProject` (replacing them; spread `DEFAULT_GATE_NAMES`).
 - Surfaces that authenticate OUTSIDE the catalog by design (system trust
   domains that must survive a database outage) opt out per file, with a
-  reason: `// alfiz-verify-ignore-file <reason>` in the leading comments.
-  A pragma without a reason is a warning — unexplained exemptions rot.
+  reason: `// alfiz-verify-ignore-file <reason>` in the file HEADER —
+  the leading comments, above or below a `"use server"`/`"use client"`
+  directive, exactly as JavaScript allows. A pragma without a reason is a
+  warning (unexplained exemptions rot); a pragma past the first statement
+  is inert and is reported as such rather than silently doing nothing.

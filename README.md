@@ -73,7 +73,14 @@ snap.can("docs.files.read");                     // sync — safe inside .map()
 snap.canAny("docs.*");                           // sync visibility
 snap.heldKeys;                                   // every key held at ANY scope
 snap.holds("docs.files.update_file");            // "should this button exist at all"
+await snap.resolve(rowScopes);                   // list pages: extend after querying
 ```
+
+Every check is verified against the catalog first: a key or pattern it does
+not declare raises `UnknownPermissionError` rather than being evaluated.
+Typed keys and `alfiz-verify` cover literal call sites; this covers the
+runtime-string paths they cannot see — and closes the hole where a
+misspelled gate key would pass for anyone holding a covering wildcard.
 
 Granting is one row, however the access came to be — an admin, a role, a
 group, an approved request, `everyone`:

@@ -1,6 +1,6 @@
 {
   "name": "@alfiz-auth/application",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "The Alfiz Application: a library-embedded provider implementing the Alfiz contract against your own database, with no external dependency. Standalone, it is the org root and the complete system for one organization.",
   "license": "UNLICENSED",
   "type": "module",
@@ -21,6 +21,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@alfiz-auth/core": "0.2.0"
+    "@alfiz-auth/core": "0.3.0"
   }
 }

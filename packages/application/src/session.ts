@@ -12,6 +12,8 @@
 import type {
   AlfizClient,
   CheckContext,
+  KeyOf,
+  PatternOf,
   PrincipalRef,
   ScopeId,
   SubjectAccessData,
@@ -171,17 +173,25 @@ export async function assertCanViewAs<K extends string, P extends string>(
   client: AlfizClient<K, P>,
   actorUserId: string,
 ): Promise<void> {
-  const allowed = await client.can(
-    { userId: actorUserId },
-    "alfiz_internal.access.view_as" as K,
-  );
+  const key = "alfiz_internal.access.view_as";
+  // A catalog built with `includeAlfizInternal: false` renders no Alfiz
+  // admin surface, so nobody may preview — deny. Checking the key would
+  // otherwise be a malformed check against that catalog, and previews must
+  // fail closed, not explode.
+  const allowed =
+    client.catalog.hasKey(key) && (await client.can({ userId: actorUserId }, key as K));
   if (!allowed) {
-    throw new AccessDeniedError({
-      reason: "forbidden",
-      permission: "alfiz_internal.access.view_as",
-    });
+    throw new AccessDeniedError({ reason: "forbidden", permission: key });
   }
 }
+
+/**
+ * The session type for a catalog — `SessionOf<typeof catalog>` — so a
+ * session stored on a request context needs no hand-written type
+ * parameters. Completes the derived-type family with `KeyOf` / `PatternOf`
+ * / `ClientOf` / `SnapshotOf`.
+ */
+export type SessionOf<Cat> = AlfizSession<KeyOf<Cat>, PatternOf<Cat>>;
 
 /** Cookie-safe serialization for view-as state. */
 export function serializeViewAs(state: ViewAsState): string {

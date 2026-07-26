@@ -65,6 +65,12 @@ export interface StorageDriver {
   /** Returns the deleted row, or null when absent. */
   deleteGrant(id: string): Promise<GrantRow | null>;
   listGrants(filter?: GrantFilter): Promise<GrantRow[]>;
+  /**
+   * Matching rows, counted in the database rather than in memory — push
+   * `SELECT count(*)` down instead of materializing every grant to size a
+   * set (role-holder counts on an admin page).
+   */
+  countGrants(filter?: GrantFilter): Promise<number>;
 
   // -- revokes --------------------------------------------------------------
   insertRevoke(row: RevokeRow): Promise<void>;

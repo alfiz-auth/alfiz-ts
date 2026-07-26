@@ -18,6 +18,7 @@ import type {
   CatalogDocument,
   CheckContext,
   GrantInput,
+  GrantQuery,
   GrantRow,
   InvalidationEvent,
   InvalidationListener,
@@ -50,6 +51,7 @@ import {
   planVirtualParentDissolution,
   runAutoStages,
   suggestPattern,
+  validateProvenance,
   validateGrantRow,
   validateJustification,
   validatePattern,
@@ -80,6 +82,11 @@ export interface ApplicationOptions {
 }
 
 const actorOf = (p: Provenance): string => {
+  // Backstop: every public write asserts provenance up front (before any
+  // storage is touched), but this is the last gate before a row is
+  // attributed, so an internally-constructed provenance cannot slip past.
+  const issue = validateProvenance(p);
+  if (issue) throw new ProviderWriteRejectedError(issue, "validation");
   switch (p.kind) {
     case "admin":
       return p.actorUserId;
@@ -195,6 +202,17 @@ export class AlfizApplication implements AlfizProvider {
         "not_org_root",
       );
     }
+  }
+
+  /**
+   * Provenance is validated at the TOP of every public write, not merely
+   * where it is consumed: `audit()` runs after the row is inserted, so a
+   * late rejection would leave a written row with no audit entry — the
+   * partial-write failure the bulk path is explicitly designed against.
+   */
+  private assertProvenance(provenance: Provenance): void {
+    const issue = validateProvenance(provenance);
+    if (issue) throw new ProviderWriteRejectedError(issue, "validation");
   }
 
   /** The unknown-pattern rejection, with the group-path near-miss named. */
@@ -427,6 +445,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async createGrant(input: GrantInput): Promise<GrantRow> {
+    this.assertProvenance(input.provenance);
     await this.assertGrantWritable(input);
     const row = this.buildGrantRow(input, input.provenance);
     await this.storage.insertGrant(row);
@@ -454,6 +473,7 @@ export class AlfizApplication implements AlfizProvider {
     inputs: readonly Omit<GrantInput, "provenance">[],
     provenance: Provenance,
   ): Promise<GrantRow[]> {
+    this.assertProvenance(provenance);
     if (inputs.length === 0) return [];
     for (const input of inputs) {
       await this.assertGrantWritable(input);
@@ -473,6 +493,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteGrant(grantId: string, provenance: Provenance): Promise<void> {
+    this.assertProvenance(provenance);
     if (!this.orgRoot) {
       // Inspect before touching: org-domain rows are not ours to delete, and
       // a delete-then-undo would leave a window where the row is missing.
@@ -496,17 +517,30 @@ export class AlfizApplication implements AlfizProvider {
     this.emitSubject(row.subject);
   }
 
-  async listGrants(filter?: {
-    subject?: SubjectId | undefined;
-    scope?: ScopeId | undefined;
-  }): Promise<GrantRow[]> {
+  async listGrants(filter?: GrantQuery): Promise<GrantRow[]> {
     return this.storage.listGrants({
       subject: filter?.subject,
       scope: filter?.scope,
+      roleId: filter?.roleId,
+    });
+  }
+
+  /**
+   * Matching grants, counted in the database. The role-holder count an
+   * admin page renders per row is the case this exists for — `listGrants()`
+   * and grouping in memory reads every grant in the organization to
+   * produce a number.
+   */
+  async countGrants(filter?: GrantQuery): Promise<number> {
+    return this.storage.countGrants({
+      subject: filter?.subject,
+      scope: filter?.scope,
+      roleId: filter?.roleId,
     });
   }
 
   async createRevoke(input: RevokeInput): Promise<RevokeRow> {
+    this.assertProvenance(input.provenance);
     const scope = input.scope ?? GLOBAL_SCOPE;
     if (isGlobalScope(scope)) this.requireOrgRoot("a global-scope revoke");
     const issue = validatePattern(input.pattern);
@@ -539,6 +573,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteRevoke(revokeId: string, provenance: Provenance): Promise<void> {
+    this.assertProvenance(provenance);
     if (!this.orgRoot) {
       const target = (await this.storage.listRevokes()).find(
         (r) => r.id === revokeId,
@@ -594,6 +629,7 @@ export class AlfizApplication implements AlfizProvider {
     subject: SubjectId,
     provenance: Provenance,
   ): Promise<{ deletedGrants: number; deletedRevokes: number }> {
+    this.assertProvenance(provenance);
     if (!isValidSubject(subject)) {
       throw new ProviderWriteRejectedError(
         `${JSON.stringify(subject)} is not a valid subject id`,
@@ -680,6 +716,7 @@ export class AlfizApplication implements AlfizProvider {
     scope: ScopeId,
     provenance: Provenance,
   ): Promise<{ deletedGrants: number; deletedRevokes: number }> {
+    this.assertProvenance(provenance);
     if (isGlobalScope(scope)) {
       throw new ProviderWriteRejectedError(
         "the global scope is not a deletable resource",
@@ -1099,6 +1136,7 @@ export class AlfizApplication implements AlfizProvider {
     document: CatalogDocument,
     provenance: Provenance,
   ): Promise<{ version: number }> {
+    this.assertProvenance(provenance);
     if (document.formatVersion !== 1) {
       throw new ProviderWriteRejectedError(
         `unknown catalog format ${String(document.formatVersion)}`,
@@ -1149,6 +1187,7 @@ export class AlfizApplication implements AlfizProvider {
     input: RoleInput,
     provenance: Provenance,
   ): Promise<RoleRecord> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a role definition");
     this.validateRolePatterns(input.patterns);
     if (input.requestable) {
@@ -1181,6 +1220,7 @@ export class AlfizApplication implements AlfizProvider {
     input: Partial<RoleInput>,
     provenance: Provenance,
   ): Promise<RoleRecord> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a role definition");
     const existing = await this.storage.getRole(roleId);
     if (!existing) {
@@ -1208,11 +1248,12 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteRole(roleId: string, provenance: Provenance): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a role definition");
-    const holders = await this.storage.listGrants({ roleId });
-    if (holders.length > 0) {
+    const holders = await this.storage.countGrants({ roleId });
+    if (holders > 0) {
       throw new ProviderWriteRejectedError(
-        `role is assigned by ${holders.length} grant(s); remove them first`,
+        `role is assigned by ${holders} grant(s); remove them first`,
         "conflict",
       );
     }
@@ -1245,6 +1286,7 @@ export class AlfizApplication implements AlfizProvider {
     },
     provenance: Provenance,
   ): Promise<UserGroup> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a user group");
     return this.storage.runExclusive("groups", async () => {
       if (input.id !== undefined) {
@@ -1284,6 +1326,7 @@ export class AlfizApplication implements AlfizProvider {
     input: { name?: string | undefined; description?: string | undefined },
     provenance: Provenance,
   ): Promise<UserGroup> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a user group");
     // Serialized with the graph writes: upsertGroup stores the full record,
     // so an unserialized rename could clobber a concurrent parent edit.
@@ -1314,6 +1357,7 @@ export class AlfizApplication implements AlfizProvider {
     parents: string[],
     provenance: Provenance,
   ): Promise<UserGroup> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("group parentage");
     return this.storage.runExclusive("groups", async () => {
       const group = await this.storage.getGroup(groupId);
@@ -1348,6 +1392,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async deleteGroup(groupId: string, provenance: Provenance): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a user group");
     await this.storage.runExclusive("groups", async () => {
       const group = await this.storage.getGroup(groupId);
@@ -1397,6 +1442,7 @@ export class AlfizApplication implements AlfizProvider {
     groupIds: string[],
     provenance: Provenance,
   ): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("group membership");
     for (const groupId of groupIds) {
       if ((await this.storage.getGroup(groupId)) === null) {
@@ -1436,6 +1482,7 @@ export class AlfizApplication implements AlfizProvider {
     active: boolean,
     provenance: Provenance,
   ): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("user provisioning");
     const user = (await this.storage.getUser(userId)) ?? {
       userId,
@@ -1454,6 +1501,7 @@ export class AlfizApplication implements AlfizProvider {
     managerUserId: string | null,
     provenance: Provenance,
   ): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a reporting edge");
     await this.storage.runExclusive("reporting", async () => {
       const user = (await this.storage.getUser(userId)) ?? {
@@ -1535,6 +1583,7 @@ export class AlfizApplication implements AlfizProvider {
     groupId: string,
     provenance: Provenance,
   ): Promise<void> {
+    this.assertProvenance(provenance);
     this.requireOrgRoot("a virtual parent");
     await this.storage.runExclusive("groups", async () => {
       const parent = await this.storage.getGroup(groupId);

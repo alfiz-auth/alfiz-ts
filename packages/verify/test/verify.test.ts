@@ -291,6 +291,80 @@ describe("alfiz-verify-ignore-file pragma", () => {
     });
     expect(report.skippedFiles.map((s) => s.file)).toEqual(["a.ts"]);
   });
+
+  it("counts below a directive prologue — the placement every RSC file forces", () => {
+    // "use server" on line 1 is what the framework docs show, what
+    // formatters preserve, and what every contributor writes.
+    const report = run({
+      "app/api/system/route.ts": `
+        "use server";
+        // alfiz-verify-ignore-file system trust domain: survives a DB outage
+        export async function POST() { return doSystemThing(); }
+      `,
+      "app/widget.tsx": `
+        'use client';
+        'use strict';
+        // alfiz-verify-ignore-file vendored, gates upstream
+        export async function Widget() { return null; }
+      `,
+      "app/above.ts": `
+        // alfiz-verify-ignore-file also fine above the directive
+        "use server";
+        export async function act() { return 1; }
+      `,
+    });
+    expect(report.skippedFiles.map((s) => s.file).sort()).toEqual([
+      "app/above.ts",
+      "app/api/system/route.ts",
+      "app/widget.tsx",
+    ]);
+    expect(byRule(report.issues, "ungated-action")).toEqual([]);
+  });
+
+  it("is recognized inside a JSDoc header", () => {
+    const report = run({
+      "a.ts": `
+        /**
+         * The system trust domain.
+         * alfiz-verify-ignore-file authenticates by deploy key
+         */
+        export async function POST() { return 1; }
+      `,
+    });
+    expect(report.skippedFiles[0]?.reason).toBe("authenticates by deploy key");
+  });
+
+  it("prose that merely mentions the pragma is not a pragma", () => {
+    const report = run({
+      "app/actions.ts": `
+        // See docs: write \`// alfiz-verify-ignore-file <reason>\` to opt out.
+        "use server";
+        export async function ungated() { return 1; }
+      `,
+    });
+    expect(report.skippedFiles).toEqual([]);
+    expect(byRule(report.issues, "ungated-action").length).toBe(1);
+  });
+
+  it("a misplaced pragma warns instead of silently doing nothing", () => {
+    const report = run({
+      "app/actions.ts": `
+        "use server";
+        export async function first() { await gateAction("docs.files.read"); }
+        // alfiz-verify-ignore-file too late to count
+        export async function second() { return 1; }
+      `,
+    });
+    // Still scanned — the safe direction — and the ungated action is caught.
+    expect(report.skippedFiles).toEqual([]);
+    expect(byRule(report.issues, "ungated-action").length).toBe(1);
+    // …and the inert pragma is called out, at its own line.
+    const warned = byRule(report.issues, "ignored-file");
+    expect(warned.length).toBe(1);
+    expect(warned[0]!.severity).toBe("warning");
+    expect(warned[0]!.line).toBe(4);
+    expect(warned[0]!.message).toMatch(/does nothing/);
+  });
 });
 
 describe("group-path near-miss", () => {

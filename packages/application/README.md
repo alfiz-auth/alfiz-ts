@@ -25,9 +25,13 @@ What lives here:
 - The admin lifecycle surface — `createGrants` (bulk: validate-all-first,
   one audit entry, one invalidation per subject), caller-supplied ids on
   `createRole`/`createGroup` (migration SQL and runtime agree on identity),
-  `updateGroup` (rename without touching parentage or membership), and
+  `updateGroup` (rename without touching parentage or membership),
   `setUserActive` (the reversible offboarding switch: inactive principals
-  evaluate to no access).
+  evaluate to no access), and `listGrants`/`countGrants` filtered by
+  `roleId` (role-holder counts without reading every grant).
+- Provenance is validated on every write, before any row is touched:
+  a missing `actorUserId` is a `ProviderWriteRejectedError` naming the
+  field, not a driver-level error inside the audit writer.
 - `notifyScopeMoved(scope)` — the move hook: the host application owns the
   hierarchy behind `resolveAncestors`, so it must report parent-pointer
   changes; this emits the `scope` invalidation that busts cached ancestor

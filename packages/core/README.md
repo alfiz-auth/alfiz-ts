@@ -6,7 +6,8 @@ data a provider supplies — no storage, no I/O.
 - **Grammar** (`grammar.ts`) — key/pattern validation, forward-inclusive
   subtree wildcard matching, pattern intersection.
 - **Catalog** (`catalog.ts`) — `defineCatalog`, derived template-literal key
-  and pattern types (`KeyOf`, `PatternOf`), scope types, navigation wiring,
+  and pattern types (`KeyOf`, `PatternOf`, plus `ClientOf` / `SnapshotOf`
+  for context objects), scope types, navigation wiring,
   requestability, `lintCatalog`, the reserved `alfiz_internal.*` project,
   `toDocument()`/`catalogFromDocument()` (the publish wire shape).
 - **Subjects & scopes** (`subjects.ts`, `scopes.ts`) — subject ids and
@@ -25,12 +26,16 @@ data a provider supplies — no storage, no I/O.
 - **Client** (`client.ts`) — `createAlfizClient`: `can` / `canAny` /
   `require*` / `can.fresh`, closure caches parameterized by provider
   invalidation events, `explain`, `grantedScopes`, `effectiveKeys`,
-  `holdsAnywhere`.
+  `holdsAnywhere`. Every check is verified against the catalog first —
+  an undeclared key or pattern raises `UnknownPermissionError` (a
+  programming error: map it to 500, never 403) instead of being evaluated,
+  which is what keeps a misspelled gate from passing for wildcard holders.
 - **Snapshot** (`snapshot.ts`) — `client.snapshot(principal)`: one provider
   round-trip, then SYNCHRONOUS `can`/`canAny`/`require*`/`holds`/`heldKeys`
   over one consistent instant — the pattern for server-rendered frameworks,
   where render helpers cannot be async. Flat (`parent: null`) scope types
-  check synchronously with no pre-resolution.
+  check synchronously with no pre-resolution; `resolve(scopes)` extends a
+  snapshot after a query without a second fetch (hierarchical list pages).
 - **Listing** (`listing.ts`) — `planListing` plus materialized-path and
   closure-table query helpers.
 - **Headless tree** (`tree.ts`) — the wildcard-aware permission-tree

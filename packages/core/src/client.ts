@@ -11,6 +11,13 @@
  * snapshot.ts; it is the intended shape wherever render helpers cannot be
  * async.
  *
+ * Every check is verified against the catalog before it is evaluated: a key
+ * or pattern the catalog does not declare raises `UnknownPermissionError`
+ * (a programming error — map it to 500, never 403) rather than being
+ * evaluated. Typed keys and the static verifier cover literal call sites;
+ * this covers the runtime-string paths they cannot see, and closes the hole
+ * where an undeclared key would pass for any holder of a covering wildcard.
+ *
  * Staleness bounds, stated honestly: subject-side data lives for
  * `subjectCacheTtlMs` (default 30s) unless an invalidation event lands
  * sooner; object ancestor chains live for `objectCacheTtlMs` (default 60s)
@@ -30,9 +37,10 @@ import {
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
-import type { AnyCatalog } from "./catalog.js";
-import { AccessDeniedError } from "./errors.js";
-import type { LooseKey, PermissionKey } from "./grammar.js";
+import type { AnyCatalog, KeyOf, PatternOf } from "./catalog.js";
+import { suggestPattern } from "./catalog.js";
+import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
+import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
 import type {
   AlfizProvider,
@@ -291,6 +299,33 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     return toCheckContext(data, this.now(), this.grantApplies);
   }
 
+  /**
+   * Every check is verified against the catalog before it is evaluated.
+   * Typed keys and the static verifier cover literal call sites; this covers
+   * the runtime-string paths they cannot see — and closes the hole where an
+   * undeclared key would pass for any holder of a covering wildcard. See
+   * {@link UnknownPermissionError}.
+   */
+  private assertKeys(keys: readonly PermissionKey[]): void {
+    for (const key of keys) {
+      if (this.catalog.hasKey(key)) continue;
+      throw new UnknownPermissionError({
+        permission: key,
+        expected: "key",
+        suggestion: suggestPattern(this.catalog, key),
+      });
+    }
+  }
+
+  private assertPattern(pattern: PermissionPattern): void {
+    if (this.catalog.isKnownPattern(pattern)) return;
+    throw new UnknownPermissionError({
+      permission: pattern,
+      expected: "pattern",
+      suggestion: suggestPattern(this.catalog, pattern),
+    });
+  }
+
   private async check(
     principal: PrincipalRef,
     key: K | readonly K[],
@@ -300,6 +335,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
+    this.assertKeys(keys);
     const [data, closure] = await Promise.all([
       this.subjectData(principal, fresh),
       this.objectClosure(scope, fresh),
@@ -389,6 +425,9 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       data,
       ctx,
       chains,
+      // Bound to this snapshot's freshness, so `resolve` mid-request keeps
+      // the same cache posture the snapshot was taken with.
+      resolveChain: (scope) => this.objectClosure(scope, fresh),
     });
   }
 
@@ -398,6 +437,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
    * in server actions and route handlers.
    */
   async canAny(principal: PrincipalRef, pattern: P): Promise<boolean> {
+    this.assertPattern(pattern);
     const data = await this.subjectData(principal, false);
     if (!data.active) return false;
     const ctx = this.ctxOf(data);
@@ -420,6 +460,9 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     key: K | readonly K[],
     scope?: ScopeId,
   ): Promise<void> {
+    this.assertKeys(
+      (Array.isArray(key) ? key : [key]) as readonly PermissionKey[],
+    );
     const data = await this.subjectData(principal, false);
     if (!data.active) {
       throw new AccessDeniedError({
@@ -439,6 +482,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
 
   /** Throwing form of `canAny` — project-root visibility (`requireAny("project.*")`). */
   async requireAny(principal: PrincipalRef, pattern: P): Promise<void> {
+    this.assertPattern(pattern);
     if (!(await this.canAny(principal, pattern))) {
       throw new AccessDeniedError({
         reason: "forbidden",
@@ -463,6 +507,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       implied: boolean;
     }
   > {
+    this.assertKeys([key as PermissionKey]);
     const [data, closure] = await Promise.all([
       this.subjectData(principal, false),
       this.objectClosure(scope, false),
@@ -500,6 +545,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     principal: PrincipalRef,
     key: LooseKey<K>,
   ): Promise<{ granted: Set<ScopeId>; revoked: Set<ScopeId> }> {
+    this.assertKeys([key as PermissionKey]);
     const data = await this.subjectData(principal, false);
     if (!data.active) return { granted: new Set(), revoked: new Set() };
     const ctx = this.ctxOf(data);
@@ -523,6 +569,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     principal: PrincipalRef,
     key: LooseKey<K>,
   ): Promise<boolean> {
+    this.assertKeys([key as PermissionKey]);
     const data = await this.subjectData(principal, false);
     if (!data.active) return false;
     return keyHeldAnywhere(this.ctxOf(data), key as PermissionKey);
@@ -556,3 +603,11 @@ export function createAlfizClient<Cat extends AnyCatalog>(
 ): AlfizClient<Cat["$key"], Cat["$pattern"]> {
   return new AlfizClient(options);
 }
+
+/**
+ * The client type for a catalog — `ClientOf<typeof catalog>` — so a client
+ * stored on a context object needs no hand-written type parameters.
+ * Completes the derived-type family with `KeyOf` / `PatternOf` /
+ * `SnapshotOf`.
+ */
+export type ClientOf<Cat> = AlfizClient<KeyOf<Cat>, PatternOf<Cat>>;
