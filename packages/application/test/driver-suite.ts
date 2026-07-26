@@ -5,8 +5,8 @@
  */
 
 import assert from "node:assert/strict";
-import type { StorageDriver } from "@alfiz/application";
-import type { AccessRequest, GrantRow, RevokeRow } from "@alfiz/core";
+import type { StorageDriver } from "@alfiz-auth/application";
+import type { AccessRequest, GrantRow, RevokeRow } from "@alfiz-auth/core";
 
 export interface DriverCase {
   name: string;

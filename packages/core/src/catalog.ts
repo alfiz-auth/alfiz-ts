@@ -7,7 +7,7 @@
  * `defineCatalog` throws on structural invalidity (bad segments, namespace
  * violations, depth without the opt-out) — a broken catalog should fail at
  * boot. Semantic convention violations (the naming floor, style, nav wiring)
- * are reported by `lintCatalog` and enforced at build time by @alfiz/verify.
+ * are reported by `lintCatalog` and enforced at build time by @alfiz-auth/verify.
  */
 
 import type { PermissionKey, PermissionPattern } from "./grammar.js";
@@ -702,7 +702,7 @@ export function catalogFromDocument(document: CatalogDocument): AnyCatalog {
 
 // ---------------------------------------------------------------------------
 // Catalog lint — the naming floor and wiring conventions, enforced at build
-// time by @alfiz/verify rather than at boot.
+// time by @alfiz-auth/verify rather than at boot.
 // ---------------------------------------------------------------------------
 
 const VERB_NOUN_RE = /^[a-z]+(_[a-z0-9]+)+$/;

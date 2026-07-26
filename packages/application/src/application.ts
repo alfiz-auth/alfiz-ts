@@ -33,7 +33,7 @@ import type {
   SubjectAccessData,
   SubjectId,
   UserGroup,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 import {
   ALFIZ_INTERNAL_NAMESPACE,
   GLOBAL_SCOPE,
@@ -51,8 +51,8 @@ import {
   validateJustification,
   validatePattern,
   validateScopeId,
-} from "@alfiz/core";
-import type { AncestryResolver } from "@alfiz/core";
+} from "@alfiz-auth/core";
+import type { AncestryResolver } from "@alfiz-auth/core";
 import { randomUUID } from "node:crypto";
 import type { StorageDriver, StoredUser } from "./storage.js";
 
@@ -548,7 +548,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   private async requestability(input: RequestInput): Promise<{
-    prompts: readonly import("@alfiz/core").RequestPromptInput[];
+    prompts: readonly import("@alfiz-auth/core").RequestPromptInput[];
     maxDurationMs: number | undefined;
     requireExpiry: boolean;
     stages: readonly ApprovalStage[];
@@ -1340,7 +1340,7 @@ export class AlfizApplication implements AlfizProvider {
           existing.map((g) => [g.id, g.parents]),
         );
         for (const g of snapshot.groups) parentsOf.set(g.id, g.parents ?? []);
-        const { condenseImportedGraph } = await import("@alfiz/core");
+        const { condenseImportedGraph } = await import("@alfiz-auth/core");
         const condensed = condenseImportedGraph(parentsOf);
         warnings.push(...condensed.warnings);
         virtualParents.push(...condensed.virtualParents);

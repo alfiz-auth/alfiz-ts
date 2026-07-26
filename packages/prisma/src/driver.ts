@@ -29,14 +29,14 @@ import type {
   RevokeRow,
   RoleRecord,
   UserGroup,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 import type {
   AuditFilter,
   GrantFilter,
   RequestStorageFilter,
   StorageDriver,
   StoredUser,
-} from "@alfiz/application";
+} from "@alfiz-auth/application";
 import type {
   AlfizAuditCreateData,
   AlfizAuditRecord,

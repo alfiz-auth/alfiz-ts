@@ -1,6 +1,6 @@
 /**
  * The storage seam: the one interface a database must satisfy to host an
- * Alfiz Application. Implement it over Prisma (@alfiz/prisma), raw SQL,
+ * Alfiz Application. Implement it over Prisma (@alfiz-auth/prisma), raw SQL,
  * Mongo, or anything else — the Application's semantics (graph integrity,
  * request workflows, org-root gating, audit) live above this line and are
  * identical over every driver.
@@ -19,7 +19,7 @@ import type {
   ScopeId,
   SubjectId,
   UserGroup,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 
 /**
  * The authorization-relevant user record. Identity (profile, sessions,

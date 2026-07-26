@@ -9,8 +9,8 @@ owns everything in between: **who may do what, where, and why**.
 
 | Layer | Package | What it is |
 | --- | --- | --- |
-| **Client** | `@alfiz/core` | The evaluator: grammar, catalog, closures, check shapes, caches, graph integrity, request evaluation, headless tree logic, and the provider contract. Every capability is a pure function over provider-supplied data. No storage, no I/O. |
-| **Application** | `@alfiz/application` (+ `@alfiz/prisma`) | The local provider: the same contract implemented against **your** database through a storage seam. Standalone, it is the **org root** — the complete system for one organization, with the full feature set and no external dependency. |
+| **Client** | `@alfiz-auth/core` | The evaluator: grammar, catalog, closures, check shapes, caches, graph integrity, request evaluation, headless tree logic, and the provider contract. Every capability is a pure function over provider-supplied data. No storage, no I/O. |
+| **Application** | `@alfiz-auth/application` (+ `@alfiz-auth/prisma`) | The local provider: the same contract implemented against **your** database through a storage seam. Standalone, it is the **org root** — the complete system for one organization, with the full feature set and no external dependency. |
 | **Service** | (future) | A managed provider speaking the *same contract*: hosted administration by relay, and federation (catalog registry, cross-application composition, the centralized org root). Nothing in this repo depends on it, by design. |
 
 Runtime checks never leave your application in any topology: every `can()`
@@ -19,8 +19,8 @@ runs in-process against your catalog, your rows, and your resolver.
 ## Quickstart
 
 ```ts
-import { defineCatalog, createAlfizClient, parentPointerResolver } from "@alfiz/core";
-import { createApplication, memoryDriver } from "@alfiz/application";
+import { defineCatalog, createAlfizClient, parentPointerResolver } from "@alfiz-auth/core";
+import { createApplication, memoryDriver } from "@alfiz-auth/application";
 
 // 1. The catalog: the single source of truth, in code.
 export const catalog = defineCatalog({
@@ -44,7 +44,7 @@ export const catalog = defineCatalog({
   },
 });
 
-// 2. The application: your database (swap memoryDriver for @alfiz/prisma),
+// 2. The application: your database (swap memoryDriver for @alfiz-auth/prisma),
 //    your hierarchy, resolved by your code.
 const app = createApplication({
   catalog,
@@ -110,13 +110,13 @@ by construction.
 
 ## Packages
 
-- [`@alfiz/core`](packages/core) — the Client.
-- [`@alfiz/application`](packages/application) — the local provider + storage seam.
-- [`@alfiz/prisma`](packages/prisma) — the Prisma storage driver + schema fragment.
-- [`@alfiz/verify`](packages/verify) — static verification (`alfiz-verify`).
+- [`@alfiz-auth/core`](packages/core) — the Client.
+- [`@alfiz-auth/application`](packages/application) — the local provider + storage seam.
+- [`@alfiz-auth/prisma`](packages/prisma) — the Prisma storage driver + schema fragment.
+- [`@alfiz-auth/verify`](packages/verify) — static verification (`alfiz-verify`).
 
 `docs/CONVENTIONS.md` is the machine-legible convention document — drop it
-into your agent context; `@alfiz/verify` checks what the conventions assume.
+into your agent context; `@alfiz-auth/verify` checks what the conventions assume.
 
 ## Development
 

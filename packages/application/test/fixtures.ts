@@ -1,8 +1,8 @@
-import { defineCatalog } from "@alfiz/core";
-import type { AncestryResolver } from "@alfiz/core";
-import { parentPointerResolver } from "@alfiz/core";
-import { createApplication, memoryDriver } from "@alfiz/application";
-import type { ApplicationOptions } from "@alfiz/application";
+import { defineCatalog } from "@alfiz-auth/core";
+import type { AncestryResolver } from "@alfiz-auth/core";
+import { parentPointerResolver } from "@alfiz-auth/core";
+import { createApplication, memoryDriver } from "@alfiz-auth/application";
+import type { ApplicationOptions } from "@alfiz-auth/application";
 
 export const testCatalog = () =>
   defineCatalog({

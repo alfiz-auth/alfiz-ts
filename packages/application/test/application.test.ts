@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { InvalidationEvent } from "@alfiz/core";
-import { ProviderWriteRejectedError, createAlfizClient } from "@alfiz/core";
+import type { InvalidationEvent } from "@alfiz-auth/core";
+import { ProviderWriteRejectedError, createAlfizClient } from "@alfiz-auth/core";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 describe("getSubjectAccess", () => {

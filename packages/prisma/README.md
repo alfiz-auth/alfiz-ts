@@ -1,7 +1,7 @@
-# @alfiz/prisma
+# @alfiz-auth/prisma
 
 The Prisma storage driver for the Alfiz Application. It implements the
-storage seam (`StorageDriver` from `@alfiz/application`) over a Prisma
+storage seam (`StorageDriver` from `@alfiz-auth/application`) over a Prisma
 client — and does it without depending on `@prisma/client`: the driver is
 written against a structural interface (`AlfizPrismaDelegates`) that any
 client generated from the bundled schema fragment satisfies.
@@ -22,8 +22,8 @@ npx prisma generate
 
 ```ts
 import { PrismaClient } from "@prisma/client";
-import { createApplication } from "@alfiz/application";
-import { prismaDriver } from "@alfiz/prisma";
+import { createApplication } from "@alfiz-auth/application";
+import { prismaDriver } from "@alfiz-auth/prisma";
 
 const prisma = new PrismaClient();
 const storage = prismaDriver(prisma); // structural match — no adapter needed

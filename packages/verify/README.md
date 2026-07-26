@@ -1,4 +1,4 @@
-# @alfiz/verify
+# @alfiz-auth/verify
 
 Static verification: the four-point wiring checklist enforced by tooling,
 not discipline. Typed keys catch typos the compiler can see; this catches
@@ -22,7 +22,7 @@ the rest:
 Programmatic (recommended — no JSON step):
 
 ```ts
-import { verifyProject } from "@alfiz/verify";
+import { verifyProject } from "@alfiz-auth/verify";
 import { catalog } from "./src/alfiz.js";
 
 const report = verifyProject({

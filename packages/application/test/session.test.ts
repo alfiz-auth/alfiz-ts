@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { createAlfizClient } from "@alfiz/core";
+import { createAlfizClient } from "@alfiz-auth/core";
 import {
   AlfizSession,
   createSession,
   parseViewAs,
   serializeViewAs,
-} from "@alfiz/application";
+} from "@alfiz-auth/application";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 const setup = async () => {

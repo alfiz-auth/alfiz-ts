@@ -20,7 +20,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { catalogFromDocument } from "@alfiz/core";
+import { catalogFromDocument } from "@alfiz-auth/core";
 import { verifyProject } from "./verify.js";
 
 interface CliConfig {

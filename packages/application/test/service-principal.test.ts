@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   createServiceKeyShim,
   parseServiceKeysEnv,
-} from "@alfiz/application";
+} from "@alfiz-auth/application";
 
 const KEY = "a-sufficiently-long-backend-key";
 const OLD = "the-previous-rotation-era-key!!";

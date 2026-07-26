@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createAlfizClient, findCycle } from "@alfiz/core";
+import { createAlfizClient, findCycle } from "@alfiz-auth/core";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 describe("scope invalidation (critical): moves propagate to cached checks", () => {

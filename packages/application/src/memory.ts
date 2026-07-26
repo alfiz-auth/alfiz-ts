@@ -12,7 +12,7 @@ import type {
   RevokeRow,
   RoleRecord,
   UserGroup,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 import type {
   AuditFilter,
   GrantFilter,

@@ -15,14 +15,14 @@ import type {
   PrincipalRef,
   ScopeId,
   SubjectAccessData,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 import {
   AccessDeniedError,
   GLOBAL_SCOPE,
   checkKey,
   objectClosureOf,
   toCheckContext,
-} from "@alfiz/core";
+} from "@alfiz-auth/core";
 
 export type ViewAsState =
   /** Preview as a role: the subject's access becomes the role's patterns. */
@@ -146,7 +146,7 @@ export class AlfizSession<K extends string = string, P extends string = string> 
   ): Promise<boolean> {
     const ctx = await this.roleContext(roleId);
     if (!ctx) return false;
-    const { checkAny } = await import("@alfiz/core");
+    const { checkAny } = await import("@alfiz-auth/core");
     return checkAny(ctx, pattern, this.client.catalog.keys);
   }
 }

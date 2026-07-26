@@ -1,9 +1,9 @@
-# @alfiz/application
+# @alfiz-auth/application
 
 The Alfiz **Application**: the local provider. Implements the provider
 contract against your own database through the storage seam
 (`StorageDriver`) — one database is the sole hard requirement. A complete
-in-memory driver ships as the reference; `@alfiz/prisma` provides the
+in-memory driver ships as the reference; `@alfiz-auth/prisma` provides the
 Prisma-backed one; implement `StorageDriver` yourself for anything else.
 
 Standalone (the default), the Application is the **org root**: it owns
@@ -31,7 +31,7 @@ What lives here:
   access, so previews can only narrow. `serializeViewAs`/`parseViewAs` for
   cookie plumbing.
 - Service principals (`service-principal.ts`) — the timing-safe env-key
-  shim with rotation lists; pair with `@alfiz/verify`'s client-reach guard.
+  shim with rotation lists; pair with `@alfiz-auth/verify`'s client-reach guard.
 - Directory ingestion (`importDirectory`) — groups/memberships/reporting
   edges from Entra/Okta/LDAP-shaped snapshots; cyclic group nesting is
   auto-condensed into virtual parents, cyclic reporting edges are skipped
