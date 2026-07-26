@@ -44,6 +44,7 @@ model AlfizRevoke {
   createdAt  BigInt
 
   @@index([userId])
+  @@index([scope])
 }
 
 /// A named bundle of permission patterns, plus its requestability policy.

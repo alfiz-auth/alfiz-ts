@@ -100,6 +100,8 @@ export function mockDelegates(): AlfizPrismaDelegates {
         let rows = [...revokes.values()];
         const userId = args?.where?.userId;
         if (userId !== undefined) rows = rows.filter((r) => r.userId === userId);
+        const scope = args?.where?.scope;
+        if (scope !== undefined) rows = rows.filter((r) => r.scope === scope);
         return rows.map(clone);
       },
       async deleteMany({ where }) {
@@ -214,6 +216,10 @@ export function mockDelegates(): AlfizPrismaDelegates {
       },
       async findMany() {
         return [...users.values()].map(clone);
+      },
+      async deleteMany({ where }) {
+        const existed = users.delete(where.userId);
+        return { count: existed ? 1 : 0 };
       },
     },
 

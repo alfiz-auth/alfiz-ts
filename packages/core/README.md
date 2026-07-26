@@ -24,7 +24,13 @@ data a provider supplies — no storage, no I/O.
   layers), pure stage evaluation.
 - **Client** (`client.ts`) — `createAlfizClient`: `can` / `canAny` /
   `require*` / `can.fresh`, closure caches parameterized by provider
-  invalidation events, `explain`, `grantedScopes`, `effectiveKeys`.
+  invalidation events, `explain`, `grantedScopes`, `effectiveKeys`,
+  `holdsAnywhere`.
+- **Snapshot** (`snapshot.ts`) — `client.snapshot(principal)`: one provider
+  round-trip, then SYNCHRONOUS `can`/`canAny`/`require*`/`holds`/`heldKeys`
+  over one consistent instant — the pattern for server-rendered frameworks,
+  where render helpers cannot be async. Flat (`parent: null`) scope types
+  check synchronously with no pre-resolution.
 - **Listing** (`listing.ts`) — `planListing` plus materialized-path and
   closure-table query helpers.
 - **Headless tree** (`tree.ts`) — the wildcard-aware permission-tree

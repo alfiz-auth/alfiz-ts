@@ -17,6 +17,7 @@ import type {
   AuditFilter,
   GrantFilter,
   RequestStorageFilter,
+  RevokeFilter,
   StorageDriver,
   StoredUser,
 } from "./storage.js";
@@ -69,10 +70,13 @@ export function memoryDriver(): StorageDriver {
       revokes.delete(id);
       return row ? clone(row) : null;
     },
-    async listRevokes(filter) {
+    async listRevokes(filter?: RevokeFilter) {
       let rows = [...revokes.values()];
       if (filter?.userId !== undefined) {
         rows = rows.filter((r) => r.userId === filter.userId);
+      }
+      if (filter?.scope !== undefined) {
+        rows = rows.filter((r) => r.scope === filter.scope);
       }
       return rows.map(clone);
     },
@@ -111,6 +115,9 @@ export function memoryDriver(): StorageDriver {
     },
     async upsertUser(user) {
       users.set(user.userId, clone(user));
+    },
+    async deleteUser(userId) {
+      users.delete(userId);
     },
     async listUsers() {
       return [...users.values()].map(clone);

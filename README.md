@@ -61,6 +61,20 @@ await alfiz.canAny({ userId }, "docs.*");            // visibility only, never a
 await alfiz.can.fresh({ userId }, "docs.files.delete", "docs.folder:9"); // destructive: bypass caches
 ```
 
+Server-rendered pages don't sprinkle `await` through render helpers — they
+take **one snapshot per request** and check synchronously. A snapshot is
+one consistent instant of the caches (a *stronger* per-request guarantee
+than repeated `can` calls), and scope types declared `parent: null` are
+flat by contract, so scoped checks stay synchronous too:
+
+```ts
+const snap = await alfiz.snapshot({ userId });   // one provider round-trip
+snap.can("docs.files.read");                     // sync — safe inside .map()
+snap.canAny("docs.*");                           // sync visibility
+snap.heldKeys;                                   // every key held at ANY scope
+snap.holds("docs.files.update_file");            // "should this button exist at all"
+```
+
 Granting is one row, however the access came to be — an admin, a role, a
 group, an approved request, `everyone`:
 
@@ -73,6 +87,15 @@ await app.createGrant({
   provenance: { kind: "admin", actorUserId: "root" },
 });
 ```
+
+Bulk imports use `createGrants(inputs, provenance)` — validate-everything-
+first, one audit entry, one invalidation per subject. And because grants
+key on subject and scope *strings*, deletion is a discipline, not an
+accident: call `deleteSubject(...)` / `deleteScope(...)` from the same code
+paths that delete the principal or the resource (exactly as
+`notifyScopeMoved` pairs with moves), or a reused id inherits the stranded
+access. `setUserActive(userId, false, ...)` is the reversible offboarding
+switch.
 
 ## The semantic opinions (fixed, not pluggable)
 
@@ -92,6 +115,11 @@ Alfiz is unopinionated about storage, transport, and deployment — and
 - **Hierarchy is data, resolved at check time.** Grants are stored once at
   the node where they are made; checks walk *up* ancestor chains (O(depth)),
   never down subtrees.
+- **A global grant satisfies every scoped check.** `*` is in every object
+  closure, so authority granted globally is authority everywhere. The
+  consequence for existing systems — whose roles can only grant globally —
+  is that adopting scopes means *splitting those roles*; that split is the
+  migration, and [`docs/MIGRATING.md`](docs/MIGRATING.md) walks it.
 - **The naming floor.** `<project>.<tab>.<permission>`; every tab has a
   `read`; actions are `<verb>_<noun>`; destructive actions stand alone.
 
@@ -116,7 +144,10 @@ by construction.
 - [`@alfiz-auth/verify`](packages/verify) — static verification (`alfiz-verify`).
 
 `docs/CONVENTIONS.md` is the machine-legible convention document — drop it
-into your agent context; `@alfiz-auth/verify` checks what the conventions assume.
+into your agent context; `@alfiz-auth/verify` checks what the conventions
+assume. Moving an existing RBAC system over? Start with
+[`docs/MIGRATING.md`](docs/MIGRATING.md) — it covers the role-splitting
+crux, bulk import, deletion wiring, and the per-request snapshot pattern.
 
 ## Development
 

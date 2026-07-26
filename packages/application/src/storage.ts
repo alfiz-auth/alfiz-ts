@@ -44,6 +44,11 @@ export interface GrantFilter {
   roleId?: string | undefined;
 }
 
+export interface RevokeFilter {
+  userId?: string | undefined;
+  scope?: ScopeId | undefined;
+}
+
 export interface RequestStorageFilter {
   state?: AccessRequest["state"] | undefined;
   requesterUserId?: string | undefined;
@@ -64,7 +69,7 @@ export interface StorageDriver {
   // -- revokes --------------------------------------------------------------
   insertRevoke(row: RevokeRow): Promise<void>;
   deleteRevoke(id: string): Promise<RevokeRow | null>;
-  listRevokes(filter?: { userId?: string | undefined }): Promise<RevokeRow[]>;
+  listRevokes(filter?: RevokeFilter): Promise<RevokeRow[]>;
 
   // -- roles ----------------------------------------------------------------
   upsertRole(role: RoleRecord): Promise<void>;
@@ -81,6 +86,8 @@ export interface StorageDriver {
   // -- users ----------------------------------------------------------------
   getUser(userId: string): Promise<StoredUser | null>;
   upsertUser(user: StoredUser): Promise<void>;
+  /** Removes the user record and its membership edges. A no-op when absent. */
+  deleteUser(userId: string): Promise<void>;
   listUsers(): Promise<StoredUser[]>;
   listUsersInGroup(groupId: string): Promise<string[]>;
 

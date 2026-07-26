@@ -16,6 +16,7 @@ import {
   isValidPattern,
   lintCatalog,
   namespaceOf,
+  suggestPattern,
 } from "@alfiz-auth/core";
 
 export type VerifySeverity = "error" | "warning";
@@ -28,6 +29,7 @@ export interface VerifyIssue {
     | "ungated-action"
     | "unreferenced-leaf"
     | "client-reachable-secret"
+    | "ignored-file"
     | "catalog";
   file: string;
   line: number;
@@ -43,13 +45,21 @@ export interface VerifyOptions {
   /**
    * Names treated as concrete-permission gates. Property accesses match on
    * the final name (`client.can`, `session.require`, `can.fresh`).
+   * REPLACES the defaults — a project with its own guard wrappers (the
+   * pattern the conventions encourage; `gateAction` is itself one) passes
+   * `[...DEFAULT_GATE_NAMES, "assertTeaches", ...]`. Without this, every
+   * action gated through a wrapper reads as ungated.
    */
   gateNames?: readonly string[] | undefined;
-  /** Names treated as visibility affordances — never valid as gates. */
+  /**
+   * Names treated as visibility affordances — never valid as gates.
+   * Replaces `DEFAULT_VISIBILITY_NAMES`; spread them in to extend.
+   */
   visibilityNames?: readonly string[] | undefined;
   /**
    * Files counted as server enforcement points even without a
    * `"use server"` directive (route handlers). Matched against the path.
+   * Replaces `DEFAULT_SERVER_FILE_PATTERNS`; spread them in to extend.
    */
   serverFilePatterns?: readonly RegExp[] | undefined;
   /**
@@ -64,23 +74,70 @@ export interface VerifyReport {
   issues: VerifyIssue[];
   /** Concrete keys referenced by at least one scanned call site or nav item. */
   referencedKeys: Set<string>;
+  /** Files skipped by the `alfiz-verify-ignore-file` pragma, with their reasons. */
+  skippedFiles: Array<{ file: string; reason: string }>;
   errorCount: number;
   warningCount: number;
 }
 
-const DEFAULT_GATES = [
+/**
+ * The built-in gate names. A project's own wrappers (`gateDestructiveAction`,
+ * `assertTeaches`, …) are exactly the convention the docs encourage — pass
+ * them via `gateNames`, and spread these in unless you deliberately want to
+ * stop counting the built-ins: `[...DEFAULT_GATE_NAMES, "assertTeaches"]`.
+ * (The CLI's `gateNames` config is additive for that reason.)
+ */
+export const DEFAULT_GATE_NAMES = [
   "can",
   "fresh",
   "require",
   "requirePermission",
   "gateAction",
   "apiRequirePermission",
-];
-const DEFAULT_VISIBILITY = ["canAny", "requireAny"];
-const DEFAULT_SERVER_PATTERNS = [
+] as const;
+export const DEFAULT_VISIBILITY_NAMES = ["canAny", "requireAny"] as const;
+export const DEFAULT_SERVER_FILE_PATTERNS: readonly RegExp[] = [
   /app\/.*route\.(t|j)sx?$/,
   /pages\/api\//,
 ];
+
+/**
+ * The out-of-domain escape hatch: a line comment
+ * `// alfiz-verify-ignore-file <reason>` in a file's LEADING comment region
+ * (before the first statement or import) skips the whole file. For surfaces
+ * that authenticate outside the catalog by design — the trust domain
+ * SPECIFICATION §2.7 endorses, which must survive a database outage and
+ * cannot gate on catalog keys by construction — where "no gate" is the
+ * architecture, not an omission. The reason is required: an unexplained
+ * exemption in a security tool is how exemptions rot.
+ *
+ * Returns `null` when absent, else the reason text ("" when none given).
+ */
+export function ignoreFilePragma(sourceText: string): string | null {
+  const pragma = /^\/\/\s*alfiz-verify-ignore-file\b[ \t]*(.*)$/;
+  let inBlockComment = false;
+  for (const rawLine of sourceText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (inBlockComment) {
+      const end = line.indexOf("*/");
+      if (end === -1) continue;
+      inBlockComment = false;
+      if (line.slice(end + 2).trim() !== "") return null; // code after */
+      continue;
+    }
+    if (line === "") continue;
+    const match = pragma.exec(line);
+    if (match) return match[1]!.trim();
+    if (line.startsWith("//")) continue;
+    if (line.startsWith("/*")) {
+      if (!line.includes("*/")) inBlockComment = true;
+      else if (line.slice(line.indexOf("*/") + 2).trim() !== "") return null;
+      continue;
+    }
+    return null; // first real code line: the leading region is over
+  }
+  return null;
+}
 
 const calleeName = (expr: ts.Expression): string | null => {
   if (ts.isIdentifier(expr)) return expr.text;
@@ -118,15 +175,16 @@ const literalsIn = (arg: ts.Expression): ts.StringLiteralLike[] => {
 
 export function verifyProject(options: VerifyOptions): VerifyReport {
   const catalog = options.catalog;
-  const gates = new Set(options.gateNames ?? DEFAULT_GATES);
-  const visibility = new Set(options.visibilityNames ?? DEFAULT_VISIBILITY);
-  const serverPatterns = options.serverFilePatterns ?? DEFAULT_SERVER_PATTERNS;
+  const gates = new Set(options.gateNames ?? DEFAULT_GATE_NAMES);
+  const visibility = new Set(options.visibilityNames ?? DEFAULT_VISIBILITY_NAMES);
+  const serverPatterns = options.serverFilePatterns ?? DEFAULT_SERVER_FILE_PATTERNS;
   const forbidden = new Set(options.forbidClientIdentifiers ?? []);
   const read =
     options.read ?? ((file: string) => readFileSync(file, "utf8"));
 
   const issues: VerifyIssue[] = [];
   const referencedKeys = new Set<string>();
+  const skippedFiles: Array<{ file: string; reason: string }> = [];
   const namespaces = new Set(catalog.namespaces);
 
   /** Is this literal plausibly a permission reference we should validate? */
@@ -138,9 +196,28 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
   };
 
   for (const file of options.files) {
+    const text = read(file);
+    const ignoreReason = ignoreFilePragma(text);
+    if (ignoreReason !== null) {
+      if (ignoreReason === "") {
+        issues.push({
+          severity: "warning",
+          rule: "ignored-file",
+          file,
+          line: 1,
+          message:
+            "alfiz-verify-ignore-file without a reason — say why this surface is out of the catalog's domain (e.g. \"system trust domain, authenticates by deploy key\")",
+        });
+      }
+      skippedFiles.push({
+        file,
+        reason: ignoreReason === "" ? "(no reason given)" : ignoreReason,
+      });
+      continue;
+    }
     const source = ts.createSourceFile(
       file,
-      read(file),
+      text,
       ts.ScriptTarget.Latest,
       true,
       file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
@@ -198,12 +275,19 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
               if (catalog.hasKey(text)) {
                 referencedKeys.add(text);
               } else if (!catalog.isKnownPattern(text)) {
+                // The near-miss a newcomer hits first: a GROUP path where a
+                // pattern belongs. `"admin"` is a valid shape and a declared
+                // namespace, but groups are folders — the project-root
+                // visibility idiom is `"admin.*"`. Say so.
+                const suggestion = suggestPattern(catalog, text);
                 issues.push({
                   severity: "error",
                   rule: "unknown-pattern",
                   file,
                   line: lineOf(source, literal),
-                  message: `${JSON.stringify(text)} is not in the catalog (typo, or an undeclared key)`,
+                  message: suggestion
+                    ? `${JSON.stringify(text)} is a group, not a key — groups are folders, and subtree patterns end in .*: did you mean ${JSON.stringify(suggestion)}?`
+                    : `${JSON.stringify(text)} is not in the catalog (typo, or an undeclared key)`,
                 });
               } else {
                 // A known group wildcard: mark every key under it referenced.
@@ -321,6 +405,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
   return {
     issues,
     referencedKeys,
+    skippedFiles,
     errorCount: issues.filter((i) => i.severity === "error").length,
     warningCount: issues.filter((i) => i.severity === "warning").length,
   };

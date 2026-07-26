@@ -277,6 +277,42 @@ export function grantedScopesFor(
   return scopes;
 }
 
+/**
+ * The "holds it anywhere" probe: does any applicable unexpired grant confer
+ * `key` at ANY scope, with only global-scope revokes able to suppress it?
+ * (A scoped revoke narrows one subtree; it does not erase a key held
+ * elsewhere.) This is the right question for unscoped conditional UI under
+ * scoped grants — "should this button exist at all" when the concrete scope
+ * is not yet known — and the shared engine behind
+ * `AlfizClient.effectiveKeys`, `AlfizClient.holdsAnywhere`, and
+ * `AlfizSnapshot.heldKeys`. Never a gate: gates use `checkKey` at a
+ * concrete scope.
+ */
+export function keyHeldAnywhere(ctx: CheckContext, key: PermissionKey): boolean {
+  let granted = false;
+  for (const grant of ctx.rows.grants) {
+    if (!ctx.subjectClosure.has(grant.subject)) continue;
+    if (isExpired(grant, ctx.now)) continue;
+    if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
+    if (
+      patternsOfGrant(grant, ctx.rows.roles).some((p) =>
+        patternMatchesKey(p, key),
+      )
+    ) {
+      granted = true;
+      break;
+    }
+  }
+  if (!granted) return false;
+  if (ctx.userId === null) return true;
+  return !ctx.rows.revokes.some(
+    (r) =>
+      r.userId === ctx.userId &&
+      r.scope === GLOBAL_SCOPE &&
+      patternMatchesKey(r.pattern, key),
+  );
+}
+
 /** The scopes at which the user holds a matching personal revoke — the exclusion set for listing queries. */
 export function revokedScopesFor(
   ctx: CheckContext,

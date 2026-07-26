@@ -27,7 +27,9 @@ const catalog = defineCatalog({
     },
   },
   scopeTypes: {
-    "docs.folder": { parent: null },
+    // Folders nest in folders: a self-referencing parent, not `null` —
+    // `parent: null` would commit folder chains to `[scope, "*"]`.
+    "docs.folder": { parent: "docs.folder" },
     "docs.doc": { parent: "docs.folder" },
   },
 });

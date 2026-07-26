@@ -140,6 +140,15 @@ export interface UserGroup {
 }
 
 export interface RoleInput {
+  /**
+   * Caller-supplied id. Omit for a generated one. Supply it when something
+   * OUTSIDE the runtime must reference the role by id — a SQL data
+   * migration seeding well-known roles, an infra-as-code definition — so
+   * migration SQL and `createRole` agree on identity instead of the caller
+   * maintaining a name-resolution cache. Creating an id that already
+   * exists is a conflict, never an overwrite.
+   */
+  id?: string | undefined;
   name: string;
   description?: string | undefined;
   patterns: PermissionPattern[];
@@ -206,6 +215,16 @@ export interface AlfizProvider {
 
   // -- Row operations -------------------------------------------------------
   createGrant(input: GrantInput): Promise<GrantRow>;
+  /**
+   * The bulk write for migrations and imports: every input validated BEFORE
+   * any row is written (one bad input rejects the whole batch), then one
+   * audit entry for the batch and one invalidation event per distinct
+   * subject — not one of each per row.
+   */
+  createGrants(
+    inputs: readonly Omit<GrantInput, "provenance">[],
+    provenance: Provenance,
+  ): Promise<GrantRow[]>;
   deleteGrant(grantId: string, provenance: Provenance): Promise<void>;
   listGrants(filter?: {
     subject?: SubjectId | undefined;
@@ -213,7 +232,43 @@ export interface AlfizProvider {
   }): Promise<GrantRow[]>;
   createRevoke(input: RevokeInput): Promise<RevokeRow>;
   deleteRevoke(revokeId: string, provenance: Provenance): Promise<void>;
-  listRevokes(filter?: { userId?: string | undefined }): Promise<RevokeRow[]>;
+  listRevokes(filter?: {
+    userId?: string | undefined;
+    scope?: ScopeId | undefined;
+  }): Promise<RevokeRow[]>;
+
+  // -- Referential cleanup ----------------------------------------------------
+  // Grants key on subject and scope STRINGS, not foreign keys: deleting a
+  // principal or a resource in the host application's own tables strands the
+  // rows here, and a reused id silently inherits the stranded access. These
+  // two are the cleanup half of the contract — call them from the same code
+  // paths that delete the principal / the resource, exactly as
+  // `notifyScopeMoved` pairs with moves.
+
+  /**
+   * Removes every grant held by `subject`. For `user:<id>` subjects, also
+   * removes the user's personal revokes, their stored record (memberships,
+   * org links, reporting edge), grants held by their implicit-group
+   * subjects (`directs:<id>`, `orgof:<id>` — keyed to the user id), and
+   * cancels their pending access requests. Reporting edges POINTING AT the
+   * deleted user are left for the host to reassign — who manages the
+   * orphaned team is an organizational decision, not a cleanup.
+   */
+  deleteSubject(
+    subject: SubjectId,
+    provenance: Provenance,
+  ): Promise<{ deletedGrants: number; deletedRevokes: number }>;
+
+  /**
+   * Removes every grant and personal revoke AT `scope`, and cancels pending
+   * requests targeting it. Rows at DESCENDANT scopes are separate rows:
+   * when a subtree of resources is deleted, call this per deleted resource
+   * id. The global scope is not deletable.
+   */
+  deleteScope(
+    scope: ScopeId,
+    provenance: Provenance,
+  ): Promise<{ deletedGrants: number; deletedRevokes: number }>;
 
   // -- Requests -------------------------------------------------------------
   submitRequest(input: RequestInput): Promise<AccessRequest>;
@@ -252,7 +307,24 @@ export interface AlfizProvider {
 
   listGroups(): Promise<UserGroup[]>;
   createGroup(
-    input: { name: string; description?: string | undefined; parents?: string[] | undefined },
+    input: {
+      /** Caller-supplied id (migrations, well-known cohorts). Conflict when taken. */
+      id?: string | undefined;
+      name: string;
+      description?: string | undefined;
+      parents?: string[] | undefined;
+    },
+    provenance: Provenance,
+  ): Promise<UserGroup>;
+  /**
+   * Rename / re-describe a group. Identity is the opaque id, so renaming
+   * never breaks grants or memberships — same rule as roles. Parentage is a
+   * graph write and stays on `setGroupParents`; membership on
+   * `setGroupMembership`.
+   */
+  updateGroup(
+    groupId: string,
+    input: { name?: string | undefined; description?: string | undefined },
     provenance: Provenance,
   ): Promise<UserGroup>;
   /** Graph write: transactional DAG enforcement, cycle paths named in errors. */
@@ -268,6 +340,19 @@ export interface AlfizProvider {
     provenance: Provenance,
   ): Promise<void>;
   getGroupMembers(groupId: string): Promise<string[]>;
+
+  /**
+   * User provisioning: set the `active` flag, creating the record when
+   * absent (deactivating a never-provisioned principal must stick). This is
+   * the offboarding switch — an inactive principal evaluates to NO access,
+   * every check shape, immediately on the next closure supply. Reversible,
+   * unlike `deleteSubject`.
+   */
+  setUserActive(
+    userId: string,
+    active: boolean,
+    provenance: Provenance,
+  ): Promise<void>;
 
   /** Graph write: the reporting tree. `managerUserId: null` clears the edge. */
   setReportingEdge(

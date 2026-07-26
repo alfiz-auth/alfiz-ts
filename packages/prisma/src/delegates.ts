@@ -15,9 +15,12 @@
  *     `T | null`, never `undefined` (Prisma's convention). Optional Json
  *     columns are OMITTED from create data when absent (Prisma requires a
  *     sentinel, not plain `null`, to write SQL NULL into a Json column).
+ *   - Optional properties are declared Prisma-style (`prop?: T`, no explicit
+ *     `| undefined`), so the structural match also holds for adopters
+ *     compiling with `exactOptionalPropertyTypes`.
  */
 
-/** A JSON value as stored in (and written to) a Json column. */
+/** A JSON value as read back from a Json column. */
 export type JsonValue =
   | string
   | number
@@ -25,6 +28,17 @@ export type JsonValue =
   | null
   | JsonValue[]
   | { [key: string]: JsonValue };
+
+/**
+ * A JSON value as WRITTEN to a Json column: everything except bare `null`.
+ * Prisma's create/update inputs reject top-level `null` — writing SQL NULL
+ * requires the `Prisma.JsonNull` sentinel, so the driver OMITS optional Json
+ * fields instead (nested nulls are fine). Keeping the create-data fields
+ * this narrow is what makes a generated `PrismaClient` satisfy
+ * `AlfizPrismaDelegates` structurally, with no cast — the package's headline
+ * promise, pinned by `prisma-client-shape.ts`.
+ */
+export type InputJsonValue = Exclude<JsonValue, null>;
 
 /** The only string conditions the driver uses: equality or membership. */
 export type StringWhere = string | { in: string[] };
@@ -51,20 +65,20 @@ export interface AlfizGrantCreateData {
   pattern: string | null;
   scope: string;
   expiresAt: bigint | null;
-  provenance: JsonValue;
+  provenance: InputJsonValue;
   createdAt: bigint;
 }
 
 export interface AlfizGrantWhere {
-  subject?: StringWhere | undefined;
-  scope?: string | undefined;
-  roleId?: string | undefined;
+  subject?: StringWhere;
+  scope?: string;
+  roleId?: string;
 }
 
 export interface AlfizGrantDelegate {
   create(args: { data: AlfizGrantCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizGrantRecord | null>;
-  findMany(args?: { where?: AlfizGrantWhere | undefined }): Promise<AlfizGrantRecord[]>;
+  findMany(args?: { where?: AlfizGrantWhere }): Promise<AlfizGrantRecord[]>;
   deleteMany(args: { where: { id: string } }): Promise<unknown>;
 }
 
@@ -86,16 +100,19 @@ export interface AlfizRevokeCreateData {
   userId: string;
   pattern: string;
   scope: string;
-  provenance: JsonValue;
+  provenance: InputJsonValue;
   createdAt: bigint;
+}
+
+export interface AlfizRevokeWhere {
+  userId?: string;
+  scope?: string;
 }
 
 export interface AlfizRevokeDelegate {
   create(args: { data: AlfizRevokeCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRevokeRecord | null>;
-  findMany(args?: {
-    where?: { userId?: string | undefined } | undefined;
-  }): Promise<AlfizRevokeRecord[]>;
+  findMany(args?: { where?: AlfizRevokeWhere }): Promise<AlfizRevokeRecord[]>;
   deleteMany(args: { where: { id: string } }): Promise<unknown>;
 }
 
@@ -116,9 +133,9 @@ export interface AlfizRoleCreateData {
   id: string;
   name: string;
   description: string | null;
-  patterns: JsonValue;
+  patterns: InputJsonValue;
   /** Omitted (not `null`) when absent — the column defaults to NULL. */
-  requestable?: JsonValue | undefined;
+  requestable?: InputJsonValue;
 }
 
 export interface AlfizRoleDelegate {
@@ -162,14 +179,12 @@ export interface AlfizGroupParentRecord {
 }
 
 export interface AlfizGroupParentWhere {
-  childId?: StringWhere | undefined;
-  parentId?: StringWhere | undefined;
+  childId?: StringWhere;
+  parentId?: StringWhere;
 }
 
 export interface AlfizGroupParentDelegate {
-  findMany(args?: {
-    where?: AlfizGroupParentWhere | undefined;
-  }): Promise<AlfizGroupParentRecord[]>;
+  findMany(args?: { where?: AlfizGroupParentWhere }): Promise<AlfizGroupParentRecord[]>;
   createMany(args: { data: AlfizGroupParentRecord[] }): Promise<unknown>;
   deleteMany(args: { where: AlfizGroupParentWhere }): Promise<unknown>;
 }
@@ -187,7 +202,7 @@ export interface AlfizUserRecord {
 
 export interface AlfizUserData {
   active: boolean;
-  orgIds: JsonValue;
+  orgIds: InputJsonValue;
   managerUserId: string | null;
 }
 
@@ -199,6 +214,8 @@ export interface AlfizUserDelegate {
   }): Promise<unknown>;
   findUnique(args: { where: { userId: string } }): Promise<AlfizUserRecord | null>;
   findMany(): Promise<AlfizUserRecord[]>;
+  /** deleteMany, not delete: Prisma's `delete` throws on absent rows and the seam wants a no-op. */
+  deleteMany(args: { where: { userId: string } }): Promise<unknown>;
 }
 
 export interface AlfizMembershipRecord {
@@ -207,14 +224,12 @@ export interface AlfizMembershipRecord {
 }
 
 export interface AlfizMembershipWhere {
-  userId?: StringWhere | undefined;
-  groupId?: StringWhere | undefined;
+  userId?: StringWhere;
+  groupId?: StringWhere;
 }
 
 export interface AlfizMembershipDelegate {
-  findMany(args?: {
-    where?: AlfizMembershipWhere | undefined;
-  }): Promise<AlfizMembershipRecord[]>;
+  findMany(args?: { where?: AlfizMembershipWhere }): Promise<AlfizMembershipRecord[]>;
   createMany(args: { data: AlfizMembershipRecord[] }): Promise<unknown>;
   deleteMany(args: { where: AlfizMembershipWhere }): Promise<unknown>;
 }
@@ -245,18 +260,18 @@ export interface AlfizRequestData {
   pattern: string | null;
   scope: string;
   proposedExpiresAt: bigint | null;
-  justification: JsonValue;
+  justification: InputJsonValue;
   state: string;
   stageIndex: number;
-  stages: JsonValue;
-  decisions: JsonValue;
+  stages: InputJsonValue;
+  decisions: InputJsonValue;
   createdAt: bigint;
   decidedAt: bigint | null;
 }
 
 export interface AlfizRequestWhere {
-  state?: string | undefined;
-  requesterUserId?: string | undefined;
+  state?: string;
+  requesterUserId?: string;
 }
 
 export interface AlfizRequestDelegate {
@@ -267,9 +282,7 @@ export interface AlfizRequestDelegate {
     update: AlfizRequestData;
   }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRequestRecord | null>;
-  findMany(args?: {
-    where?: AlfizRequestWhere | undefined;
-  }): Promise<AlfizRequestRecord[]>;
+  findMany(args?: { where?: AlfizRequestWhere }): Promise<AlfizRequestRecord[]>;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,8 +298,8 @@ export interface AlfizCatalogRecord {
 export interface AlfizCatalogDelegate {
   upsert(args: {
     where: { id: number };
-    create: { id: number; version: number; document: JsonValue };
-    update: { version: number; document: JsonValue };
+    create: { id: number; version: number; document: InputJsonValue };
+    update: { version: number; document: InputJsonValue };
   }): Promise<unknown>;
   findUnique(args: { where: { id: number } }): Promise<AlfizCatalogRecord | null>;
 }
@@ -312,7 +325,7 @@ export interface AlfizAuditCreateData {
   action: string;
   target: string;
   /** Omitted (not `null`) when absent — the column defaults to NULL. */
-  detail?: JsonValue | undefined;
+  detail?: InputJsonValue;
 }
 
 export interface AlfizAuditDelegate {
@@ -322,9 +335,9 @@ export interface AlfizAuditDelegate {
    * convention ("last N of the ordered result") for audit tail reads.
    */
   findMany(args?: {
-    where?: { target?: string | undefined } | undefined;
-    orderBy?: { at: "asc" } | undefined;
-    take?: number | undefined;
+    where?: { target?: string };
+    orderBy?: { at: "asc" };
+    take?: number;
   }): Promise<AlfizAuditRecord[]>;
 }
 

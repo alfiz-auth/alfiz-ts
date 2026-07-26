@@ -17,17 +17,41 @@ the rest:
 - **client-reachable-secret** — a forbidden identifier (service-key env
   vars) appearing in a `"use client"` module.
 
+## Describe YOUR project, not a hypothetical one
+
+Real projects gate through their own wrappers — the conventions encourage
+it (`gateAction` is itself one). Declare them, or every wrapped action
+reads as ungated and the noise buries the real findings:
+
+- `gateNames` / `visibilityNames` — your wrapper function names. In the CLI
+  config these are **added** to the built-in defaults; on `verifyProject`
+  they **replace** them (spread `DEFAULT_GATE_NAMES` /
+  `DEFAULT_VISIBILITY_NAMES` to extend).
+- `serverFilePatterns` — extra paths treated as server enforcement points
+  (RegExp sources in the CLI config, added to the defaults).
+- Out-of-domain surfaces — files that authenticate outside the catalog *by
+  design* (system trust domains that must survive a database outage) opt
+  out in-file, with a reason, and are listed in the report's
+  `skippedFiles`:
+
+  ```ts
+  // alfiz-verify-ignore-file system trust domain: authenticates by deploy key
+  ```
+
+  A pragma without a reason still skips, but warns (`ignored-file`).
+
 ## Usage
 
 Programmatic (recommended — no JSON step):
 
 ```ts
-import { verifyProject } from "@alfiz-auth/verify";
+import { DEFAULT_GATE_NAMES, verifyProject } from "@alfiz-auth/verify";
 import { catalog } from "./src/alfiz.js";
 
 const report = verifyProject({
   catalog,
   files: myGlob("src/**/*.{ts,tsx}"),
+  gateNames: [...DEFAULT_GATE_NAMES, "assertTeaches", "gateDestructiveAction"],
   forbidClientIdentifiers: ["ALFIZ_SERVICE_KEYS"],
 });
 process.exitCode = report.errorCount > 0 ? 1 : 0;
@@ -39,4 +63,12 @@ CLI: export the catalog document once (`catalog.toDocument()` → JSON), then
 alfiz-verify --config alfiz-verify.config.json
 ```
 
-with `{ "catalog": "alfiz-catalog.json", "include": ["src", "app"] }`.
+```jsonc
+{
+  "catalog": "alfiz-catalog.json",
+  "include": ["src", "app"],
+  "gateNames": ["assertTeaches", "gateDestructiveAction"],
+  "serverFilePatterns": ["app/actions/"],
+  "forbidClientIdentifiers": ["ALFIZ_SERVICE_KEYS"]
+}
+```

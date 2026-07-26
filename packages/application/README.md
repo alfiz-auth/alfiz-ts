@@ -22,10 +22,22 @@ What lives here:
   the approver queue, catalog publishing, virtual-parent dissolution
   snapshots, invalidation events.
 - `memoryDriver` — the reference storage driver.
+- The admin lifecycle surface — `createGrants` (bulk: validate-all-first,
+  one audit entry, one invalidation per subject), caller-supplied ids on
+  `createRole`/`createGroup` (migration SQL and runtime agree on identity),
+  `updateGroup` (rename without touching parentage or membership), and
+  `setUserActive` (the reversible offboarding switch: inactive principals
+  evaluate to no access).
 - `notifyScopeMoved(scope)` — the move hook: the host application owns the
   hierarchy behind `resolveAncestors`, so it must report parent-pointer
   changes; this emits the `scope` invalidation that busts cached ancestor
   chains immediately.
+- `deleteSubject(subject, provenance)` / `deleteScope(scope, provenance)` —
+  the deletion hooks, same discipline as moves: grants key on subject and
+  scope STRINGS, so the code path that deletes a principal or a resource
+  must sweep its rows here, or a reused id inherits the stranded access.
+  User deletion also removes revokes, the stored record, implicit-group
+  grants, and cancels pending requests.
 - Sessions (`session.ts`) — actor/subject split with view-as narrowing:
   every check intersects the previewed subject with the actor's REAL
   access, so previews can only narrow. `serializeViewAs`/`parseViewAs` for

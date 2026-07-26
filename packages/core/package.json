@@ -1,7 +1,7 @@
 {
   "name": "@alfiz-auth/core",
-  "version": "0.1.1",
-  "description": "The Alfiz Client: permission grammar, catalog, closure evaluation, check shapes, caching, and the provider contract. Pure functions over provider-supplied data — no storage, no I/O.",
+  "version": "0.2.0",
+  "description": "The Alfiz Client: permission grammar, catalog, closure evaluation, check shapes, caching, and the provider contract. Pure functions over provider-supplied data \u2014 no storage, no I/O.",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",

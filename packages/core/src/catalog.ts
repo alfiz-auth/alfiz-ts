@@ -29,6 +29,12 @@ import type { ApprovalPolicyInput, RequestPromptInput } from "./requests.js";
 // ---------------------------------------------------------------------------
 
 export interface PermissionLeafInput {
+  /**
+   * Short human-facing name for pickers and checkboxes ("Publish course").
+   * `description` is the LONGER help text beside it; keeping both in the
+   * catalog is what stops UI copy drifting into side tables.
+   */
+  label?: string;
   description?: string;
   /**
    * The read-versus-action taxonomy. Inferred from the leaf name when
@@ -43,8 +49,11 @@ export interface PermissionLeafInput {
   destructive?: boolean;
   /**
    * Scope types this permission is grantable at, in addition to the global
-   * scope. Omitted = grantable at `*` only. Granting at an undeclared scope
-   * type is a validation error at the write path.
+   * scope. Omitted = inherited from the nearest enclosing group that
+   * declares `scopes`, else grantable at `*` only. Declare explicitly
+   * (including `[]` for global-only) to override the inherited default.
+   * Granting at an undeclared scope type is a validation error at the
+   * write path.
    */
   scopes?: readonly ScopeType[];
   /**
@@ -58,14 +67,31 @@ export interface PermissionLeafInput {
 export type LeafInput = true | PermissionLeafInput;
 
 export interface GroupInput {
+  /** Short human-facing name for pickers; `description` is the longer help text. */
+  label?: string;
   description?: string;
+  /**
+   * Default scope types for every leaf under this group (descendant groups
+   * included), overridable per leaf or by a nearer group. Saves declaring
+   * an identical `scopes: [...]` on dozens of sibling leaves when a whole
+   * tab is scoped to one resource type.
+   */
+  scopes?: readonly ScopeType[];
   permissions?: Record<string, LeafInput>;
   groups?: Record<string, GroupInput>;
 }
 
 export interface ScopeTypeInput {
   description?: string;
-  /** The expected parent scope type; `null` for top-level types whose instances parent to `*`. */
+  /**
+   * The expected parent scope type; `null` for top-level types whose
+   * instances parent directly to `*`. This is a COMMITMENT, not a hint: a
+   * `parent: null` type's instances have the ancestor chain `[scope, "*"]`
+   * by declaration, which is what lets the request-scoped snapshot check
+   * them synchronously without consulting the ancestry resolver. A type
+   * whose instances nest under other instances of the SAME type (folders in
+   * folders) declares itself as its own parent: `{ parent: "docs.folder" }`.
+   */
   parent?: ScopeType | null;
   /**
    * Loud opt-out of the single-parent default. With multi-parent enabled an
@@ -263,16 +289,23 @@ export interface LeafMeta {
   /** The group path containing this leaf (its "tab" in the blessed shape). */
   groupPath: string;
   name: string;
+  /** Short human-facing name for pickers; falls back to `name` when absent. */
+  label: string | undefined;
   description: string | undefined;
   kind: "read" | "action";
   destructive: boolean;
-  /** Scope types this leaf is grantable at, beyond the global scope. */
+  /**
+   * Scope types this leaf is grantable at, beyond the global scope —
+   * RESOLVED: group-level defaults are already applied at build time.
+   */
   scopes: readonly ScopeType[];
   impliedOnAncestors: boolean;
 }
 
 export interface GroupMeta {
   path: string;
+  /** Short human-facing name for pickers; falls back to the path segment. */
+  label: string | undefined;
   description: string | undefined;
   /** Immediate child group paths. */
   groups: readonly string[];
@@ -539,8 +572,17 @@ export function defineCatalog<const C extends CatalogInput>(
 
   const leaves = new Map<PermissionKey, LeafMeta>();
   const groups = new Map<string, GroupMeta>();
+  /** Group-declared scope defaults, validated against scopeTypes below. */
+  const groupScopeRefs: Array<{ path: string; scopes: readonly ScopeType[] }> = [];
 
-  const walk = (path: string, group: GroupInput) => {
+  const walk = (
+    path: string,
+    group: GroupInput,
+    inheritedScopes: readonly ScopeType[],
+  ) => {
+    // The nearest enclosing `scopes` declaration wins; leaves override last.
+    const defaultScopes = group.scopes ?? inheritedScopes;
+    if (group.scopes) groupScopeRefs.push({ path, scopes: group.scopes });
     const childGroups: string[] = [];
     const childLeaves: PermissionKey[] = [];
     for (const [name, leafInput] of Object.entries(group.permissions ?? {})) {
@@ -565,10 +607,11 @@ export function defineCatalog<const C extends CatalogInput>(
         key,
         groupPath: path,
         name,
+        label: leaf.label,
         description: leaf.description,
         kind: leaf.kind ?? inferKind(name),
         destructive: leaf.destructive ?? inferDestructive(name),
-        scopes: leaf.scopes ?? [],
+        scopes: leaf.scopes ?? defaultScopes,
         impliedOnAncestors: leaf.impliedOnAncestors ?? false,
       });
       childLeaves.push(key);
@@ -580,10 +623,11 @@ export function defineCatalog<const C extends CatalogInput>(
       }
       const subPath = `${path}.${name}`;
       childGroups.push(subPath);
-      walk(subPath, sub);
+      walk(subPath, sub, defaultScopes);
     }
     groups.set(path, {
       path,
+      label: group.label,
       description: group.description,
       groups: childGroups,
       permissions: childLeaves,
@@ -604,7 +648,7 @@ export function defineCatalog<const C extends CatalogInput>(
         `project is not a declared namespace (namespace/additionalNamespaces) — catalogs must be federation-shaped from the first commit`,
       );
     }
-    walk(projectName, project);
+    walk(projectName, project, []);
   }
 
   // Scope types.
@@ -634,11 +678,20 @@ export function defineCatalog<const C extends CatalogInput>(
       );
     }
   }
-  // Leaf scope references.
+  // Leaf scope references (group defaults are already resolved onto leaves).
   for (const leaf of leaves.values()) {
     for (const type of leaf.scopes) {
       if (!scopeTypes.has(type)) {
         err(leaf.key, `references undeclared scope type ${JSON.stringify(type)}`);
+      }
+    }
+  }
+  // Group-declared defaults too — a group with no leaves must still not
+  // reference a scope type nobody declared.
+  for (const ref of groupScopeRefs) {
+    for (const type of ref.scopes) {
+      if (!scopeTypes.has(type)) {
+        err(ref.path, `references undeclared scope type ${JSON.stringify(type)}`);
       }
     }
   }
@@ -672,6 +725,24 @@ export function defineCatalog<const C extends CatalogInput>(
     scopeTypes,
     navigation: buildNav(input.navigation ?? []),
   });
+}
+
+/**
+ * A "did you mean" for unknown patterns. The near-miss every newcomer hits:
+ * passing a GROUP path (`"admin"`) where a pattern is required — a valid
+ * shape that names nothing, because groups are folders, never keys; the
+ * pattern selecting a subtree is `"admin.*"`. Returns the corrected pattern
+ * when that is the fix, else `null`. Used by the static verifier and the
+ * Application's write-path errors so both report the idiom instead of a
+ * bare "not in the catalog".
+ */
+export function suggestPattern(
+  catalog: AnyCatalog,
+  pattern: string,
+): string | null {
+  if (catalog.isKnownPattern(pattern)) return null;
+  if (catalog.hasGroup(pattern)) return `${pattern}.*`;
+  return null;
 }
 
 /**

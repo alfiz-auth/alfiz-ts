@@ -184,6 +184,136 @@ describe("client-reachable-secret", () => {
   });
 });
 
+describe("project gate wrappers via gateNames/visibilityNames/serverFilePatterns", () => {
+  it("custom gate names count as gates and their key literals are validated", () => {
+    const report = run(
+      {
+        "app/actions.ts": `
+          "use server";
+          export async function destroy(id: string) {
+            await gateDestructiveAction("docs.files.delete");
+            return remove(id);
+          }
+          export async function edit(id: string) {
+            await assertTeaches(actor, id, "docs.files.update_file");
+            return save(id);
+          }
+        `,
+      },
+      {
+        gateNames: [
+          "can",
+          "gateAction",
+          "gateDestructiveAction",
+          "assertTeaches",
+        ],
+      },
+    );
+    expect(byRule(report.issues, "ungated-action")).toEqual([]);
+    // Keys inside wrappers count as referenced: no unreferenced-leaf noise.
+    expect(byRule(report.issues, "unreferenced-leaf")).toEqual([]);
+  });
+
+  it("custom visibility names are flagged as gates in server files", () => {
+    const report = run(
+      {
+        "app/actions.ts": `
+          "use server";
+          export async function thing() {
+            if (await showIfAny(user, "docs.*")) return;
+          }
+        `,
+      },
+      { visibilityNames: ["canAny", "requireAny", "showIfAny"] },
+    );
+    expect(byRule(report.issues, "visibility-as-gate").length).toBe(1);
+  });
+
+  it("custom server-file patterns pull files into enforcement analysis", () => {
+    const report = run(
+      {
+        "server/handlers/update.ts": `
+          export async function handler() { return save(); }
+        `,
+      },
+      { serverFilePatterns: [/server\/handlers\//] },
+    );
+    expect(byRule(report.issues, "ungated-action").length).toBe(1);
+  });
+});
+
+describe("alfiz-verify-ignore-file pragma", () => {
+  it("skips the file with a recorded reason; keys and actions inside are invisible", () => {
+    const report = run({
+      "app/api/system/route.ts": `
+        // alfiz-verify-ignore-file system trust domain: authenticates by deploy key, must survive a DB outage
+        export async function POST() {
+          return doSystemThing();
+        }
+      `,
+      "app/actions.ts": `await gateAction("docs.files.update_file");`,
+    });
+    expect(byRule(report.issues, "ungated-action")).toEqual([]);
+    expect(report.skippedFiles).toEqual([
+      {
+        file: "app/api/system/route.ts",
+        reason:
+          "system trust domain: authenticates by deploy key, must survive a DB outage",
+      },
+    ]);
+  });
+
+  it("a pragma without a reason still skips, but warns", () => {
+    const report = run({
+      "app/api/system/route.ts": `
+        // alfiz-verify-ignore-file
+        export async function POST() { return doSystemThing(); }
+      `,
+    });
+    expect(byRule(report.issues, "ungated-action")).toEqual([]);
+    const warnings = byRule(report.issues, "ignored-file");
+    expect(warnings.length).toBe(1);
+    expect(warnings[0]!.severity).toBe("warning");
+  });
+
+  it("works below a license header, but not after code begins", () => {
+    const report = run({
+      "a.ts": `
+        /* copyright someone */
+        // alfiz-verify-ignore-file generated bindings
+        export async function x() { return 1; }
+      `,
+      "b.ts": `
+        export const y = 1;
+        // alfiz-verify-ignore-file too late — this is not a leading comment
+        export async function z() { return 1; }
+      `,
+    });
+    expect(report.skippedFiles.map((s) => s.file)).toEqual(["a.ts"]);
+  });
+});
+
+describe("group-path near-miss", () => {
+  it('says "did you mean docs.*" when a group path is used as a pattern', () => {
+    const report = run({
+      "app/page.ts": `await client.requireAny(user, "docs");`,
+    });
+    const unknown = byRule(report.issues, "unknown-pattern");
+    expect(unknown.length).toBe(1);
+    expect(unknown[0]!.message).toContain('did you mean "docs.*"');
+    expect(unknown[0]!.message).toContain("group");
+  });
+
+  it("still reports plain typos without a bogus suggestion", () => {
+    const report = run({
+      "app/page.ts": `await client.can(user, "docs.files.raed");`,
+    });
+    const unknown = byRule(report.issues, "unknown-pattern");
+    expect(unknown.length).toBe(1);
+    expect(unknown[0]!.message).not.toContain("did you mean");
+  });
+});
+
 describe("catalog rule + report totals", () => {
   it("catalog lint issues ride along and totals add up", () => {
     const floorless = defineCatalog({

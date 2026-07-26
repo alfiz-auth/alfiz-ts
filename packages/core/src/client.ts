@@ -6,7 +6,10 @@
  * Check shapes: `can` (the only gate shape), `canAny` (visibility affordance
  * only), their throwing `require*` forms, and `can.fresh`, which bypasses all
  * caches — the intended pairing for destructive actions and time-bound
- * elevations.
+ * elevations. Server-rendered request handling has a third surface:
+ * `snapshot(principal)` fetches once and then checks SYNCHRONOUSLY — see
+ * snapshot.ts; it is the intended shape wherever render helpers cannot be
+ * async.
  *
  * Staleness bounds, stated honestly: subject-side data lives for
  * `subjectCacheTtlMs` (default 30s) unless an invalidation event lands
@@ -24,13 +27,12 @@ import {
   checkKey,
   explainKey,
   grantedScopesFor,
-  isExpired,
-  patternsOfGrant,
+  keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
 import type { AnyCatalog } from "./catalog.js";
 import { AccessDeniedError } from "./errors.js";
-import type { PermissionKey } from "./grammar.js";
+import type { LooseKey, PermissionKey } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
 import type {
   AlfizProvider,
@@ -39,6 +41,8 @@ import type {
 } from "./provider.js";
 import type { ScopeId } from "./scopes.js";
 import { GLOBAL_SCOPE, objectClosureOf } from "./scopes.js";
+import type { SnapshotOptions } from "./snapshot.js";
+import { AlfizSnapshot } from "./snapshot.js";
 
 export interface AlfizClientOptions {
   catalog: AnyCatalog;
@@ -344,6 +348,51 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   }
 
   /**
+   * One provider round-trip, then synchronous checks: the request-scoped
+   * snapshot, THE pattern for server-rendered frameworks (see snapshot.ts).
+   * Resolves the chain of every scope appearing in the principal's own
+   * grant and revoke rows — so `snap.canAny`, revoke suppression, and
+   * ancestor implication are exact — plus any `options.scopes` you intend
+   * to check against. Flat top-level scope types need no pre-resolution;
+   * hierarchical ones do.
+   *
+   * Draws from the same caches as `can` (a snapshot is one CONSISTENT
+   * instant of them, which is a stronger per-request guarantee than calling
+   * `can` repeatedly); `fresh: true` bypasses the caches like `can.fresh`.
+   */
+  async snapshot(
+    principal: PrincipalRef,
+    options?: SnapshotOptions,
+  ): Promise<AlfizSnapshot<K, P>> {
+    const fresh = options?.fresh ?? false;
+    const data = await this.subjectData(principal, fresh);
+    const ctx = this.ctxOf(data);
+    const wanted = new Set<ScopeId>();
+    for (const scope of options?.scopes ?? []) {
+      if (scope !== GLOBAL_SCOPE) wanted.add(scope);
+    }
+    for (const grant of data.grants) {
+      if (grant.scope !== GLOBAL_SCOPE) wanted.add(grant.scope);
+    }
+    for (const revoke of data.revokes) {
+      if (revoke.scope !== GLOBAL_SCOPE) wanted.add(revoke.scope);
+    }
+    const chains = new Map<ScopeId, readonly ScopeId[]>();
+    await Promise.all(
+      [...wanted].map(async (scope) => {
+        chains.set(scope, await this.objectClosure(scope, fresh));
+      }),
+    );
+    return new AlfizSnapshot<K, P>({
+      catalog: this.catalog,
+      principal,
+      data,
+      ctx,
+      chains,
+    });
+  }
+
+  /**
    * The visibility affordance: does effective access intersect `pattern` at
    * all, at any scope? Never a gate — the static verifier errors on `canAny`
    * in server actions and route handlers.
@@ -404,7 +453,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
    */
   async explain(
     principal: PrincipalRef,
-    key: K,
+    key: LooseKey<K>,
     scope?: ScopeId,
   ): Promise<
     CheckExplanation & {
@@ -449,7 +498,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
    */
   async grantedScopes(
     principal: PrincipalRef,
-    key: K,
+    key: LooseKey<K>,
   ): Promise<{ granted: Set<ScopeId>; revoked: Set<ScopeId> }> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return { granted: new Set(), revoked: new Set() };
@@ -461,44 +510,39 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   }
 
   /**
+   * Does the principal hold `key` at ANY scope? The single-key "holds it
+   * anywhere" probe (see `keyHeldAnywhere` for the exact semantics). This is
+   * a legitimate — and under scoped grants, the RIGHT — question for
+   * unscoped conditional UI: an instructor holding `publish_course` only at
+   * the courses they teach should still see the button surface exist.
+   * Never a gate: the action behind the button still gates with `can` at
+   * its concrete scope. O(rows) for one key; for many keys per request,
+   * prefer `snapshot(principal).heldKeys`.
+   */
+  async holdsAnywhere(
+    principal: PrincipalRef,
+    key: LooseKey<K>,
+  ): Promise<boolean> {
+    const data = await this.subjectData(principal, false);
+    if (!data.active) return false;
+    return keyHeldAnywhere(this.ctxOf(data), key as PermissionKey);
+  }
+
+  /**
    * Every concrete catalog key the principal holds SOMEWHERE: granted by an
    * applicable unexpired row at any scope, suppressed only by global-scope
    * revokes (a folder-scoped revoke narrows one subtree; it does not erase
-   * a key held elsewhere). A debugging and administration surface, not a
-   * gate — gates always use `can` at a concrete scope.
+   * a key held elsewhere). "Not a gate" does not mean "not useful": this is
+   * the right feed for unscoped conditional UI under scoped grants — it is
+   * simply never the thing that AUTHORIZES an action, which always gates
+   * with `can` at a concrete scope. O(catalog); call once per request and
+   * reuse — `snapshot(principal).heldKeys` does exactly that.
    */
   async effectiveKeys(principal: PrincipalRef): Promise<PermissionKey[]> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return [];
     const ctx = this.ctxOf(data);
-    const held: PermissionKey[] = [];
-    for (const key of this.catalog.keys) {
-      let granted = false;
-      for (const grant of ctx.rows.grants) {
-        if (!ctx.subjectClosure.has(grant.subject)) continue;
-        if (isExpired(grant, ctx.now)) continue;
-        if (!this.grantApplies(key, grant.scope)) continue;
-        if (
-          patternsOfGrant(grant, ctx.rows.roles).some((p) =>
-            patternMatchesKey(p, key),
-          )
-        ) {
-          granted = true;
-          break;
-        }
-      }
-      if (!granted) continue;
-      const revoked =
-        ctx.userId !== null &&
-        ctx.rows.revokes.some(
-          (r) =>
-            r.userId === ctx.userId &&
-            r.scope === GLOBAL_SCOPE &&
-            patternMatchesKey(r.pattern, key),
-        );
-      if (!revoked) held.push(key);
-    }
-    return held;
+    return this.catalog.keys.filter((key) => keyHeldAnywhere(ctx, key));
   }
 }
 

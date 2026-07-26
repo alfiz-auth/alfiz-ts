@@ -45,8 +45,11 @@ import {
   computeSubjectClosure,
   findCycle,
   isGlobalScope,
+  isValidSubject,
+  parseSubject,
   planVirtualParentDissolution,
   runAutoStages,
+  suggestPattern,
   validateGrantRow,
   validateJustification,
   validatePattern,
@@ -194,6 +197,18 @@ export class AlfizApplication implements AlfizProvider {
     }
   }
 
+  /** The unknown-pattern rejection, with the group-path near-miss named. */
+  private unknownPattern(pattern: string): ProviderWriteRejectedError {
+    const suggestion = suggestPattern(this.catalog, pattern);
+    return new ProviderWriteRejectedError(
+      `pattern ${JSON.stringify(pattern)} references nothing in the catalog` +
+        (suggestion
+          ? ` — it is a group, and groups are folders, never keys; the subtree pattern is ${JSON.stringify(suggestion)}`
+          : ""),
+      "validation",
+    );
+  }
+
   // -- capabilities ---------------------------------------------------------
 
   async capabilities() {
@@ -326,7 +341,7 @@ export class AlfizApplication implements AlfizProvider {
 
   // -- row operations -------------------------------------------------------
 
-  private validateGrantInput(input: GrantInput): asserts input is GrantInput {
+  private validateGrantInput(input: Omit<GrantInput, "provenance">): void {
     const scope = input.scope ?? GLOBAL_SCOPE;
     const scopeIssue = validateScopeId(scope);
     if (scopeIssue) {
@@ -344,10 +359,7 @@ export class AlfizApplication implements AlfizProvider {
         throw new ProviderWriteRejectedError(issue.reason, "validation");
       }
       if (!this.catalog.isKnownPattern(input.pattern)) {
-        throw new ProviderWriteRejectedError(
-          `pattern ${JSON.stringify(input.pattern)} references nothing in the catalog`,
-          "validation",
-        );
+        throw this.unknownPattern(input.pattern);
       }
       if (!isGlobalScope(scope)) {
         const grantable = this.catalog.validateGrantableAt(input.pattern, scope);
@@ -364,7 +376,10 @@ export class AlfizApplication implements AlfizProvider {
     }
   }
 
-  async createGrant(input: GrantInput): Promise<GrantRow> {
+  /** Everything createGrant checks before touching storage — shared by the bulk form. */
+  private async assertGrantWritable(
+    input: Omit<GrantInput, "provenance">,
+  ): Promise<void> {
     this.validateGrantInput(input);
     const scope = input.scope ?? GLOBAL_SCOPE;
     if (isGlobalScope(scope)) this.requireOrgRoot("a global-scope grant");
@@ -388,20 +403,32 @@ export class AlfizApplication implements AlfizProvider {
         }
       }
     }
+  }
+
+  private buildGrantRow(
+    input: Omit<GrantInput, "provenance">,
+    provenance: Provenance,
+  ): GrantRow {
     const row: GrantRow = {
       id: this.newId(),
       subject: input.subject,
       roleId: input.roleId,
       pattern: input.pattern,
-      scope,
+      scope: input.scope ?? GLOBAL_SCOPE,
       expiresAt: input.expiresAt,
-      provenance: input.provenance,
+      provenance,
       createdAt: this.now(),
     };
     const invalid = validateGrantRow(row);
     if (invalid) {
       throw new ProviderWriteRejectedError(invalid.reason, "validation");
     }
+    return row;
+  }
+
+  async createGrant(input: GrantInput): Promise<GrantRow> {
+    await this.assertGrantWritable(input);
+    const row = this.buildGrantRow(input, input.provenance);
     await this.storage.insertGrant(row);
     await this.audit(input.provenance, "grant.create", row.id, {
       subject: row.subject,
@@ -412,6 +439,37 @@ export class AlfizApplication implements AlfizProvider {
     });
     this.emitSubject(row.subject);
     return row;
+  }
+
+  /**
+   * The bulk write for migrations and imports. Every input is validated
+   * BEFORE any row is written, so one bad assignment rejects the whole
+   * batch instead of leaving a half-imported tenant; then one audit entry
+   * records the batch and one invalidation event fires per distinct
+   * subject. N sequential `createGrant` calls would cost N validations, N
+   * audit rows, and N cache busts — this is the shape a real tenant
+   * migration wants.
+   */
+  async createGrants(
+    inputs: readonly Omit<GrantInput, "provenance">[],
+    provenance: Provenance,
+  ): Promise<GrantRow[]> {
+    if (inputs.length === 0) return [];
+    for (const input of inputs) {
+      await this.assertGrantWritable(input);
+    }
+    const rows = inputs.map((input) => this.buildGrantRow(input, provenance));
+    for (const row of rows) {
+      await this.storage.insertGrant(row);
+    }
+    await this.audit(provenance, "grant.create_bulk", this.newId(), {
+      count: rows.length,
+      grantIds: rows.map((r) => r.id),
+    });
+    for (const subject of new Set(rows.map((r) => r.subject))) {
+      this.emitSubject(subject);
+    }
+    return rows;
   }
 
   async deleteGrant(grantId: string, provenance: Provenance): Promise<void> {
@@ -456,10 +514,7 @@ export class AlfizApplication implements AlfizProvider {
     if (!this.catalog.isKnownPattern(input.pattern)) {
       // A typo'd revoke would silently fail OPEN — the one direction a
       // mistake here must never take.
-      throw new ProviderWriteRejectedError(
-        `pattern ${JSON.stringify(input.pattern)} references nothing in the catalog`,
-        "validation",
-      );
+      throw this.unknownPattern(input.pattern);
     }
     const scopeIssue = validateScopeId(scope);
     if (scopeIssue) {
@@ -507,8 +562,176 @@ export class AlfizApplication implements AlfizProvider {
 
   async listRevokes(filter?: {
     userId?: string | undefined;
+    scope?: ScopeId | undefined;
   }): Promise<RevokeRow[]> {
     return this.storage.listRevokes(filter);
+  }
+
+  // -- referential cleanup ----------------------------------------------------
+  // Grants key on subject and scope STRINGS, not foreign keys. Deleting a
+  // principal or a resource in the host application's own tables therefore
+  // strands the rows here — silently, and a reused id would inherit the
+  // stranded access. These two are the deletion discipline, paired with the
+  // host's own delete paths exactly as `notifyScopeMoved` pairs with moves.
+
+  /**
+   * Remove a principal from the authorization system: every grant held by
+   * `subject`; and for `user:<id>` subjects also their personal revokes,
+   * their stored record (memberships, org links, reporting edge), grants
+   * held by their implicit-group subjects (`directs:<id>` / `orgof:<id>`,
+   * which are keyed to the user id and would resurrect on id reuse), and
+   * their pending access requests (cancelled — a departed requester must
+   * not haunt approver queues).
+   *
+   * Call this from the same code path that deletes the user, revokes the
+   * API token, or removes the service account. For groups prefer
+   * `deleteGroup`, which additionally repairs parentage and memberships.
+   * Reporting edges POINTING AT a deleted user are left in place: who
+   * inherits the orphaned team is an organizational decision for the host
+   * (reassign via `setReportingEdge` / `importDirectory`), not a cleanup.
+   */
+  async deleteSubject(
+    subject: SubjectId,
+    provenance: Provenance,
+  ): Promise<{ deletedGrants: number; deletedRevokes: number }> {
+    if (!isValidSubject(subject)) {
+      throw new ProviderWriteRejectedError(
+        `${JSON.stringify(subject)} is not a valid subject id`,
+        "validation",
+      );
+    }
+    const parsed = parseSubject(subject)!;
+    if (parsed.kind === "user") {
+      // Offboarding touches the user record and memberships: org-domain.
+      this.requireOrgRoot("offboarding a user");
+    }
+    const sweep: SubjectId[] =
+      parsed.kind === "user"
+        ? [subject, `directs:${parsed.id}`, `orgof:${parsed.id}`]
+        : [subject];
+    const grants: GrantRow[] = [];
+    for (const member of sweep) {
+      grants.push(...(await this.storage.listGrants({ subject: member })));
+    }
+    const revokes =
+      parsed.kind === "user"
+        ? await this.storage.listRevokes({ userId: parsed.id })
+        : [];
+    if (
+      !this.orgRoot &&
+      (grants.some((g) => isGlobalScope(g.scope)) ||
+        revokes.some((r) => isGlobalScope(r.scope)))
+    ) {
+      // Checked before ANY row is touched: no partial sweep on rejection.
+      this.requireOrgRoot("deleting a subject's global-scope rows");
+    }
+    for (const grant of grants) {
+      await this.storage.deleteGrant(grant.id);
+      await this.audit(provenance, "grant.delete", grant.id, {
+        subject: grant.subject,
+        reason: "subject deleted",
+      });
+    }
+    for (const revoke of revokes) {
+      await this.storage.deleteRevoke(revoke.id);
+      await this.audit(provenance, "revoke.delete", revoke.id, {
+        userId: revoke.userId,
+        reason: "subject deleted",
+      });
+    }
+    let cancelledRequests = 0;
+    if (parsed.kind === "user") {
+      const pending = await this.storage.listRequests({
+        state: "pending",
+        requesterUserId: parsed.id,
+      });
+      for (const request of pending) {
+        await this.storage.updateRequest({
+          ...request,
+          state: "cancelled",
+          decidedAt: this.now(),
+        });
+        await this.audit(provenance, "request.cancel", request.id, {
+          reason: "subject deleted",
+        });
+      }
+      cancelledRequests = pending.length;
+      await this.storage.deleteUser(parsed.id);
+    }
+    await this.audit(provenance, "subject.delete", subject, {
+      grants: grants.length,
+      revokes: revokes.length,
+      ...(cancelledRequests > 0 ? { cancelledRequests } : {}),
+    });
+    for (const member of sweep) this.emitSubject(member);
+    return { deletedGrants: grants.length, deletedRevokes: revokes.length };
+  }
+
+  /**
+   * Remove a deleted resource's access data: every grant and every personal
+   * revoke AT `scope`, plus cancellation of pending requests targeting it.
+   * Call this from the same code path that deletes the resource row.
+   *
+   * Rows at DESCENDANT scopes are separate rows — hierarchy is your data,
+   * so Alfiz cannot enumerate a subtree. When you delete a subtree of
+   * resources, call this once per deleted resource id.
+   */
+  async deleteScope(
+    scope: ScopeId,
+    provenance: Provenance,
+  ): Promise<{ deletedGrants: number; deletedRevokes: number }> {
+    if (isGlobalScope(scope)) {
+      throw new ProviderWriteRejectedError(
+        "the global scope is not a deletable resource",
+        "validation",
+      );
+    }
+    const scopeIssue = validateScopeId(scope);
+    if (scopeIssue) {
+      throw new ProviderWriteRejectedError(scopeIssue.reason, "validation");
+    }
+    const grants = await this.storage.listGrants({ scope });
+    const revokes = await this.storage.listRevokes({ scope });
+    for (const grant of grants) {
+      await this.storage.deleteGrant(grant.id);
+      await this.audit(provenance, "grant.delete", grant.id, {
+        subject: grant.subject,
+        reason: "scope deleted",
+      });
+    }
+    for (const revoke of revokes) {
+      await this.storage.deleteRevoke(revoke.id);
+      await this.audit(provenance, "revoke.delete", revoke.id, {
+        userId: revoke.userId,
+        reason: "scope deleted",
+      });
+    }
+    const pending = (
+      await this.storage.listRequests({ state: "pending" })
+    ).filter((r) => r.scope === scope);
+    for (const request of pending) {
+      await this.storage.updateRequest({
+        ...request,
+        state: "cancelled",
+        decidedAt: this.now(),
+      });
+      await this.audit(provenance, "request.cancel", request.id, {
+        reason: "scope deleted",
+      });
+    }
+    await this.audit(provenance, "scope.delete", scope, {
+      grants: grants.length,
+      revokes: revokes.length,
+      ...(pending.length > 0 ? { cancelledRequests: pending.length } : {}),
+    });
+    this.emit({ type: "scope", scope });
+    for (const subject of new Set(grants.map((g) => g.subject))) {
+      this.emitSubject(subject);
+    }
+    for (const userId of new Set(revokes.map((r) => r.userId))) {
+      this.emit({ type: "user", userId });
+    }
+    return { deletedGrants: grants.length, deletedRevokes: revokes.length };
   }
 
   // -- requests -------------------------------------------------------------
@@ -624,10 +847,7 @@ export class AlfizApplication implements AlfizProvider {
       const issue = validatePattern(input.pattern);
       if (issue) throw new ProviderWriteRejectedError(issue.reason, "validation");
       if (!this.catalog.isKnownPattern(input.pattern)) {
-        throw new ProviderWriteRejectedError(
-          `pattern ${JSON.stringify(input.pattern)} references nothing in the catalog`,
-          "validation",
-        );
+        throw this.unknownPattern(input.pattern);
       }
       if (!isGlobalScope(scope)) {
         const grantable = this.catalog.validateGrantableAt(input.pattern, scope);
@@ -910,11 +1130,18 @@ export class AlfizApplication implements AlfizProvider {
       const issue = validatePattern(pattern);
       if (issue) throw new ProviderWriteRejectedError(issue.reason, "validation");
       if (!this.catalog.isKnownPattern(pattern)) {
-        throw new ProviderWriteRejectedError(
-          `pattern ${JSON.stringify(pattern)} references nothing in the catalog`,
-          "validation",
-        );
+        throw this.unknownPattern(pattern);
       }
+    }
+  }
+
+  /** A caller-supplied id must be usable and free — never an overwrite. */
+  private validateSuppliedId(id: string): void {
+    if (id === "") {
+      throw new ProviderWriteRejectedError(
+        "a caller-supplied id must be a non-empty string",
+        "validation",
+      );
     }
   }
 
@@ -927,8 +1154,17 @@ export class AlfizApplication implements AlfizProvider {
     if (input.requestable) {
       await this.assertPolicyResolvable(input.requestable.stages);
     }
+    if (input.id !== undefined) {
+      this.validateSuppliedId(input.id);
+      if ((await this.storage.getRole(input.id)) !== null) {
+        throw new ProviderWriteRejectedError(
+          `role id ${JSON.stringify(input.id)} already exists`,
+          "conflict",
+        );
+      }
+    }
     const role: RoleRecord = {
-      id: this.newId(),
+      id: input.id ?? this.newId(),
       name: input.name,
       description: input.description,
       patterns: [...input.patterns],
@@ -1002,6 +1238,7 @@ export class AlfizApplication implements AlfizProvider {
 
   async createGroup(
     input: {
+      id?: string | undefined;
       name: string;
       description?: string | undefined;
       parents?: string[] | undefined;
@@ -1010,6 +1247,15 @@ export class AlfizApplication implements AlfizProvider {
   ): Promise<UserGroup> {
     this.requireOrgRoot("a user group");
     return this.storage.runExclusive("groups", async () => {
+      if (input.id !== undefined) {
+        this.validateSuppliedId(input.id);
+        if ((await this.storage.getGroup(input.id)) !== null) {
+          throw new ProviderWriteRejectedError(
+            `group id ${JSON.stringify(input.id)} already exists`,
+            "conflict",
+          );
+        }
+      }
       for (const parent of input.parents ?? []) {
         if ((await this.storage.getGroup(parent)) === null) {
           throw new ProviderWriteRejectedError(
@@ -1019,7 +1265,7 @@ export class AlfizApplication implements AlfizProvider {
         }
       }
       const group: UserGroup = {
-        id: this.newId(),
+        id: input.id ?? this.newId(),
         name: input.name,
         description: input.description,
         parents: [...(input.parents ?? [])],
@@ -1030,6 +1276,36 @@ export class AlfizApplication implements AlfizProvider {
       });
       this.emitSubject(`group:${group.id}`);
       return group;
+    });
+  }
+
+  async updateGroup(
+    groupId: string,
+    input: { name?: string | undefined; description?: string | undefined },
+    provenance: Provenance,
+  ): Promise<UserGroup> {
+    this.requireOrgRoot("a user group");
+    // Serialized with the graph writes: upsertGroup stores the full record,
+    // so an unserialized rename could clobber a concurrent parent edit.
+    return this.storage.runExclusive("groups", async () => {
+      const group = await this.storage.getGroup(groupId);
+      if (!group) {
+        throw new ProviderWriteRejectedError("group not found", "not_found");
+      }
+      const updated: UserGroup = {
+        ...group,
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        ...(input.description !== undefined
+          ? { description: input.description }
+          : {}),
+      };
+      await this.storage.upsertGroup(updated);
+      await this.audit(provenance, "group.update", groupId, {
+        name: updated.name,
+      });
+      // No invalidation event: identity is the id — names and descriptions
+      // never enter evaluation, so renaming busts nothing.
+      return updated;
     });
   }
 
@@ -1144,6 +1420,33 @@ export class AlfizApplication implements AlfizProvider {
 
   async getGroupMembers(groupId: string): Promise<string[]> {
     return this.storage.listUsersInGroup(groupId);
+  }
+
+  /**
+   * The offboarding switch: an inactive principal evaluates to NO access —
+   * every check shape, every scope — from the next closure supply
+   * (immediately, via the emitted invalidation; bounded by the subject TTL
+   * otherwise). Creates the record when absent, because deactivating a
+   * principal Alfiz never stored must still stick: absence means "member of
+   * `everyone`", not "gone". Reversible, unlike `deleteSubject` —
+   * deactivate on offboarding, delete when the id itself is being retired.
+   */
+  async setUserActive(
+    userId: string,
+    active: boolean,
+    provenance: Provenance,
+  ): Promise<void> {
+    this.requireOrgRoot("user provisioning");
+    const user = (await this.storage.getUser(userId)) ?? {
+      userId,
+      active: true,
+      groupIds: [],
+      orgIds: [],
+      managerUserId: null,
+    };
+    await this.storage.upsertUser({ ...user, active });
+    await this.audit(provenance, "user.set_active", userId, { active });
+    this.emit({ type: "user", userId });
   }
 
   async setReportingEdge(

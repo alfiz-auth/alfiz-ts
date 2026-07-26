@@ -20,6 +20,18 @@ export type PermissionKey = string;
 /** A key or a subtree wildcard: `*`, `a.*`, `a.b.*`, or a concrete key. */
 export type PermissionPattern = string;
 
+/**
+ * A catalog-typed key that still admits runtime strings: the blessed escape
+ * hatch for generic wrappers that route many keys through one function
+ * (`assertCanDo(actor, thing, permission: string)`). Autocomplete and
+ * compile-checking survive for literal call sites; a plain `string` flows
+ * through without `as never`. Used on the INTROSPECTION paths only
+ * (`grantedScopes`, `explain`, `holdsAnywhere`) — gates (`can`, `require*`)
+ * stay strictly typed, because a gate on an unchecked key is exactly the
+ * typo class the derived types exist to prevent.
+ */
+export type LooseKey<K extends string> = K | (string & {});
+
 /** The reserved namespace for Alfiz's own administration permissions. */
 export const ALFIZ_INTERNAL_NAMESPACE = "alfiz_internal";
 

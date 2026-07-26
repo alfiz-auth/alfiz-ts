@@ -26,9 +26,17 @@ import { createApplication } from "@alfiz-auth/application";
 import { prismaDriver } from "@alfiz-auth/prisma";
 
 const prisma = new PrismaClient();
-const storage = prismaDriver(prisma); // structural match — no adapter needed
+const storage = prismaDriver(prisma); // structural match — no adapter, no cast
 const app = createApplication({ storage /* ... */ });
 ```
+
+That no-cast promise is pinned in CI by a compile-only fixture
+(`src/prisma-client-shape.ts`) replicating the exact input types
+`prisma generate` emits — Json inputs that reject bare `null`,
+`bigint | number` scalars, Prisma-style optional properties — so a
+delegate-surface change that would force `as unknown as
+AlfizPrismaDelegates` on adopters fails this package's own build instead.
+The match holds under `exactOptionalPropertyTypes` too.
 
 ## Multi-node deployments: pass an advisory lock
 

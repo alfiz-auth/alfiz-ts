@@ -1,6 +1,11 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { KeyOf, PatternOf } from "../src/catalog.js";
-import { CatalogError, defineCatalog, lintCatalog } from "../src/catalog.js";
+import {
+  CatalogError,
+  catalogFromDocument,
+  defineCatalog,
+  lintCatalog,
+} from "../src/catalog.js";
 
 const fixture = () =>
   defineCatalog({
@@ -65,6 +70,97 @@ describe("defineCatalog", () => {
     expect(catalog.leaf("docs.files.update_file")!.kind).toBe("action");
     expect(catalog.leaf("docs.files.delete")!.destructive).toBe(true);
     expect(catalog.leaf("docs.files.update_file")!.destructive).toBe(false);
+  });
+
+  it("group-level scopes are inherited by leaves, nearest declaration wins, leaf overrides", () => {
+    const catalog = defineCatalog({
+      namespace: "lms",
+      includeAlfizInternal: false,
+      allowArbitraryDepth: true,
+      projects: {
+        lms: {
+          groups: {
+            courses: {
+              scopes: ["lms.course"], // the tab-wide default
+              permissions: {
+                read: true, // inherits ["lms.course"]
+                publish_course: true, // inherits ["lms.course"]
+                manage_catalog: { scopes: [] }, // explicit []: global-only
+                grade_student: { scopes: ["lms.cohort"] }, // leaf override
+              },
+              groups: {
+                sessions: {
+                  permissions: { read: true }, // inherits from `courses`
+                },
+                cohorts: {
+                  scopes: ["lms.cohort"], // nearer declaration wins
+                  permissions: { read: true },
+                },
+              },
+            },
+            reports: {
+              permissions: { read: true }, // no declaration anywhere: global-only
+            },
+          },
+        },
+      },
+      scopeTypes: {
+        "lms.course": { parent: null },
+        "lms.cohort": { parent: null },
+      },
+    });
+    expect(catalog.leaf("lms.courses.read")!.scopes).toEqual(["lms.course"]);
+    expect(catalog.leaf("lms.courses.publish_course")!.scopes).toEqual(["lms.course"]);
+    expect(catalog.leaf("lms.courses.manage_catalog")!.scopes).toEqual([]);
+    expect(catalog.leaf("lms.courses.grade_student")!.scopes).toEqual(["lms.cohort"]);
+    expect(catalog.leaf("lms.courses.sessions.read")!.scopes).toEqual(["lms.course"]);
+    expect(catalog.leaf("lms.courses.cohorts.read")!.scopes).toEqual(["lms.cohort"]);
+    expect(catalog.leaf("lms.reports.read")!.scopes).toEqual([]);
+    // Grantability follows the inherited declaration.
+    expect(catalog.appliesAt("lms.courses.read", "lms.course:9")).toBe(true);
+    expect(catalog.appliesAt("lms.courses.manage_catalog", "lms.course:9")).toBe(false);
+  });
+
+  it("a group-declared scope default referencing an undeclared type is an error", () => {
+    expect(() =>
+      defineCatalog({
+        namespace: "a",
+        includeAlfizInternal: false,
+        projects: {
+          a: { groups: { t: { scopes: ["a.ghost"], permissions: { read: true } } } },
+        },
+      }),
+    ).toThrow(/undeclared scope type/);
+  });
+
+  it("labels ride on leaves and groups and survive the document round-trip", () => {
+    const catalog = defineCatalog({
+      namespace: "docs",
+      includeAlfizInternal: false,
+      projects: {
+        docs: {
+          label: "Documents",
+          groups: {
+            files: {
+              label: "Files & uploads",
+              description: "Everything under /files",
+              permissions: {
+                read: true,
+                update_file: { label: "Edit files", description: "Longer help text" },
+              },
+            },
+          },
+        },
+      },
+    });
+    expect(catalog.leaf("docs.files.update_file")!.label).toBe("Edit files");
+    expect(catalog.leaf("docs.files.update_file")!.description).toBe("Longer help text");
+    expect(catalog.leaf("docs.files.read")!.label).toBeUndefined();
+    expect(catalog.groups.get("docs.files")!.label).toBe("Files & uploads");
+    expect(catalog.groups.get("docs")!.label).toBe("Documents");
+    const rebuilt = catalogFromDocument(catalog.toDocument());
+    expect(rebuilt.leaf("docs.files.update_file")!.label).toBe("Edit files");
+    expect(rebuilt.groups.get("docs.files")!.label).toBe("Files & uploads");
   });
 
   it("excludes alfiz_internal on request", () => {

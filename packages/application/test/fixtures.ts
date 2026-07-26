@@ -27,8 +27,9 @@ export const testCatalog = () =>
       },
     },
     scopeTypes: {
+      // Folders nest in folders (see testParents): self-referencing parent.
       "docs.folder": {
-        parent: null,
+        parent: "docs.folder",
         requestable: {
           prompts: [{ id: "why", label: "Why do you need this?" }],
           maxDurationMs: 7 * 24 * 3600_000,

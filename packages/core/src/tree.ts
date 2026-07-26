@@ -14,6 +14,8 @@ export interface PermTreeNode {
   path: string;
   /** Last segment. */
   name: string;
+  /** Short human-facing name (catalog `label`), falling back to `name`. */
+  label: string;
   kind: "group" | "leaf";
   leaf?: LeafMeta | undefined;
   description?: string | undefined;
@@ -34,6 +36,7 @@ export function buildPermissionTree(
         return {
           path: key,
           name: leaf.name,
+          label: leaf.label ?? leaf.name,
           kind: "leaf" as const,
           leaf,
           description: leaf.description,
@@ -41,9 +44,11 @@ export function buildPermissionTree(
         };
       }),
     ];
+    const name = path.split(".").pop()!;
     return {
       path,
-      name: path.split(".").pop()!,
+      name,
+      label: group.label ?? name,
       kind: "group",
       description: group.description,
       children,

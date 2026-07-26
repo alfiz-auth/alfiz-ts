@@ -64,8 +64,8 @@ const catalog = defineCatalog({
     },
   },
   scopeTypes: {
-    "groups.folder": { parent: null },
-    "payments.namespace": { parent: null },
+    "groups.folder": { parent: "groups.folder" }, // folders nest in folders
+    "payments.namespace": { parent: null }, // genuinely flat: chains are [scope, *]
   },
   navigation: [
     { label: "Mathaniyy", href: "/mathaniyy", permission: "mathaniyy.*" },

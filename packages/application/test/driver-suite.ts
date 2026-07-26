@@ -86,12 +86,21 @@ export const driverContractCases: DriverCase[] = [
     },
   },
   {
-    name: "revokes: insert, filter by user, delete",
+    name: "revokes: insert, filter by user and scope, delete",
     async run(driver) {
       await driver.insertRevoke(revoke("r1", "u1"));
       await driver.insertRevoke(revoke("r2", "u2"));
+      await driver.insertRevoke({ ...revoke("r3", "u1"), scope: "docs.folder:9" });
       assert.deepEqual(
-        (await driver.listRevokes({ userId: "u1" })).map((r) => r.id),
+        (await driver.listRevokes({ userId: "u1" })).map((r) => r.id).sort(),
+        ["r1", "r3"],
+      );
+      assert.deepEqual(
+        (await driver.listRevokes({ scope: "docs.folder:9" })).map((r) => r.id),
+        ["r3"],
+      );
+      assert.deepEqual(
+        (await driver.listRevokes({ userId: "u1", scope: "*" })).map((r) => r.id),
         ["r1"],
       );
       assert.equal((await driver.deleteRevoke("r1"))?.id, "r1");
@@ -142,6 +151,16 @@ export const driverContractCases: DriverCase[] = [
       assert.deepEqual(await driver.listUsersInGroup("none"), []);
       assert.equal((await driver.listUsers()).length, 2);
       assert.equal(await driver.getUser("ghost"), null);
+    },
+  },
+  {
+    name: "users: delete removes the record and its membership edges; absent is a no-op",
+    async run(driver) {
+      await driver.upsertUser({ userId: "gone", active: true, groupIds: ["g1"], orgIds: [], managerUserId: null });
+      await driver.deleteUser("gone");
+      assert.equal(await driver.getUser("gone"), null);
+      assert.deepEqual(await driver.listUsersInGroup("g1"), []);
+      await driver.deleteUser("never-existed"); // must not throw
     },
   },
   {

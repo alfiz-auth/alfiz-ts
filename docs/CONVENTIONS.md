@@ -62,6 +62,35 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
 - `require*` — the throwing forms of both.
 - `can.fresh(...)` — bypasses all caches. REQUIRED pairing for destructive
   actions (`delete` leaves) and time-bound elevations.
+- `holdsAnywhere(subject, key)` — "does this key exist for them at ANY
+  scope": the right question for unscoped conditional UI under scoped
+  grants (the button exists; the action still gates at its concrete scope).
+  Never a gate.
+
+## Server-rendered pages: one snapshot per request
+
+Render paths perform many checks inside helpers and `.map()` callbacks that
+must stay synchronous. Do NOT make render helpers async, and do NOT call
+`can()` per button. Fetch once, check synchronously:
+
+```ts
+const snap = await alfiz.snapshot({ userId });      // once per request
+snap.can("docs.files.read");                        // sync gate-shaped check
+snap.can("docs.files.update_file", "docs.doc:1");   // sync, scoped
+snap.canAny("docs.*");                              // sync visibility
+snap.heldKeys / snap.holds(key)                     // "held anywhere" probes
+```
+
+- A per-request snapshot is a STRONGER consistency guarantee than repeated
+  `can` calls: one data instant, one clock, for every check in the render.
+- Scope types declared `parent: null` are flat BY CONTRACT (chains are
+  `[scope, "*"]`), so scoped checks on them are synchronous with no
+  pre-resolution. Hierarchical scopes you intend to check must be listed:
+  `alfiz.snapshot(principal, { scopes: [docScope] })` — an unresolved
+  hierarchical scope throws rather than guessing (a guessed chain would
+  miss ancestor revokes: fail-open).
+- Server actions and route handlers still gate with `can`/`can.fresh` —
+  the snapshot is the read/render surface.
 
 ## Grants and revokes
 
@@ -75,6 +104,15 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
   scope-inclusively. Groups and roles can never revoke.
 - "Broad vs narrow authority" is modeled with ONE permission key granted at
   different scopes — never with parallel blanket-and-variant key families.
+- A GLOBAL grant satisfies EVERY scoped check (`*` is in every object
+  closure). Roles that mix org-wide and per-resource authority must be
+  split before scoped grants change anything — see `docs/MIGRATING.md`.
+- Bulk writes (migrations, imports) use `createGrants(inputs, provenance)`:
+  all inputs validated before any row is written, one audit entry, one
+  invalidation per distinct subject. Never loop `createGrant` for an import.
+- Migration SQL and runtime agree on identity by passing YOUR ids:
+  `createRole({ id: "role_x", ... })`, `createGroup({ id: "cohort_y", ... })`.
+  A taken id is a conflict, never an overwrite.
 
 ## Sessions and view-as
 
@@ -101,6 +139,26 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
   sensitive document into a restricted folder takes effect at once" true.
   The client's object-chain TTL only bounds the damage if you forget.
 
+## Deletions — the same discipline as moves
+
+Grants key on subject and scope STRINGS, not foreign keys: Alfiz cannot see
+your tables, so deleting a principal or a resource there strands its rows
+here, and a reused id silently inherits the stranded access. Pair every
+delete path:
+
+- Deleting a user / API token / service account →
+  `app.deleteSubject("user:<id>" | "service:<id>", provenance)` in the same
+  code path. For users this also removes revokes, the stored record,
+  implicit-group (`directs:`/`orgof:`) grants, and cancels their pending
+  requests. For groups use `deleteGroup` (it also repairs parentage and
+  membership).
+- Deleting a scoped resource → `app.deleteScope("<scopeType>:<id>",
+  provenance)`. Descendant scopes are separate rows: call it per deleted
+  resource when removing a subtree.
+- Reversible offboarding → `app.setUserActive(userId, false, provenance)`;
+  an inactive principal evaluates to no access everywhere. Deactivate on
+  offboarding; delete when the id itself is retired.
+
 ## Listing pages
 
 - Never per-row `can()` (N+1). Compute the granted scope set
@@ -116,3 +174,13 @@ unknown keys at call sites, `canAny` used as a gate, exported server actions
 with no gate, catalog leaves referenced nowhere, catalog convention
 violations, and client-reachable secrets. Typos compile — the verifier is
 what catches the rest.
+
+- Your own gate wrappers (`assertTeaches`, `gateDestructiveAction`, …) are
+  the encouraged pattern — DECLARE them, or every wrapped action reads as
+  ungated: `gateNames` / `visibilityNames` / `serverFilePatterns` in
+  `alfiz-verify.config.json` (added to the built-in defaults), or the same
+  options on `verifyProject` (replacing them; spread `DEFAULT_GATE_NAMES`).
+- Surfaces that authenticate OUTSIDE the catalog by design (system trust
+  domains that must survive a database outage) opt out per file, with a
+  reason: `// alfiz-verify-ignore-file <reason>` in the leading comments.
+  A pragma without a reason is a warning — unexplained exemptions rot.

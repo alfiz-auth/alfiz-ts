@@ -34,6 +34,7 @@ import type {
   AuditFilter,
   GrantFilter,
   RequestStorageFilter,
+  RevokeFilter,
   StorageDriver,
   StoredUser,
 } from "@alfiz-auth/application";
@@ -47,10 +48,11 @@ import type {
   AlfizPrismaDelegates,
   AlfizRequestData,
   AlfizRequestRecord,
+  AlfizRevokeWhere,
   AlfizRoleCreateData,
   AlfizRoleRecord,
   AlfizUserRecord,
-  JsonValue,
+  InputJsonValue,
 } from "./delegates.js";
 
 export interface PrismaDriverOptions {
@@ -69,8 +71,8 @@ export interface PrismaDriverOptions {
 // Boundary helpers — the only casts in the package, kept in one place.
 // ---------------------------------------------------------------------------
 
-/** Core payloads (provenance, stages, …) are JSON-shaped by contract. */
-const toJson = (value: unknown): JsonValue => value as JsonValue;
+/** Core payloads (provenance, stages, …) are JSON-shaped by contract, and never bare null. */
+const toJson = (value: unknown): InputJsonValue => value as InputJsonValue;
 const fromJson = <T>(value: unknown): T => value as T;
 
 const toBig = (value: number): bigint => BigInt(value);
@@ -306,12 +308,11 @@ export function prismaDriver(
       await db.alfizRevoke.deleteMany({ where: { id } });
       return revokeFromDb(existing);
     },
-    async listRevokes(filter) {
-      const rows = await db.alfizRevoke.findMany(
-        filter?.userId !== undefined
-          ? { where: { userId: filter.userId } }
-          : {},
-      );
+    async listRevokes(filter?: RevokeFilter) {
+      const where: AlfizRevokeWhere = {};
+      if (filter?.userId !== undefined) where.userId = filter.userId;
+      if (filter?.scope !== undefined) where.scope = filter.scope;
+      const rows = await db.alfizRevoke.findMany({ where });
       return rows.map(revokeFromDb);
     },
 
@@ -437,6 +438,12 @@ export function prismaDriver(
           data: toAdd.map((groupId) => ({ userId: user.userId, groupId })),
         });
       }
+    },
+    async deleteUser(userId) {
+      // Membership edges compose the user's record, exactly as group-parent
+      // edges compose a group's — they follow the record out.
+      await db.alfizMembership.deleteMany({ where: { userId } });
+      await db.alfizUser.deleteMany({ where: { userId } });
     },
     async listUsers() {
       const [rows, memberships] = await Promise.all([
