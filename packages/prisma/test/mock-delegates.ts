@@ -19,6 +19,7 @@ import type {
   AlfizAuditRecord,
   AlfizCatalogRecord,
   AlfizGrantRecord,
+  AlfizGrantWhere,
   AlfizGroupParentRecord,
   AlfizGroupRecord,
   AlfizMembershipRecord,
@@ -50,6 +51,16 @@ export function mockDelegates(): AlfizPrismaDelegates {
   const catalogs = new Map<number, AlfizCatalogRecord>();
   const audits: AlfizAuditRecord[] = [];
 
+  const matchingGrants = (where?: AlfizGrantWhere): AlfizGrantRecord[] =>
+    [...grants.values()].filter((r) => {
+      if (where?.subject !== undefined && !matchString(r.subject, where.subject)) {
+        return false;
+      }
+      if (where?.scope !== undefined && r.scope !== where.scope) return false;
+      if (where?.roleId !== undefined && r.roleId !== where.roleId) return false;
+      return true;
+    });
+
   return {
     alfizGrant: {
       async create({ data }) {
@@ -63,21 +74,10 @@ export function mockDelegates(): AlfizPrismaDelegates {
         return row === undefined ? null : clone(row);
       },
       async findMany(args) {
-        let rows = [...grants.values()];
-        const where = args?.where;
-        if (where?.subject !== undefined) {
-          const cond = where.subject;
-          rows = rows.filter((r) => matchString(r.subject, cond));
-        }
-        if (where?.scope !== undefined) {
-          const cond = where.scope;
-          rows = rows.filter((r) => r.scope === cond);
-        }
-        if (where?.roleId !== undefined) {
-          const cond = where.roleId;
-          rows = rows.filter((r) => r.roleId === cond);
-        }
-        return rows.map(clone);
+        return matchingGrants(args?.where).map(clone);
+      },
+      async count(args) {
+        return matchingGrants(args?.where).length;
       },
       async deleteMany({ where }) {
         const existed = grants.delete(where.id);

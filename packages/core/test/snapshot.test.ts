@@ -174,7 +174,7 @@ describe("snapshot: one round-trip, synchronous checks", () => {
     expect(snap.can("docs.files.read", "docs.folder:9")).toBe(true); // granted scope: auto-resolved
 
     // Unresolved hierarchical target: throws rather than guessing a chain.
-    expect(() => snap.can("docs.files.read", "docs.doc:2")).toThrow(/pre-resolve/);
+    expect(() => snap.can("docs.files.read", "docs.doc:2")).toThrow(/pre-resolve/i);
     expect(() => snap.can("docs.files.read", "docs.doc:2")).toThrow(/docs\.doc:2/);
   });
 
@@ -344,6 +344,48 @@ describe("snapshot: one round-trip, synchronous checks", () => {
     } catch (err) {
       expect((err as AccessDeniedError).reason).toBe("forbidden");
     }
+  });
+
+  it("resolve() extends a snapshot in place — the hierarchical list-page shape", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:9")],
+      parents: {
+        "docs.doc:1": "docs.folder:9",
+        "docs.doc:2": "docs.folder:9",
+        "docs.doc:99": "docs.folder:77",
+      },
+    });
+    const client = createAlfizClient({ catalog, provider });
+
+    // 1. Guard the page — the row ids do not exist yet.
+    const snap = await client.snapshot({ userId: "u1" });
+    const fetchesAfterGuard = provider.stats().fetches;
+    expect(() => snap.can("docs.files.read", "docs.doc:1")).toThrow(/resolve/);
+
+    // 2. Query, then resolve what the query returned.
+    const rows = ["docs.doc:1", "docs.doc:2", "docs.doc:99"];
+    const returned = await snap.resolve(rows);
+    expect(returned).toBe(snap); // same snapshot, for chaining
+
+    // 3. Check rows synchronously, against the SAME data instant.
+    expect(provider.stats().fetches).toBe(fetchesAfterGuard); // no re-fetch
+    expect(rows.filter((r) => snap.can("docs.files.read", r))).toEqual([
+      "docs.doc:1",
+      "docs.doc:2",
+    ]);
+    expect(snap.resolvedScopes.has("docs.doc:99")).toBe(true);
+  });
+
+  it("resolve() skips already-resolved scopes and ignores the global scope", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:9")],
+      parents: { "docs.doc:1": "docs.folder:9" },
+    });
+    const client = createAlfizClient({ catalog, provider });
+    const snap = await client.snapshot({ userId: "u1" }, { scopes: ["docs.doc:1"] });
+    const before = provider.stats().resolves;
+    await snap.resolve(["docs.doc:1", "docs.doc:1", "*"]);
+    expect(provider.stats().resolves).toBe(before);
   });
 
   it("service principals snapshot too", async () => {

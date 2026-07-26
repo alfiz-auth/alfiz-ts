@@ -1,5 +1,7 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 import type { KeyOf, PatternOf } from "../src/catalog.js";
+import type { AlfizClient, ClientOf } from "../src/client.js";
+import type { SnapshotOf } from "../src/snapshot.js";
 import {
   CatalogError,
   catalogFromDocument,
@@ -285,6 +287,18 @@ describe("defineCatalog", () => {
     expectTypeOf<"*">().toExtend<Pattern>();
     // @ts-expect-error unknown group wildcards are rejected
     expectTypeOf<"ghost.*">().toExtend<Pattern>();
+  });
+
+  it("ClientOf / SnapshotOf carry the same unions, so context objects need no type parameters", () => {
+    const catalog = fixture();
+    type Client = ClientOf<typeof catalog>;
+    type Snapshot = SnapshotOf<typeof catalog>;
+    expectTypeOf<Client>().toExtend<AlfizClient<KeyOf<typeof catalog>, PatternOf<typeof catalog>>>();
+    expectTypeOf<Snapshot["can"]>().parameter(0).toExtend<KeyOf<typeof catalog> | readonly KeyOf<typeof catalog>[]>();
+    expectTypeOf<Snapshot["canAny"]>().parameter(0).toExtend<PatternOf<typeof catalog>>();
+    // The shape an adopter stores on their actor/session object.
+    type Actor = { userId: string; alfiz: SnapshotOf<typeof catalog> };
+    expectTypeOf<Actor["alfiz"]["heldKeys"]>().toExtend<ReadonlySet<string>>();
   });
 });
 

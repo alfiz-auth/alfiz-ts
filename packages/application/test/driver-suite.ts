@@ -62,6 +62,35 @@ export const driverContractCases: DriverCase[] = [
     },
   },
   {
+    name: "grants: countGrants agrees with listGrants for every filter shape",
+    async run(driver) {
+      await driver.insertGrant(grant("c1", "user:u1"));
+      await driver.insertGrant(grant("c2", "user:u1", "docs.folder:9"));
+      await driver.insertGrant({ ...grant("c3", "group:team"), pattern: undefined, roleId: "r1" });
+      await driver.insertGrant({ ...grant("c4", "user:u2"), pattern: undefined, roleId: "r1" });
+      const filters = [
+        undefined,
+        { subject: "user:u1" },
+        { subjects: ["group:team", "user:u2"] },
+        { scope: "docs.folder:9" },
+        { roleId: "r1" },
+        { roleId: "r1", subject: "group:team" },
+        { roleId: "nobody-holds-this" },
+        // Contradictory subject filters: provably empty, not a scan.
+        { subject: "user:u1", subjects: ["user:u2"] },
+      ];
+      for (const filter of filters) {
+        assert.equal(
+          await driver.countGrants(filter),
+          (await driver.listGrants(filter)).length,
+          `countGrants disagreed with listGrants for ${JSON.stringify(filter)}`,
+        );
+      }
+      assert.equal(await driver.countGrants({ roleId: "r1" }), 2);
+      assert.equal(await driver.countGrants(), 4);
+    },
+  },
+  {
     name: "grants: rows round-trip losslessly (expiry, provenance)",
     async run(driver) {
       const row: GrantRow = {

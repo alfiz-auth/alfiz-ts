@@ -246,6 +246,28 @@ export function prismaDriver(
   const externalLock = options?.lock;
   const locks = new Map<string, Promise<unknown>>();
 
+  /**
+   * The grant where-clause, shared by list and count so the two can never
+   * disagree about what "matching" means. `null` means "provably empty"
+   * (contradictory subject filters), which the caller short-circuits rather
+   * than sending an impossible query.
+   */
+  const grantWhere = (filter?: GrantFilter): AlfizGrantWhere | null => {
+    const where: AlfizGrantWhere = {};
+    if (filter?.subject !== undefined && filter.subjects !== undefined) {
+      // Both filters present: their conjunction is the intersection.
+      if (!filter.subjects.includes(filter.subject)) return null;
+      where.subject = filter.subject;
+    } else if (filter?.subject !== undefined) {
+      where.subject = filter.subject;
+    } else if (filter?.subjects !== undefined) {
+      where.subject = { in: [...filter.subjects] };
+    }
+    if (filter?.scope !== undefined) where.scope = filter.scope;
+    if (filter?.roleId !== undefined) where.roleId = filter.roleId;
+    return where;
+  };
+
   /** Diff an edge set keyed on `userId`/`childId` into deletes + inserts. */
   const diff = (
     current: readonly string[],
@@ -273,20 +295,15 @@ export function prismaDriver(
       return grantFromDb(existing);
     },
     async listGrants(filter?: GrantFilter) {
-      const where: AlfizGrantWhere = {};
-      if (filter?.subject !== undefined && filter.subjects !== undefined) {
-        // Both filters present: their conjunction is the intersection.
-        if (!filter.subjects.includes(filter.subject)) return [];
-        where.subject = filter.subject;
-      } else if (filter?.subject !== undefined) {
-        where.subject = filter.subject;
-      } else if (filter?.subjects !== undefined) {
-        where.subject = { in: [...filter.subjects] };
-      }
-      if (filter?.scope !== undefined) where.scope = filter.scope;
-      if (filter?.roleId !== undefined) where.roleId = filter.roleId;
+      const where = grantWhere(filter);
+      if (where === null) return [];
       const rows = await db.alfizGrant.findMany({ where });
       return rows.map(grantFromDb);
+    },
+    async countGrants(filter?: GrantFilter) {
+      const where = grantWhere(filter);
+      if (where === null) return 0;
+      return db.alfizGrant.count({ where });
     },
 
     // -- revokes --------------------------------------------------------------

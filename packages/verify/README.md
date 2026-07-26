@@ -5,7 +5,9 @@ not discipline. Typed keys catch typos the compiler can see; this catches
 the rest:
 
 - **unknown-pattern** — a string at a `can`/`require*`/`gateAction` call
-  site that is not a catalog key or known group wildcard.
+  site that is not a catalog key or known group wildcard. (The same rule
+  runs at runtime in `@alfiz-auth/core` for the string paths static
+  analysis cannot see; this is the build-time half.)
 - **visibility-as-gate** — `canAny`/`requireAny` inside a `"use server"`
   file or route handler. Visibility affordances are never gates.
 - **ungated-action** — an exported async function in a `"use server"` file
@@ -35,10 +37,17 @@ reads as ungated and the noise buries the real findings:
   `skippedFiles`:
 
   ```ts
+  "use server";
   // alfiz-verify-ignore-file system trust domain: authenticates by deploy key
   ```
 
-  A pragma without a reason still skips, but warns (`ignored-file`).
+  The pragma belongs in the file header: the leading comments, above or
+  below a `"use server"` / `"use client"` directive — JavaScript permits
+  comments before and between directive-prologue statements, and so does
+  this. A pragma without a reason still skips, but warns; a pragma past the
+  first statement is inert and is *reported* as inert, because a security
+  tool that silently drops its own escape hatch teaches you the escape
+  hatch doesn't work.
 
 ## Usage
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAlfizClient } from "@alfiz-auth/core";
+import { createAlfizClient, defineCatalog } from "@alfiz-auth/core";
 import {
   AlfizSession,
   createSession,
@@ -37,6 +37,34 @@ const setup = async () => {
   });
   return { app, client };
 };
+
+describe("view-as against a catalog with no Alfiz admin surface", () => {
+  it("denies rather than raising a malformed-check error", async () => {
+    // `includeAlfizInternal: false` renders no Alfiz admin surface, so
+    // `alfiz_internal.access.view_as` is not a key in this catalog. Starting
+    // a preview must fail CLOSED — the check being unanswerable is not
+    // license to explode on a page that would otherwise render.
+    const { app } = makeApp({
+      catalog: defineCatalog({
+        namespace: "docs",
+        includeAlfizInternal: false,
+        projects: { docs: { groups: { files: { permissions: { read: true } } } } },
+      }),
+    });
+    const client = createAlfizClient({
+      catalog: (app as unknown as { catalog: Parameters<typeof createAlfizClient>[0]["catalog"] })
+        .catalog,
+      provider: app,
+    });
+    await app.createGrant({ subject: "user:root", pattern: "*", provenance: admin });
+    await expect(
+      createSession(client, { actorUserId: "root", viewAs: { kind: "user", userId: "x" } }),
+    ).rejects.toMatchObject({ name: "AccessDeniedError", reason: "forbidden" });
+    // Sessions without a preview are unaffected.
+    const plain = await createSession(client, { actorUserId: "root" });
+    expect(await plain.can("docs.files.read")).toBe(true);
+  });
+});
 
 describe("plain sessions", () => {
   it("pass through the actor's access", async () => {

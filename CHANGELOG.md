@@ -1,5 +1,89 @@
 # Changelog
 
+## 0.3.0 — second field report
+
+From upgrading the same LMS to 0.2.0 and adopting the surface it added.
+Every 0.1.2 finding stayed fixed; this release is the friction the upgrade
+itself exposed — plus a soundness hole found while investigating one of it.
+
+### Checks are verified against the catalog (behavior change)
+
+Investigating the reported "`canAny("admin")` silently answers `false`"
+turned up its sibling on the **gate** path, in the dangerous direction:
+`*` matches any string, so `can(user, "docs.files.raed")` returned **true**
+for anyone holding a covering wildcard and `false` for everyone else. A
+misspelled gate key admitted exactly the broadly-privileged users who
+review and test it, while denying the users it was written for.
+
+Both are the same missing rule, now enforced at every check boundary:
+
+- An undeclared key or pattern raises **`UnknownPermissionError`** instead
+  of being evaluated — a programming error; map it to 500, never 403.
+  `isUnknownPermission(err)` narrows it.
+- Enforced on `can`, `canAny`, `require*`, `explain`, `grantedScopes`,
+  `holdsAnywhere` and every snapshot equivalent. Typed keys and
+  `alfiz-verify` already covered literal call sites; this covers the
+  runtime-string paths they cannot see (nav tables, config, generic
+  wrappers) — the ones the report's nav regression came from.
+- Messages carry the fix: a group path where a pattern belongs says *did
+  you mean `"admin.*"`?*; a group path where a **gate key** belongs says to
+  gate on a leaf, since `admin.*` is not a gate either.
+- `assertCanViewAs` now denies (rather than raising) when a catalog is
+  built with `includeAlfizInternal: false` — previews fail closed.
+
+**Upgrading:** a bare group path or a stale key in a runtime-string check
+path now throws where it previously returned a quiet boolean. That is the
+bug becoming visible; fix the string or declare the key.
+
+### The ignore pragma follows JavaScript's own rule
+
+`// alfiz-verify-ignore-file <reason>` is now recognized anywhere in the
+file **header** — the leading comments, above *or below* a `"use server"` /
+`"use client"` directive, exactly as the language permits comments before
+and between directive-prologue statements. Every RSC file puts that
+directive on line 1, so requiring the pragma above it made the natural
+placement the broken one.
+
+And a misplaced pragma is no longer a silent no-op: it is reported as a
+warning naming its line. A security tool that quietly drops its own escape
+hatch teaches the adopter that the escape hatch doesn't work.
+
+Also recognized inside a JSDoc header; prose that merely mentions the
+pragma mid-sentence is not one. `ignoreFilePragma` is replaced by
+`findIgnorePragma`, which returns `{ reason, line, effective }`.
+
+### Provenance validated at the write path
+
+A provenance missing its `actorUserId` used to pass through every write and
+fail inside the audit writer, as a driver-level error naming a Prisma
+argument the developer never wrote. `validateProvenance` (exported from
+core) now checks the required fields per kind, and the Application asserts
+it at the **top of every public write** — not merely in `actorOf`, which
+runs after the row is inserted and would leave a written row with no audit
+entry. `actorOf` keeps the assertion as a backstop.
+
+### Grant queries that don't scan
+
+- `listGrants({ roleId })` on the provider contract (the storage seam
+  already supported it) — "who holds this role" without reading every
+  grant in the organization.
+- **`countGrants(filter)`** through the contract, the storage seam, and
+  both drivers (`SELECT count(*)`), for the role-holder count an admin page
+  renders per row. `deleteRole` uses it for its blocking-holder check.
+  *Breaking for third-party storage drivers:* implement `countGrants`.
+
+### Derived types and hierarchical list pages
+
+- **`SnapshotOf<Cat>`**, **`ClientOf<Cat>`**, **`SessionOf<Cat>`** round out
+  `KeyOf` / `PatternOf`, so a snapshot on a request-context object stops
+  needing hand-written type parameters.
+- **`snapshot.resolve(scopes)`** extends an existing snapshot's chains
+  without a second closure fetch — the shape a hierarchical list page
+  needs, since it cannot know its row ids until after it queries. The data
+  instant and clock are unchanged, so the consistency guarantee holds.
+  Documented, with the push-the-filter-down alternative for large result
+  sets, in the snapshot docblock, CONVENTIONS, and `docs/MIGRATING.md` §7.
+
 ## 0.2.0 — the alpha-feedback release
 
 Shaped by the first real migration (a Next.js LMS with a 97-key catalog,

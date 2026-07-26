@@ -24,6 +24,16 @@ import type {
 
 const clone = <T>(value: T): T => structuredClone(value);
 
+const matchesGrant = (row: GrantRow, filter?: GrantFilter): boolean => {
+  if (filter?.subject !== undefined && row.subject !== filter.subject) return false;
+  if (filter?.subjects !== undefined && !filter.subjects.includes(row.subject)) {
+    return false;
+  }
+  if (filter?.scope !== undefined && row.scope !== filter.scope) return false;
+  if (filter?.roleId !== undefined && row.roleId !== filter.roleId) return false;
+  return true;
+};
+
 export function memoryDriver(): StorageDriver {
   const grants = new Map<string, GrantRow>();
   const revokes = new Map<string, RevokeRow>();
@@ -45,21 +55,16 @@ export function memoryDriver(): StorageDriver {
       return row ? clone(row) : null;
     },
     async listGrants(filter?: GrantFilter) {
-      let rows = [...grants.values()];
-      if (filter?.subject !== undefined) {
-        rows = rows.filter((r) => r.subject === filter.subject);
+      return [...grants.values()]
+        .filter((row) => matchesGrant(row, filter))
+        .map(clone);
+    },
+    async countGrants(filter?: GrantFilter) {
+      let count = 0;
+      for (const row of grants.values()) {
+        if (matchesGrant(row, filter)) count++;
       }
-      if (filter?.subjects !== undefined) {
-        const set = new Set(filter.subjects);
-        rows = rows.filter((r) => set.has(r.subject));
-      }
-      if (filter?.scope !== undefined) {
-        rows = rows.filter((r) => r.scope === filter.scope);
-      }
-      if (filter?.roleId !== undefined) {
-        rows = rows.filter((r) => r.roleId === filter.roleId);
-      }
-      return rows.map(clone);
+      return count;
     },
 
     async insertRevoke(row) {

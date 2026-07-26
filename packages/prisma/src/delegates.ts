@@ -79,6 +79,8 @@ export interface AlfizGrantDelegate {
   create(args: { data: AlfizGrantCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizGrantRecord | null>;
   findMany(args?: { where?: AlfizGrantWhere }): Promise<AlfizGrantRecord[]>;
+  /** `SELECT count(*)`: sizing a grant set without materializing it. */
+  count(args?: { where?: AlfizGrantWhere }): Promise<number>;
   deleteMany(args: { where: { id: string } }): Promise<unknown>;
 }
 

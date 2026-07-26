@@ -231,6 +231,40 @@ Scoped checks stay synchronous too, in the cases that matter:
 Actions and route handlers keep gating with `can` / `can.fresh` — the
 snapshot is the read/render surface.
 
+### Hierarchical list pages
+
+A list page inverts the order: it cannot know its row ids until after it
+queries, so it cannot name them when it builds the snapshot it wanted to
+guard with. Two shapes, and which you want depends on the size of the list.
+
+**Tens of rows — resolve after querying.** `resolve` extends an existing
+snapshot in place, with no second closure fetch, so every check still sees
+one data instant:
+
+```ts
+const snap = await alfiz.snapshot(principal);
+snap.require("docs.files.read");                       // guard the page
+const rows = await db.doc.findMany({ where: { folderId } });
+await snap.resolve(rows.map((r) => `docs.doc:${r.id}`)); // ids exist now
+const editable = rows.filter((r) => snap.can("docs.files.update_file", `docs.doc:${r.id}`));
+```
+
+**Thousands of rows — don't check per row at all.** That is the N+1 the
+listing helpers exist to avoid: compute the granted scope set once and push
+the filter into your database, so the query returns only visible rows.
+
+```ts
+const { granted, revoked } = snap.grantedScopes("docs.files.read");
+const plan = planListing({ granted, revoked });
+if (plan.mode === "none") return [];                    // never an unfiltered query
+const rows = await db.doc.findMany({
+  where: plan.mode === "all" ? {} : prismaMatPathWhere(plan.include, { pathField: "path" }),
+});
+```
+
+Flat scope types (`parent: null`) need neither: their chains are known by
+declaration, so `snap.can(key, scope)` works on any row id immediately.
+
 ## 8. Turn the verifier on last, and configure it for your wrappers
 
 Your codebase gates through its own wrappers (`assertTeaches`,
@@ -249,13 +283,57 @@ the verifier, or every wrapped action reads as ungated:
 
 Surfaces that authenticate outside the catalog *by design* (system trust
 domains that must survive a database outage) opt out in-file, with a
-reason the next reviewer will see:
+reason the next reviewer will see. It belongs in the file header —
+anywhere in the leading comments, above or below a `"use server"` /
+`"use client"` directive, exactly as JavaScript itself allows:
 
 ```ts
+"use server";
 // alfiz-verify-ignore-file system trust domain: authenticates by deploy key
 ```
 
-## 9. The checklist
+A pragma placed *after* the first real statement does nothing; the verifier
+warns and names the line rather than leaving you to infer it from an
+unchanged error count.
+
+One thing the upgrade will surface: checks are now verified against the
+catalog at runtime too, so a key or pattern the catalog does not declare
+raises `UnknownPermissionError` instead of being evaluated. If a nav table
+or a generic wrapper carries a bare group path (`"admin"` where `"admin.*"`
+was meant), that is where you will hear about it — see §9.
+
+## 9. Runtime strings are checked against the catalog
+
+Typed keys and the verifier cover every literal call site. The paths they
+cannot see — nav tables, config, generic wrappers taking `permission:
+string` — are checked at runtime instead: a key or pattern the catalog does
+not declare raises `UnknownPermissionError`, a **programming error** your
+framework should map to 500, never 403.
+
+This is not strictness for its own sake. Both silent behaviours it replaces
+were wrong in ways that were nearly impossible to notice:
+
+| Call | Before | Now |
+| --- | --- | --- |
+| `can(u, "docs.files.raed")` | **`true`** for anyone holding `*` or `docs.*` — the typo admitted exactly the privileged users who review and test it, and denied everyone else | throws, naming the key |
+| `canAny(u, "admin")` | `false` — a whole nav section vanishes, no error to search for | throws: *did you mean `"admin.*"`?* |
+
+Two consequences worth planning for:
+
+- **A bare group path is never a valid check.** For visibility, the subtree
+  pattern is `"admin.*"`. For a gate, groups are folders — gate on a leaf.
+- **Keys must exist in the compiled-in catalog.** That is always true for a
+  correct deployment (the catalog ships with the code that checks it), but
+  a shared component checking a key from a namespace this app does not
+  declare will now say so instead of quietly denying.
+
+Provenance is validated the same way, at the write path: a missing
+`actorUserId` is rejected as `ProviderWriteRejectedError("provenance.
+actorUserId is required for kind \"admin\"", "validation")` before any row
+is written, instead of failing later inside the audit writer as a
+driver-level error naming a column you never wrote.
+
+## 10. The checklist
 
 1. Catalog: keys unchanged (`additionalNamespaces` / `allowArbitraryDepth`),
    scope types declared (`parent: null` only if instances are truly flat),
@@ -265,9 +343,12 @@ reason the next reviewer will see:
    well-known ids supplied by you.
 4. Every delete path paired with `deleteSubject` / `deleteScope`; every
    move path with `notifyScopeMoved`; offboarding with `setUserActive`.
-5. Render path on `snapshot`; actions on `can` / `can.fresh`.
-6. `alfiz-verify` in CI with your wrappers configured, out-of-domain files
-   pragma'd, and the remaining error count at zero.
+5. Render path on `snapshot` (hierarchical list pages: `resolve` after the
+   query, or push the filter down); actions on `can` / `can.fresh`.
+6. Runtime-string check paths audited for bare group paths, and
+   `UnknownPermissionError` mapped to 500 rather than 403.
+7. `alfiz-verify` in CI with your wrappers configured, out-of-domain files
+   pragma'd (in the header), and the remaining error count at zero.
 
 After that, the capabilities your old system lacked — cohort grants,
 time-bound elevation, access requests, per-resource roles — are single

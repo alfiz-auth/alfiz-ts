@@ -104,6 +104,14 @@ export interface GrantInput {
   provenance: Provenance;
 }
 
+/** The filter shared by `listGrants` and `countGrants`. */
+export interface GrantQuery {
+  subject?: SubjectId | undefined;
+  scope?: ScopeId | undefined;
+  /** Grants conferring a given role — role-holder queries without a scan. */
+  roleId?: string | undefined;
+}
+
 export interface RevokeInput {
   userId: string;
   pattern: PermissionPattern;
@@ -226,10 +234,14 @@ export interface AlfizProvider {
     provenance: Provenance,
   ): Promise<GrantRow[]>;
   deleteGrant(grantId: string, provenance: Provenance): Promise<void>;
-  listGrants(filter?: {
-    subject?: SubjectId | undefined;
-    scope?: ScopeId | undefined;
-  }): Promise<GrantRow[]>;
+  listGrants(filter?: GrantQuery): Promise<GrantRow[]>;
+  /**
+   * How many grants match — without materializing them. "How many people
+   * hold this role", rendered per row on a roles admin page, is the case
+   * this exists for: the alternative is reading every grant in the
+   * organization to produce a number.
+   */
+  countGrants(filter?: GrantQuery): Promise<number>;
   createRevoke(input: RevokeInput): Promise<RevokeRow>;
   deleteRevoke(revokeId: string, provenance: Provenance): Promise<void>;
   listRevokes(filter?: {
