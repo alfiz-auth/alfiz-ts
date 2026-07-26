@@ -212,3 +212,87 @@ shouldn't:
 4. **§4 `roleId` filter** — one-line passthrough, removes a full-table scan
    from a common admin page.
 5. **§5 / §6** — cosmetic and documentation.
+
+---
+
+## Addendum — verified against 0.2.1
+
+Every finding above is fixed, and I probed each rather than taking the
+changelog's word for it:
+
+| Finding | Probe | Result |
+| --- | --- | --- |
+| §1 pragma below `"use server"` | pragma under the directive | **honoured** |
+| §1 silent failure | pragma after real code | **warns**, names the line and the fix |
+| §1 (new) reasonless pragma | pragma with no reason | **warns** |
+| §2 `canAny("admin")` | bare group path | **raises**, "Did you mean `admin.*`?" |
+| §3 provenance | `actorUserId: undefined` | `ProviderWriteRejectedError[validation]`, names the field and the kind |
+| §4 `roleId` filter | roles admin page | one indexed query per role, `countGrants` for the total |
+| §5 `SnapshotOf` | actor type | `SnapshotOf<typeof catalog>` |
+| §6 `snapshot.resolve` | n/a | Garden's scopes are flat; not exercised |
+
+The unasked-for finding is the valuable one. Investigating §2 turned up its
+sibling on the **gate** path — `can(u, "docs.files.raed")` returning `true`
+for wildcard-holders and `false` for everyone else — which is a genuinely
+nasty failure mode: the misspelling passes review by the people privileged
+enough to test it and denies exactly the users it was written for. Finding
+that from a report about a *visibility* helper is the right instinct.
+
+Garden's own exposure to the new throw is nil: all 14 course-gate call sites
+pass literal keys, which `alfiz-verify` already checks against the catalog.
+The integration work was entirely about not *mis-reporting* it — see below.
+
+### One standing issue: the version understates the release
+
+`packages/*/package.json` ship **0.2.1**. `CHANGELOG.md` heads the same
+release **0.3.0**, and the release commit says "All packages to 0.3.0". The
+two disagree, and 0.2.1 is the wrong one:
+
+- **`countGrants` is a required member of `StorageDriver`**, not an optional
+  one. Any third-party driver breaks on upgrade — the release notes say so
+  explicitly ("Breaking for third-party storage drivers: implement
+  countGrants").
+- **Checks now raise where they previously returned a boolean.** A consumer
+  carrying a latent typo gets a runtime exception where they used to get a
+  (wrong) answer. That is the right change, and it is still a behaviour
+  change at every call site.
+
+`^0.2.0` resolves to `>=0.2.0 <0.3.0`, so every consumer on the previous
+release picks this up **automatically**, without opting in — which is
+precisely what `0.3.0` would have prevented. The changelog already made the
+right call; only the tarball disagrees.
+
+Suggest publishing the same tree as `0.3.0` (0.2.1 can stay as a deprecated
+alias), or at minimum reconciling the changelog heading so the document and
+the package agree on what shipped.
+
+### One small API gap left over from §4
+
+`listGrants({ roleId })` fixed the per-role query, but a roles **index** page
+still needs one query per role — there is no `listGrants({ roleIds: [...] })`
+and no grouped count. Garden has seven roles so this is invisible; a
+deployment with dozens pays a query each to render a count column. A
+`countGrants` variant that groups by role, or a plural `roleIds` filter,
+would close it.
+
+### An integration note worth documenting upstream
+
+The throw is correct, but it lands in adopter code that was written to treat
+*everything* from a gate as a denial. Garden had fourteen copies of
+
+```ts
+try { await assertTeaches(...) } catch (err) { throw new ApiError(403, err.message) }
+```
+
+which would have reported "403 Forbidden: courses.builder.raed is not a
+permission key" to the API caller — sending a developer to hunt for a grant
+instead of a typo, and re-creating in the error channel exactly the
+misdiagnosis the throw exists to prevent. The fix is one line
+(`if (err instanceof UnknownPermissionError) throw err`), but nothing
+prompts an adopter to make it.
+
+**Proposal.** A short "handling UnknownPermissionError" section in
+CONVENTIONS.md: it is a programming error, map it to 500, and never fold it
+into a permission-denied path. Adopters with a catch-to-403 wrapper — which
+is the common shape for resource-scoped gates — will otherwise inherit the
+bug the release set out to remove.
