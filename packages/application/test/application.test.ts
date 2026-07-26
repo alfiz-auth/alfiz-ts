@@ -28,11 +28,32 @@ describe("getSubjectAccess", () => {
     });
   });
 
-  it("unknown users evaluate inactive with an empty shape", async () => {
+  it("unknown principals are active members of `everyone` — public access reaches them", async () => {
     const { app } = makeApp();
     const data = await app.getSubjectAccess({ userId: "ghost" });
-    expect(data.active).toBe(false);
-    expect(data.grants).toEqual([]);
+    // Deny-by-default still holds (no rows), but absence is not offboarding.
+    expect(data.active).toBe(true);
+    expect(data.closure).toEqual(["user:ghost", "everyone"]);
+    await app.createGrant({
+      subject: "everyone",
+      pattern: "docs.files.read",
+      scope: "docs.doc:1",
+      provenance: admin,
+    });
+    const withPublic = await app.getSubjectAccess({ userId: "ghost" });
+    expect(withPublic.grants.length).toBe(1);
+  });
+
+  it("explicitly deactivated users evaluate inactive", async () => {
+    const { app, storage } = makeApp();
+    await storage.upsertUser({
+      userId: "gone",
+      active: false,
+      groupIds: [],
+      orgIds: [],
+      managerUserId: null,
+    });
+    expect((await app.getSubjectAccess({ userId: "gone" })).active).toBe(false);
   });
 
   it("surfaces unresolved role references instead of dropping them silently", async () => {

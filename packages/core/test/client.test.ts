@@ -190,6 +190,92 @@ describe("AlfizClient.can", () => {
   });
 });
 
+describe("review regressions", () => {
+  it("can(u, key, '*') agrees with can(u, key) for impliedOnAncestors leaves", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read_listing" }, "docs.folder:9")],
+      parents: { "docs.folder:9": "docs.folder:2" },
+    });
+    const client = createAlfizClient({ catalog, provider });
+    // One narrow share must not pass the broadest possible check.
+    expect(await client.can({ userId: "u1" }, "docs.files.read_listing")).toBe(false);
+    expect(await client.can({ userId: "u1" }, "docs.files.read_listing", "*")).toBe(false);
+    // Proper ancestors still get the implication.
+    expect(await client.can({ userId: "u1" }, "docs.files.read_listing", "docs.folder:2")).toBe(true);
+  });
+
+  it("explain agrees with can and reports the implication", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read_listing" }, "docs.folder:9")],
+      parents: { "docs.folder:9": "docs.folder:2" },
+    });
+    const client = createAlfizClient({ catalog, provider });
+    const atAncestor = await client.explain({ userId: "u1" }, "docs.files.read_listing", "docs.folder:2");
+    expect(atAncestor.allowed).toBe(true);
+    expect(atAncestor.implied).toBe(true);
+    expect(atAncestor.matchedGrants).toEqual([]); // no direct match — implication only
+    const atGlobal = await client.explain({ userId: "u1" }, "docs.files.read_listing");
+    expect(atGlobal.allowed).toBe(false);
+    expect(atGlobal.implied).toBe(false);
+  });
+
+  it("an invalidation landing during an in-flight fetch is not lost", async () => {
+    let release: (() => void) | undefined;
+    let fetches = 0;
+    const base = fakeProvider({ grants: [g("user:u1", { pattern: "docs.files.read" })] });
+    const provider = {
+      ...base,
+      getSubjectAccess: async (p: Parameters<typeof base.getSubjectAccess>[0]) => {
+        fetches++;
+        if (fetches === 1) {
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        }
+        return base.getSubjectAccess(p);
+      },
+    };
+    const client = createAlfizClient({ catalog, provider });
+    const first = client.can({ userId: "u1" }, "docs.files.read");
+    // The bust arrives while the fetch is still in flight…
+    provider.emit({ type: "user", userId: "u1" });
+    release!();
+    await first;
+    // …so the stale result must NOT have been cached: the next check refetches.
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(fetches).toBe(2);
+    client.close();
+  });
+
+  it("a wildcard grant at a scope confers only keys grantable at that scope type", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.*" }, "docs.doc:1")],
+    });
+    const client = createAlfizClient({ catalog, provider });
+    expect(await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1")).toBe(true);
+    // delete is folder-only: it does not escape through the wildcard.
+    expect(await client.can({ userId: "u1" }, "docs.files.delete", "docs.doc:1")).toBe(false);
+  });
+
+  it("effectiveKeys ignores scoped revokes (they narrow one subtree, not the held set)", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" })],
+      revokes: [
+        {
+          id: "r1",
+          userId: "u1",
+          pattern: "docs.files.read",
+          scope: "docs.folder:9",
+          provenance: { kind: "admin", actorUserId: "root" },
+          createdAt: 0,
+        },
+      ],
+    });
+    const client = createAlfizClient({ catalog, provider });
+    expect(await client.effectiveKeys({ userId: "u1" })).toContain("docs.files.read");
+  });
+});
+
 describe("ancestor visibility (impliedOnAncestors)", () => {
   it("a granted scope implies the marked leaf on its ancestors only", async () => {
     const provider = fakeProvider({

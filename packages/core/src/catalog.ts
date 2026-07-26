@@ -348,6 +348,7 @@ export interface AnyCatalog {
     pattern: PermissionPattern,
     scope: ScopeId,
   ): CatalogIssue | null;
+  appliesAt(key: PermissionKey, grantScope: ScopeId): boolean;
   toDocument(): CatalogDocument;
 }
 
@@ -451,6 +452,24 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
       };
     }
     return null;
+  }
+
+  /**
+   * The scope-type system at CHECK time: may a grant made at `grantScope`
+   * confer `key` there? Global grants confer everything they match; a grant
+   * at a scope instance confers only keys grantable at that scope type.
+   * This is what keeps a wildcard or role grant at a narrow scope from
+   * conferring keys (e.g. a folder-only `delete`) the catalog never made
+   * grantable there — `validateGrantableAt` is the write-path half, this is
+   * the evaluation half.
+   */
+  appliesAt(key: PermissionKey, grantScope: ScopeId): boolean {
+    if (grantScope === GLOBAL_SCOPE) return true;
+    const type = scopeTypeOf(grantScope);
+    if (type === null) return false;
+    const leaf = this.leaves.get(key);
+    if (!leaf) return false;
+    return leaf.scopes.includes(type);
   }
 
   /** The stable, serializable publish shape. */

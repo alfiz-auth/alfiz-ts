@@ -149,6 +149,9 @@ describe("role-shaped requests", () => {
   it("admin override: alfiz_internal.requests.decide_request may decide any stage", async () => {
     const { app } = makeApp();
     await seedUsers(app);
+    // The hierarchy is populated (policy creation demands it), but the
+    // REQUESTER has no manager — the stage is unfillable for this request.
+    await app.setReportingEdge("someone-else", "their-boss", admin);
     await app.createGrant({
       subject: "user:approver",
       pattern: "alfiz_internal.requests.decide_request",
@@ -158,7 +161,6 @@ describe("role-shaped requests", () => {
       {
         name: "Reader",
         patterns: ["docs.files.read"],
-        // A stage nobody can fill: requester has no manager.
         requestable: { stages: [{ kind: "management" }] },
       },
       admin,
@@ -270,6 +272,7 @@ describe("scope-type (pattern) requests", () => {
 
   it("role requests at a scope validate grantability at submission (approval skips re-validation)", async () => {
     const { app } = await setup();
+    await app.setReportingEdge("someone", "their-boss", admin);
     // A role whose only pattern is global-only (docs.admin.* declares no scopes).
     const globalOnly = await app.createRole(
       {
@@ -306,6 +309,7 @@ describe("request lifecycle", () => {
   it("cancel: requester only, pending only", async () => {
     const { app } = makeApp();
     await app.setGroupMembership("requester", [], admin);
+    await app.setReportingEdge("requester", "jane", admin);
     const requestable = await app.createRole(
       {
         name: "Reader",

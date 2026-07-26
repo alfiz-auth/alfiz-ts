@@ -91,8 +91,12 @@ export function patternsOfGrant(
   row: GrantRow,
   roles: ReadonlyMap<string, RoleDef>,
 ): readonly PermissionPattern[] {
-  if (row.pattern !== undefined) return [row.pattern];
-  if (row.roleId !== undefined) return roles.get(row.roleId)?.patterns ?? [];
+  // Empty-string pattern is "absent", exactly as validateGrantRow treats it —
+  // a role grant with pattern:"" resolves through the role, not to nothing.
+  if (row.pattern !== undefined && row.pattern !== "") return [row.pattern];
+  if (row.roleId !== undefined && row.roleId !== "") {
+    return roles.get(row.roleId)?.patterns ?? [];
+  }
   return [];
 }
 
@@ -111,6 +115,15 @@ export interface CheckContext {
   rows: AccessRows;
   /** Evaluation instant (epoch ms) for expiry filtering. */
   now: number;
+  /**
+   * The scope-type system at check time: whether a grant made at
+   * `grantScope` may confer `key` there. The Client derives this from the
+   * catalog (a leaf applies at a non-global grant scope only when it
+   * declares that scope type), which closes the hole where a wildcard or
+   * role grant at a narrow scope would otherwise confer keys the catalog
+   * never made grantable there. Absent = every matched key applies.
+   */
+  grantApplies?: ((key: PermissionKey, grantScope: ScopeId) => boolean) | undefined;
 }
 
 /**
@@ -163,6 +176,7 @@ export function explainKey(
     if (!ctx.subjectClosure.has(grant.subject)) continue;
     if (!objects.has(grant.scope)) continue;
     if (isExpired(grant, ctx.now)) continue;
+    if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
     for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
       if (patternMatchesKey(pattern, key)) {
         matchedGrants.push(grant);
@@ -209,6 +223,7 @@ export function checkAny(
     for (const grant of ctx.rows.grants) {
       if (!ctx.subjectClosure.has(grant.subject)) continue;
       if (isExpired(grant, ctx.now)) continue;
+      if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
       let matches = false;
       for (const p of patternsOfGrant(grant, ctx.rows.roles)) {
         if (patternMatchesKey(p, key)) {
@@ -251,6 +266,7 @@ export function grantedScopesFor(
   for (const grant of ctx.rows.grants) {
     if (!ctx.subjectClosure.has(grant.subject)) continue;
     if (isExpired(grant, ctx.now)) continue;
+    if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
     for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
       if (patternMatchesKey(pattern, key)) {
         scopes.add(grant.scope);

@@ -155,6 +155,19 @@ export class AlfizApplication implements AlfizProvider {
     }
   }
 
+  /**
+   * The host application owns the object hierarchy behind
+   * `resolveAncestors`, so only it knows when a resource moved. Call this
+   * from the code path that changes a parent pointer: it emits the `scope`
+   * invalidation event that busts cached ancestor chains immediately —
+   * "moving a sensitive document into a restricted folder must take effect
+   * at once". Without it, staleness is bounded only by the client's
+   * object-chain TTL.
+   */
+  notifyScopeMoved(scope: ScopeId): void {
+    this.emit({ type: "scope", scope });
+  }
+
   private async audit(
     provenance: Provenance,
     action: string,
@@ -228,20 +241,19 @@ export class AlfizApplication implements AlfizProvider {
       };
     }
 
-    const user = await this.storage.getUser(principal.userId);
-    if (!user) {
-      // Unknown principals evaluate to nothing, in the same shape.
-      return {
-        userId: principal.userId,
-        closure: [`user:${principal.userId}`, "everyone"],
-        grants: [],
-        revokes: [],
-        roles: [],
-        managerChain: [],
-        unresolvedRoleIds: [],
-        active: false,
-      };
-    }
+    const stored = await this.storage.getUser(principal.userId);
+    // A principal the identity provider authenticated but Alfiz never
+    // provisioned is still a member of `everyone` — public access is an
+    // ordinary grant row, and it must reach them. Deny-by-default still
+    // holds: without matching rows they can do nothing. Inactive means an
+    // EXPLICIT active:false — offboarding, not absence.
+    const user: StoredUser = stored ?? {
+      userId: principal.userId,
+      active: true,
+      groupIds: [],
+      orgIds: [],
+      managerUserId: null,
+    };
     const groups = await this.storage.listGroups();
     const groupParents = new Map<string, readonly string[]>(
       groups.map((g) => [g.id, g.parents]),
@@ -307,6 +319,7 @@ export class AlfizApplication implements AlfizProvider {
           roles: new Map(data.roles.map((r) => [r.id, r])),
         },
         now: this.now(),
+        grantApplies: (key, grantScope) => this.catalog.appliesAt(key, grantScope),
       },
     };
   }
@@ -440,6 +453,14 @@ export class AlfizApplication implements AlfizProvider {
     if (isGlobalScope(scope)) this.requireOrgRoot("a global-scope revoke");
     const issue = validatePattern(input.pattern);
     if (issue) throw new ProviderWriteRejectedError(issue.reason, "validation");
+    if (!this.catalog.isKnownPattern(input.pattern)) {
+      // A typo'd revoke would silently fail OPEN — the one direction a
+      // mistake here must never take.
+      throw new ProviderWriteRejectedError(
+        `pattern ${JSON.stringify(input.pattern)} references nothing in the catalog`,
+        "validation",
+      );
+    }
     const scopeIssue = validateScopeId(scope);
     if (scopeIssue) {
       throw new ProviderWriteRejectedError(scopeIssue.reason, "validation");
@@ -491,6 +512,40 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   // -- requests -------------------------------------------------------------
+
+  /**
+   * §9.3: a policy referencing management layers where no reporting
+   * hierarchy is populated is a configuration error — surfaced at policy
+   * creation for roles, at submission for catalog scope-type policies —
+   * never silently skipped. Empty stage lists and layers < 1 are equally
+   * unresolvable.
+   */
+  private async assertPolicyResolvable(
+    stages: readonly ApprovalStage[],
+  ): Promise<void> {
+    if (stages.length === 0) {
+      throw new ProviderWriteRejectedError(
+        "requestable without a resolvable policy: declare at least one approval stage",
+        "validation",
+      );
+    }
+    for (const stage of stages) {
+      if (stage.kind !== "management") continue;
+      if ((stage.layers ?? 1) < 1) {
+        throw new ProviderWriteRejectedError(
+          "management layers must be at least 1 (the direct manager)",
+          "validation",
+        );
+      }
+      const users = await this.storage.listUsers();
+      if (!users.some((u) => u.managerUserId !== null)) {
+        throw new ProviderWriteRejectedError(
+          "policy references management layers but no reporting hierarchy is populated",
+          "validation",
+        );
+      }
+    }
+  }
 
   private async requestability(input: RequestInput): Promise<{
     prompts: readonly import("@alfiz/core").RequestPromptInput[];
@@ -582,6 +637,7 @@ export class AlfizApplication implements AlfizProvider {
       }
     }
     const requestability = await this.requestability(input);
+    await this.assertPolicyResolvable(requestability.stages);
     const problems = validateJustification(
       requestability.prompts,
       input.justification ?? {},
@@ -590,21 +646,30 @@ export class AlfizApplication implements AlfizProvider {
       throw new ProviderWriteRejectedError(problems.join("; "), "validation");
     }
     const now = this.now();
-    if (requestability.requireExpiry && input.proposedExpiresAt === undefined) {
+    let proposedExpiresAt = input.proposedExpiresAt;
+    if (proposedExpiresAt !== undefined && proposedExpiresAt <= now) {
+      throw new ProviderWriteRejectedError(
+        "proposed expiry is already in the past",
+        "validation",
+      );
+    }
+    if (requestability.requireExpiry && proposedExpiresAt === undefined) {
       throw new ProviderWriteRejectedError(
         "this access must be time-bound: propose an expiry",
         "validation",
       );
     }
-    if (
-      input.proposedExpiresAt !== undefined &&
-      requestability.maxDurationMs !== undefined &&
-      input.proposedExpiresAt - now > requestability.maxDurationMs
-    ) {
-      throw new ProviderWriteRejectedError(
-        `proposed duration exceeds the maximum (${requestability.maxDurationMs} ms)`,
-        "validation",
-      );
+    if (requestability.maxDurationMs !== undefined) {
+      if (proposedExpiresAt === undefined) {
+        // A maximum-duration policy caps open-ended requests too: omitting
+        // the expiry must not evade the cap, so the cap becomes the expiry.
+        proposedExpiresAt = now + requestability.maxDurationMs;
+      } else if (proposedExpiresAt - now > requestability.maxDurationMs) {
+        throw new ProviderWriteRejectedError(
+          `proposed duration exceeds the maximum (${requestability.maxDurationMs} ms)`,
+          "validation",
+        );
+      }
     }
     let request: AccessRequest = {
       id: this.newId(),
@@ -612,7 +677,7 @@ export class AlfizApplication implements AlfizProvider {
       roleId: input.roleId,
       pattern: input.pattern,
       scope,
-      proposedExpiresAt: input.proposedExpiresAt,
+      proposedExpiresAt,
       justification: input.justification ?? {},
       state: "pending",
       stageIndex: 0,
@@ -621,7 +686,7 @@ export class AlfizApplication implements AlfizProvider {
       createdAt: now,
     };
     const requester = await this.contextFor({ userId: input.requesterUserId });
-    const result = runAutoStages(request, requester.ctx, now);
+    const result = runAutoStages(request, requester.ctx, now, this.catalog.keys);
     request = result.request;
     await this.storage.insertRequest(request);
     await this.audit(
@@ -687,85 +752,112 @@ export class AlfizApplication implements AlfizProvider {
       note?: string | undefined;
     },
   ): Promise<AccessRequest> {
-    const request = await this.storage.getRequest(requestId);
-    if (!request) {
-      throw new ProviderWriteRejectedError("request not found", "not_found");
-    }
-    if (request.state !== "pending") {
-      throw new ProviderWriteRejectedError(
-        `request is ${request.state}`,
-        "conflict",
-      );
-    }
-    if (!(await this.canDecide(request, decision.deciderUserId))) {
-      throw new ProviderWriteRejectedError(
-        "not an approver for the current stage",
-        "validation",
-      );
-    }
-    const now = this.now();
-    let result = applyDecision(request, {
-      decidedBy: decision.deciderUserId,
-      decision: decision.decision,
-      at: now,
-      note: decision.note,
-    });
-    if (result.request.state === "pending") {
-      // A human approval may unlock consecutive auto stages.
-      const requester = await this.contextFor({
-        userId: request.requesterUserId,
+    // Decisions are serialized per request: two concurrent deciders must not
+    // both apply (a denial overwritten by an approval, duplicate grants).
+    return this.storage.runExclusive(`request:${requestId}`, async () => {
+      const request = await this.storage.getRequest(requestId);
+      if (!request) {
+        throw new ProviderWriteRejectedError("request not found", "not_found");
+      }
+      if (request.state !== "pending") {
+        throw new ProviderWriteRejectedError(
+          `request is ${request.state}`,
+          "conflict",
+        );
+      }
+      // Requests are homed where their proposed row would live: deciding a
+      // global-scope request is an org-domain write.
+      if (isGlobalScope(request.scope)) {
+        this.requireOrgRoot("deciding a global-scope access request");
+      }
+      if (!(await this.canDecide(request, decision.deciderUserId))) {
+        throw new ProviderWriteRejectedError(
+          "not an approver for the current stage",
+          "validation",
+        );
+      }
+      const now = this.now();
+      let result = applyDecision(request, {
+        decidedBy: decision.deciderUserId,
+        decision: decision.decision,
+        at: now,
+        note: decision.note,
       });
-      const advanced = runAutoStages(result.request, requester.ctx, now);
-      result = {
-        request: advanced.request,
-        grantPlan: advanced.grantPlan ?? result.grantPlan,
-      };
-    }
-    await this.storage.updateRequest(result.request);
-    await this.audit(
-      { kind: "admin", actorUserId: decision.deciderUserId },
-      `request.${decision.decision}`,
-      requestId,
-      { note: decision.note },
-    );
-    if (result.grantPlan) {
-      await this.writeGrantFromPlan(result.grantPlan);
-    }
-    return result.request;
+      if (result.request.state === "pending") {
+        // A human approval may unlock consecutive auto stages.
+        const requester = await this.contextFor({
+          userId: request.requesterUserId,
+        });
+        const advanced = runAutoStages(
+          result.request,
+          requester.ctx,
+          now,
+          this.catalog.keys,
+        );
+        result = {
+          request: advanced.request,
+          grantPlan: advanced.grantPlan ?? result.grantPlan,
+        };
+      }
+      if (
+        result.grantPlan?.roleId !== undefined &&
+        (await this.storage.getRole(result.grantPlan.roleId)) === null
+      ) {
+        // The role was deleted while the request was pending: approving now
+        // would write a dangling-role grant that confers nothing.
+        throw new ProviderWriteRejectedError(
+          "the requested role no longer exists",
+          "conflict",
+        );
+      }
+      await this.storage.updateRequest(result.request);
+      await this.audit(
+        { kind: "admin", actorUserId: decision.deciderUserId },
+        `request.${decision.decision}`,
+        requestId,
+        { note: decision.note },
+      );
+      if (result.grantPlan) {
+        await this.writeGrantFromPlan(result.grantPlan);
+      }
+      return result.request;
+    });
   }
 
   async cancelRequest(
     requestId: string,
     byUserId: string,
   ): Promise<AccessRequest> {
-    const request = await this.storage.getRequest(requestId);
-    if (!request) {
-      throw new ProviderWriteRejectedError("request not found", "not_found");
-    }
-    if (request.requesterUserId !== byUserId) {
-      throw new ProviderWriteRejectedError(
-        "only the requester may cancel",
-        "validation",
+    return this.storage.runExclusive(`request:${requestId}`, async () => {
+      const request = await this.storage.getRequest(requestId);
+      if (!request) {
+        throw new ProviderWriteRejectedError("request not found", "not_found");
+      }
+      if (request.requesterUserId !== byUserId) {
+        throw new ProviderWriteRejectedError(
+          "only the requester may cancel",
+          "validation",
+        );
+      }
+      if (request.state !== "pending") {
+        throw new ProviderWriteRejectedError(
+          `request is ${request.state}`,
+          "conflict",
+        );
+      }
+      const cancelled: AccessRequest = {
+        ...request,
+        state: "cancelled",
+        decidedAt: this.now(),
+      };
+      await this.storage.updateRequest(cancelled);
+      await this.audit(
+        { kind: "admin", actorUserId: byUserId },
+        "request.cancel",
+        requestId,
       );
-    }
-    if (request.state !== "pending") {
-      throw new ProviderWriteRejectedError(
-        `request is ${request.state}`,
-        "conflict",
-      );
-    }
-    const cancelled: AccessRequest = {
-      ...request,
-      state: "cancelled",
-      decidedAt: this.now(),
-    };
-    await this.storage.updateRequest(cancelled);
-    await this.audit(
-      { kind: "admin", actorUserId: byUserId },
-      "request.cancel",
-      requestId,
-    );
-    return cancelled;
+      return cancelled;
+    });
   }
 
   async listRequests(filter?: RequestFilter): Promise<AccessRequest[]> {
@@ -832,6 +924,9 @@ export class AlfizApplication implements AlfizProvider {
   ): Promise<RoleRecord> {
     this.requireOrgRoot("a role definition");
     this.validateRolePatterns(input.patterns);
+    if (input.requestable) {
+      await this.assertPolicyResolvable(input.requestable.stages);
+    }
     const role: RoleRecord = {
       id: this.newId(),
       name: input.name,
@@ -856,6 +951,9 @@ export class AlfizApplication implements AlfizProvider {
       throw new ProviderWriteRejectedError("role not found", "not_found");
     }
     if (input.patterns) this.validateRolePatterns(input.patterns);
+    if (input.requestable) {
+      await this.assertPolicyResolvable(input.requestable.stages);
+    }
     const updated: RoleRecord = {
       ...existing,
       ...(input.name !== undefined ? { name: input.name } : {}),
@@ -879,6 +977,17 @@ export class AlfizApplication implements AlfizProvider {
     if (holders.length > 0) {
       throw new ProviderWriteRejectedError(
         `role is assigned by ${holders.length} grant(s); remove them first`,
+        "conflict",
+      );
+    }
+    const pending = (await this.storage.listRequests({ state: "pending" })).filter(
+      (r) =>
+        r.roleId === roleId ||
+        r.stages.some((s) => s.kind === "named_approvers" && s.roleId === roleId),
+    );
+    if (pending.length > 0) {
+      throw new ProviderWriteRejectedError(
+        `role is referenced by ${pending.length} pending request(s); decide or cancel them first`,
         "conflict",
       );
     }
@@ -1099,7 +1208,10 @@ export class AlfizApplication implements AlfizProvider {
       });
       const newChain = await this.managerChain(userId);
       this.emit({ type: "user", userId });
-      for (const m of new Set([...oldChain, ...newChain])) {
+      // The edited user's own implicit groups too: their reports' closures
+      // contain orgof:<userId>, and those closures just gained or lost the
+      // new ancestors above them.
+      for (const m of new Set([userId, ...oldChain, ...newChain])) {
         this.emit({ type: "subject", subject: `directs:${m}` });
         this.emit({ type: "subject", subject: `orgof:${m}` });
       }
@@ -1150,6 +1262,10 @@ export class AlfizApplication implements AlfizProvider {
       }
       for (const grant of parentGrants) {
         await this.storage.deleteGrant(grant.id);
+        await this.audit(provenance, "grant.delete", grant.id, {
+          reason: "virtual parent dissolved",
+          copiedTo: children.map((c) => `group:${c.id}`),
+        });
       }
       // Children keep inheriting the parent's own parents, then drift freely.
       for (const child of children) {
@@ -1163,6 +1279,19 @@ export class AlfizApplication implements AlfizProvider {
           ],
         });
         this.emitSubject(`group:${child.id}`);
+      }
+      // Direct members (rare for virtual parents, possible after imports)
+      // must not keep a dangling membership.
+      const members = await this.storage.listUsersInGroup(groupId);
+      for (const userId of members) {
+        const user = await this.storage.getUser(userId);
+        if (user) {
+          await this.storage.upsertUser({
+            ...user,
+            groupIds: user.groupIds.filter((g) => g !== groupId),
+          });
+          this.emit({ type: "user", userId });
+        }
       }
       await this.storage.deleteGroup(groupId);
       await this.audit(provenance, "group.dissolve_virtual_parent", groupId, {
@@ -1202,25 +1331,40 @@ export class AlfizApplication implements AlfizProvider {
 
     await this.storage.runExclusive("groups", async () => {
       if (snapshot.groups) {
+        // Condense the MERGED graph — pre-existing groups plus the snapshot
+        // (snapshot wins per group) — a snapshot that is individually
+        // acyclic can still close a cycle through stored parentage, and a
+        // stored cycle would brick every later group-parent edit.
+        const existing = await this.storage.listGroups();
         const parentsOf = new Map<string, readonly string[]>(
-          snapshot.groups.map((g) => [g.id, g.parents ?? []]),
+          existing.map((g) => [g.id, g.parents]),
         );
+        for (const g of snapshot.groups) parentsOf.set(g.id, g.parents ?? []);
         const { condenseImportedGraph } = await import("@alfiz/core");
         const condensed = condenseImportedGraph(parentsOf);
         warnings.push(...condensed.warnings);
         virtualParents.push(...condensed.virtualParents);
         const names = new Map(snapshot.groups.map((g) => [g.id, g]));
+        const existingById = new Map(existing.map((g) => [g.id, g]));
         for (const [id, parents] of condensed.parentsOf) {
           const known = names.get(id);
-          const existing = await this.storage.getGroup(id);
+          const prior = existingById.get(id);
+          const priorParents = prior?.parents ?? null;
+          const changed =
+            known !== undefined ||
+            prior === undefined ||
+            priorParents === null ||
+            priorParents.length !== parents.length ||
+            priorParents.some((p, i) => parents[i] !== p);
+          if (!changed) continue;
           await this.storage.upsertGroup({
             id,
-            name: known?.name ?? existing?.name ?? id,
-            description: known?.description ?? existing?.description,
+            name: known?.name ?? prior?.name ?? id,
+            description: known?.description ?? prior?.description,
             parents: [...parents],
             virtual: condensed.virtualParents.some((vp) => vp.id === id)
               ? true
-              : existing?.virtual,
+              : prior?.virtual,
           });
         }
         await this.audit(provenance, "directory.import_groups", source, {
@@ -1273,10 +1417,21 @@ export class AlfizApplication implements AlfizProvider {
 
     if (snapshot.reportingEdges) {
       await this.storage.runExclusive("reporting", async () => {
-        const edges = snapshot.reportingEdges!;
-        for (const [userId, managerUserId] of Object.entries(edges)) {
-          // Follow the proposed edges upward; a loop back to userId is a
-          // directory cycle — skipped with a warning, never written.
+        // Cycle detection must see the MERGED edge set: snapshot edges
+        // overlaid on stored ones — a partial import composed with stored
+        // edges can close a loop the snapshot alone does not contain.
+        const merged = new Map<string, string>();
+        for (const user of await this.storage.listUsers()) {
+          if (user.managerUserId !== null) {
+            merged.set(user.userId, user.managerUserId);
+          }
+        }
+        for (const [userId, managerUserId] of Object.entries(
+          snapshot.reportingEdges!,
+        )) {
+          // Walk upward through the merged view as it would look with this
+          // edge applied; a loop back to userId is a cycle — skipped with a
+          // warning, never written.
           const path = [userId];
           let current: string | undefined = managerUserId;
           let cyclic = false;
@@ -1288,7 +1443,7 @@ export class AlfizApplication implements AlfizProvider {
               break;
             }
             seen.add(current);
-            current = edges[current];
+            current = merged.get(current);
           }
           if (cyclic) {
             warnings.push(
@@ -1296,6 +1451,7 @@ export class AlfizApplication implements AlfizProvider {
             );
             continue;
           }
+          merged.set(userId, managerUserId);
           const user = (await this.storage.getUser(userId)) ?? {
             userId,
             active: true,

@@ -98,11 +98,15 @@ Alfiz is unopinionated about storage, transport, and deployment — and
 ## Staleness, honestly
 
 Closures are cached; decisions are not. Subject-side caches default to a
-30-second TTL (configurable) plus event-driven invalidation; object chains
-bust immediately on move. That TTL is the bound on over-access after a
-revocation. `can.fresh()` bypasses all caches — pair it with destructive
-actions and just-in-time elevations. Nothing on your request path is ever
-metered, priced, or throttled: checks are unmeterable by construction.
+30-second TTL (configurable) plus event-driven invalidation — that TTL is
+the bound on over-access after a revocation. Object ancestor chains bust
+immediately when a move is reported: your application owns the hierarchy,
+so call `app.notifyScopeMoved(scope)` from the code path that changes a
+parent pointer; a 60-second chain TTL (configurable) bounds staleness for
+moves that were never reported. `can.fresh()` bypasses all caches — pair it
+with destructive actions and just-in-time elevations. Nothing on your
+request path is ever metered, priced, or throttled: checks are unmeterable
+by construction.
 
 ## Packages
 

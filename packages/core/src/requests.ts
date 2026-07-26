@@ -11,13 +11,13 @@
  * org-root promotion untouched.
  */
 
-import type { PermissionPattern } from "./grammar.js";
-import { patternMatchesKey, patternsIntersect } from "./grammar.js";
+import type { PermissionKey, PermissionPattern } from "./grammar.js";
+import { patternMatchesKey } from "./grammar.js";
 import type { ScopeId } from "./scopes.js";
 import type { SubjectId } from "./subjects.js";
 import { groupSubject, orgSubject } from "./subjects.js";
 import type { CheckContext, GrantRow, Provenance } from "./access.js";
-import { isExpired, patternsOfGrant } from "./access.js";
+import { checkAny, isExpired } from "./access.js";
 
 // ---------------------------------------------------------------------------
 // Justification prompts
@@ -114,10 +114,16 @@ export interface AccessRequest {
 /**
  * Evaluates an auto-approval predicate against the requester's closure and
  * rows — deliberately the `can()` machinery, not a rules engine.
+ *
+ * `catalogKeys` grounds `holds_pattern` in the catalog's concrete keys and
+ * applies revoke suppression exactly as `checkAny` does: a fully-revoked
+ * requester never auto-approves, and a pattern matching no catalog key never
+ * passes. Negative-always-wins holds here too.
  */
 export function evaluateAutoPredicate(
   predicate: AutoApprovalPredicate,
   requester: CheckContext,
+  catalogKeys: readonly PermissionKey[],
 ): boolean {
   switch (predicate.type) {
     case "in_group":
@@ -126,16 +132,8 @@ export function evaluateAutoPredicate(
       return requester.subjectClosure.has(orgSubject(predicate.orgId));
     case "member_of":
       return requester.subjectClosure.has(predicate.subject);
-    case "holds_pattern": {
-      for (const grant of requester.rows.grants) {
-        if (!requester.subjectClosure.has(grant.subject)) continue;
-        if (isExpired(grant, requester.now)) continue;
-        for (const granted of patternsOfGrant(grant, requester.rows.roles)) {
-          if (patternsIntersect(granted, predicate.pattern)) return true;
-        }
-      }
-      return false;
-    }
+    case "holds_pattern":
+      return checkAny(requester, predicate.pattern, catalogKeys);
   }
 }
 
@@ -264,13 +262,14 @@ export function runAutoStages(
   request: AccessRequest,
   requester: CheckContext,
   now: number,
+  catalogKeys: readonly PermissionKey[],
 ): StageAdvanceResult {
   let current: AccessRequest = request;
   let plan: StageAdvanceResult["grantPlan"];
   while (current.state === "pending") {
     const stage = current.stages[current.stageIndex];
     if (!stage || stage.kind !== "auto") break;
-    if (evaluateAutoPredicate(stage.predicate, requester)) {
+    if (evaluateAutoPredicate(stage.predicate, requester, catalogKeys)) {
       const advanced = applyDecision(current, {
         decidedBy: "auto",
         decision: "approved",

@@ -50,20 +50,45 @@ const request = (stages: ApprovalStage[]): AccessRequest => ({
   createdAt: NOW - 100,
 });
 
+const CATALOG_KEYS = [
+  "docs.files.read",
+  "docs.files.export_file",
+  "billing.invoices.read",
+];
+
 describe("evaluateAutoPredicate", () => {
   it("in_group / in_org / member_of read the closure", () => {
     const ctx = ctxOf("u1", ["user:u1", "group:teachers", "org:acme", "orgof:jane", "everyone"]);
-    expect(evaluateAutoPredicate({ type: "in_group", groupId: "teachers" }, ctx)).toBe(true);
-    expect(evaluateAutoPredicate({ type: "in_group", groupId: "admins" }, ctx)).toBe(false);
-    expect(evaluateAutoPredicate({ type: "in_org", orgId: "acme" }, ctx)).toBe(true);
-    expect(evaluateAutoPredicate({ type: "member_of", subject: "orgof:jane" }, ctx)).toBe(true);
-    expect(evaluateAutoPredicate({ type: "member_of", subject: "directs:jane" }, ctx)).toBe(false);
+    expect(evaluateAutoPredicate({ type: "in_group", groupId: "teachers" }, ctx, CATALOG_KEYS)).toBe(true);
+    expect(evaluateAutoPredicate({ type: "in_group", groupId: "admins" }, ctx, CATALOG_KEYS)).toBe(false);
+    expect(evaluateAutoPredicate({ type: "in_org", orgId: "acme" }, ctx, CATALOG_KEYS)).toBe(true);
+    expect(evaluateAutoPredicate({ type: "member_of", subject: "orgof:jane" }, ctx, CATALOG_KEYS)).toBe(true);
+    expect(evaluateAutoPredicate({ type: "member_of", subject: "directs:jane" }, ctx, CATALOG_KEYS)).toBe(false);
   });
 
-  it("holds_pattern intersects effective grants", () => {
+  it("holds_pattern evaluates against catalog keys via the can() machinery", () => {
     const ctx = ctxOf("u1", ["user:u1", "everyone"], [grant("user:u1", { pattern: "docs.*" })]);
-    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "docs.files.read" }, ctx)).toBe(true);
-    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "billing.*" }, ctx)).toBe(false);
+    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "docs.files.read" }, ctx, CATALOG_KEYS)).toBe(true);
+    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "billing.*" }, ctx, CATALOG_KEYS)).toBe(false);
+    // A pattern matching no catalog key never passes, whatever is granted.
+    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "docs.ghost.*" }, ctx, CATALOG_KEYS)).toBe(false);
+  });
+
+  it("holds_pattern respects personal revokes — negative always wins", () => {
+    const ctx: CheckContext = {
+      subjectClosure: new Set(["user:u1", "everyone"]),
+      userId: "u1",
+      rows: {
+        grants: [grant("user:u1", { pattern: "docs.*" })],
+        revokes: [{
+          id: "r1", userId: "u1", pattern: "*", scope: "*",
+          provenance: { kind: "admin", actorUserId: "root" }, createdAt: NOW - 1,
+        }],
+        roles: new Map(),
+      },
+      now: NOW,
+    };
+    expect(evaluateAutoPredicate({ type: "holds_pattern", pattern: "docs.*" }, ctx, CATALOG_KEYS)).toBe(false);
   });
 });
 
@@ -155,7 +180,7 @@ describe("runAutoStages", () => {
 
   it("a passing predicate approves and can settle the whole request", () => {
     const req = request([{ kind: "auto", predicate: { type: "in_group", groupId: "teachers" } }]);
-    const result = runAutoStages(req, teacherCtx, NOW);
+    const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
     expect(result.request.state).toBe("approved");
     expect(result.grantPlan?.provenance).toEqual({ kind: "request", requestId: "req1" });
     expect(result.request.decisions[0]?.decidedBy).toBe("auto");
@@ -166,7 +191,7 @@ describe("runAutoStages", () => {
       { kind: "auto", predicate: { type: "in_group", groupId: "admins" } },
       { kind: "management" },
     ]);
-    const result = runAutoStages(req, teacherCtx, NOW);
+    const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
     expect(result.request.state).toBe("pending");
     expect(result.request.stageIndex).toBe(1);
     expect(result.request.decisions).toEqual([]);
@@ -177,7 +202,7 @@ describe("runAutoStages", () => {
       { kind: "auto", predicate: { type: "in_group", groupId: "teachers" } },
       { kind: "named_approvers", roleId: "owner" },
     ]);
-    const result = runAutoStages(req, teacherCtx, NOW);
+    const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
     expect(result.request.state).toBe("pending");
     expect(result.request.stageIndex).toBe(1);
     expect(result.request.decisions.length).toBe(1);
@@ -185,7 +210,7 @@ describe("runAutoStages", () => {
 
   it("a failing sole auto stage leaves the request pending for admin decision", () => {
     const req = request([{ kind: "auto", predicate: { type: "in_group", groupId: "admins" } }]);
-    const result = runAutoStages(req, teacherCtx, NOW);
+    const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
     expect(result.request.state).toBe("pending");
     expect(result.request.stageIndex).toBe(0);
   });

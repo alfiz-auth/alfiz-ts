@@ -8,7 +8,7 @@
  */
 
 import type { ScopeId } from "./scopes.js";
-import { GLOBAL_SCOPE, parseScopeId } from "./scopes.js";
+import { GLOBAL_SCOPE } from "./scopes.js";
 
 export type ListingPlan =
   /** A global grant and no revokes: no filter needed. */
@@ -47,14 +47,19 @@ export interface SqlFragment {
 export interface MatPathOptions {
   /**
    * The materialized-path column: the separator-joined chain of scope tokens
-   * from root to the row itself, wrapped in separators — e.g. `/f2/f9/d1/`.
+   * from root to the row itself, wrapped in separators — e.g.
+   * `/docs.folder:2/docs.folder:9/docs.doc:1/`.
    */
   pathColumn: string;
   separator?: string;
   /**
    * Maps a scope id to the token stored in the path column. Defaults to the
-   * instance-id part of the scope id (`docs.folder:9` → `9`); pass identity
-   * to store full scope ids.
+   * FULL scope id — instance ids alone collide across scope types (doc 9 vs
+   * folder 9 from independent id spaces), which would over-list on include
+   * sets and wrongly hide rows on exclude sets. Override consciously if your
+   * path column stores bare instance ids and your id space is global.
+   * A token containing the separator is rejected — it would forge path
+   * boundaries.
    */
   scopeToToken?: (scope: ScopeId) => string;
   /** Placeholder style: `?` (default) or `$n` starting at `startParam`. */
@@ -62,8 +67,30 @@ export interface MatPathOptions {
   startParam?: number;
 }
 
-const defaultToken = (scope: ScopeId): string =>
-  parseScopeId(scope)?.instanceId ?? scope;
+const defaultToken = (scope: ScopeId): string => scope;
+
+/**
+ * LIKE metacharacters in scope tokens (`%`, `_`, and the escape char itself)
+ * must not act as wildcards: identity-provider ids routinely contain `_`,
+ * and an unescaped token would match paths outside the granted subtree.
+ * Escaped with `\` and paired with an `ESCAPE '\'` clause.
+ */
+const escapeLike = (value: string): string =>
+  value.replace(/([\\%_])/g, "\\$1");
+
+const tokenFor = (
+  scope: ScopeId,
+  token: (scope: ScopeId) => string,
+  separator: string,
+): string => {
+  const raw = token(scope);
+  if (raw.includes(separator)) {
+    throw new Error(
+      `scope token ${JSON.stringify(raw)} contains the path separator ${JSON.stringify(separator)} — it would forge path boundaries`,
+    );
+  }
+  return raw;
+};
 
 const placeholders = (
   count: number,
@@ -76,9 +103,11 @@ const placeholders = (
 
 /**
  * Materialized-path condition: the row's ancestor set (its own path)
- * intersects `scopes`. One `LIKE` per scope, OR-joined:
+ * intersects `scopes`. One `LIKE` per scope, OR-joined, metacharacters
+ * escaped:
  *
- *   (path LIKE ? OR path LIKE ?)   with params ['%/9/%', '%/2/%']
+ *   (path LIKE ? ESCAPE '\' OR path LIKE ? ESCAPE '\')
+ *   with params ['%/docs.folder:9/%', '%/docs.folder:2/%']
  */
 export function matPathCondition(
   scopes: readonly ScopeId[],
@@ -93,11 +122,13 @@ export function matPathCondition(
     options.startParam ?? 1,
   );
   const sql = `(${marks
-    .map((m) => `${options.pathColumn} LIKE ${m}`)
+    .map((m) => `${options.pathColumn} LIKE ${m} ESCAPE '\\'`)
     .join(" OR ")})`;
   return {
     sql,
-    params: scopes.map((s) => `%${sep}${token(s)}${sep}%`),
+    params: scopes.map(
+      (s) => `%${escapeLike(sep + tokenFor(s, token, sep) + sep)}%`,
+    ),
   };
 }
 
@@ -108,6 +139,7 @@ export interface ClosureTableOptions {
   descendantColumn: string;
   /** SQL expression for the listed row's scope token (e.g. `d.id`). */
   rowIdExpr: string;
+  /** Defaults to the full scope id (see MatPathOptions.scopeToToken). */
   scopeToToken?: (scope: ScopeId) => string;
   placeholder?: "?" | "$n";
   startParam?: number;
@@ -136,7 +168,9 @@ export function closureTableCondition(
 
 /**
  * A Prisma-shaped `where` filter for the materialized-path shape. Compose it
- * yourself for `all_except` (wrap in `NOT`) — the plan says which.
+ * yourself for `all_except` (wrap in `NOT`) — the plan says which. Prisma's
+ * `contains` is literal (Prisma escapes LIKE metacharacters itself), so only
+ * boundary forging is guarded here.
  */
 export function prismaMatPathWhere(
   scopes: readonly ScopeId[],
@@ -151,7 +185,7 @@ export function prismaMatPathWhere(
   if (scopes.length === 0) return { [options.pathField]: { in: [] } };
   return {
     OR: scopes.map((s) => ({
-      [options.pathField]: { contains: `${sep}${token(s)}${sep}` },
+      [options.pathField]: { contains: `${sep}${tokenFor(s, token, sep)}${sep}` },
     })),
   };
 }

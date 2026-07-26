@@ -110,7 +110,10 @@ export async function objectClosureOf(
  * an array of parents; the union of chains is returned breadth-first
  * (nearest-first), deduplicated, ending at `*`.
  *
- * Throws on a parent cycle: object graphs must be DAGs (see graph/dag).
+ * Object graphs must be DAGs (the owning site enforces this at the write
+ * path — see graph.ts). Defensively, a cycle that reaches this resolver
+ * anyway terminates via the seen-set rather than hanging; only pathological
+ * depth (>10 000 levels) throws.
  */
 export function parentPointerResolver(
   parentOf: (scope: ScopeId) => ScopeId | ScopeId[] | null | undefined,

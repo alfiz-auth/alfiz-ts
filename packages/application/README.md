@@ -22,6 +22,10 @@ What lives here:
   the approver queue, catalog publishing, virtual-parent dissolution
   snapshots, invalidation events.
 - `memoryDriver` — the reference storage driver.
+- `notifyScopeMoved(scope)` — the move hook: the host application owns the
+  hierarchy behind `resolveAncestors`, so it must report parent-pointer
+  changes; this emits the `scope` invalidation that busts cached ancestor
+  chains immediately.
 - Sessions (`session.ts`) — actor/subject split with view-as narrowing:
   every check intersects the previewed subject with the actor's REAL
   access, so previews can only narrow. `serializeViewAs`/`parseViewAs` for

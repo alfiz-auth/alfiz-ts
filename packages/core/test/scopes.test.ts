@@ -104,7 +104,7 @@ describe("parentPointerResolver", () => {
     ]);
   });
 
-  it("terminates (throws) on a parent cycle rather than hanging", () => {
+  it("terminates on a parent cycle via the seen-set rather than hanging", () => {
     const cyclic = new Map<string, string>([
       ["a:1", "b:1"],
       ["b:1", "a:1"],

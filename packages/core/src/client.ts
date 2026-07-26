@@ -7,9 +7,18 @@
  * only), their throwing `require*` forms, and `can.fresh`, which bypasses all
  * caches — the intended pairing for destructive actions and time-bound
  * elevations.
+ *
+ * Staleness bounds, stated honestly: subject-side data lives for
+ * `subjectCacheTtlMs` (default 30s) unless an invalidation event lands
+ * sooner; object ancestor chains live for `objectCacheTtlMs` (default 60s)
+ * unless a `scope` event lands sooner. Providers emit `scope` events for
+ * moves they perform; moves the HOST application performs in its own tables
+ * must be reported via `AlfizApplication.notifyScopeMoved` (or an equivalent
+ * provider event) for immediate effect — the TTL is the backstop, not the
+ * mechanism.
  */
 
-import type { CheckContext, CheckExplanation, RoleDef } from "./access.js";
+import type { CheckContext, CheckExplanation } from "./access.js";
 import {
   checkAny,
   checkKey,
@@ -41,11 +50,24 @@ export interface AlfizClientOptions {
    * `can.fresh` is the escape hatch.
    */
   subjectCacheTtlMs?: number;
+  /**
+   * Object-chain cache TTL (ms). Chains are deep, narrow, and near-static;
+   * `scope` invalidation events bust them immediately on move, and this TTL
+   * bounds staleness when a move was never reported. Default 60s.
+   */
+  objectCacheTtlMs?: number;
+  /** Maximum cached principals before oldest entries are evicted. Default 10 000. */
+  maxSubjectCacheEntries?: number;
   clock?: () => number;
 }
 
 interface SubjectCacheEntry {
   data: SubjectAccessData;
+  expiresAt: number;
+}
+
+interface ObjectCacheEntry {
+  chain: ScopeId[];
   expiresAt: number;
 }
 
@@ -56,6 +78,7 @@ const principalKey = (p: PrincipalRef): string =>
 export function toCheckContext(
   data: SubjectAccessData,
   now: number,
+  grantApplies?: (key: PermissionKey, grantScope: ScopeId) => boolean,
 ): CheckContext {
   return {
     subjectClosure: new Set(data.closure),
@@ -66,6 +89,7 @@ export function toCheckContext(
       roles: new Map(data.roles.map((r) => [r.id, r])),
     },
     now,
+    grantApplies,
   };
 }
 
@@ -96,21 +120,38 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   readonly provider: AlfizProvider;
   readonly can: CanFn<K>;
 
-  private readonly ttl: number;
+  private readonly subjectTtl: number;
+  private readonly objectTtl: number;
+  private readonly maxSubjects: number;
   private readonly now: () => number;
   private readonly subjectCache = new Map<string, SubjectCacheEntry>();
+  private readonly objectCache = new Map<ScopeId, ObjectCacheEntry>();
+  /**
+   * Bust-during-fetch protection: every invalidation bumps the generation
+   * for the affected key; a fetch only stores its result if no bust landed
+   * while it was in flight.
+   */
+  private readonly subjectGen = new Map<string, number>();
+  private readonly objectGen = new Map<ScopeId, number>();
   private readonly subjectInFlight = new Map<
     string,
     Promise<SubjectAccessData>
   >();
-  private readonly objectCache = new Map<ScopeId, ScopeId[]>();
   private readonly unsubscribe: () => void;
+  private readonly grantApplies: (
+    key: PermissionKey,
+    grantScope: ScopeId,
+  ) => boolean;
 
   constructor(options: AlfizClientOptions) {
     this.catalog = options.catalog;
     this.provider = options.provider;
-    this.ttl = options.subjectCacheTtlMs ?? 30_000;
+    this.subjectTtl = options.subjectCacheTtlMs ?? 30_000;
+    this.objectTtl = options.objectCacheTtlMs ?? 60_000;
+    this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
     this.now = options.clock ?? Date.now;
+    this.grantApplies = (key, grantScope) =>
+      this.catalog.appliesAt(key, grantScope);
 
     const can = (async (
       principal: PrincipalRef,
@@ -124,38 +165,52 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     this.unsubscribe = this.provider.onInvalidate((event) => {
       switch (event.type) {
         case "user":
-          this.subjectCache.delete(`u:${event.userId}`);
+          this.bustSubject(`u:${event.userId}`);
           break;
         case "subject":
           for (const [cacheKey, entry] of this.subjectCache) {
             if (entry.data.closure.includes(event.subject)) {
-              this.subjectCache.delete(cacheKey);
+              this.bustSubject(cacheKey);
             }
           }
           break;
         case "scope":
           // Object chains bust immediately on move: the moved scope's own
           // chain, and every cached chain passing through it.
-          this.objectCache.delete(event.scope);
-          for (const [cached, chain] of this.objectCache) {
-            if (chain.includes(event.scope)) this.objectCache.delete(cached);
+          this.bustObject(event.scope);
+          for (const [cached, entry] of this.objectCache) {
+            if (entry.chain.includes(event.scope)) this.bustObject(cached);
           }
           break;
         case "role":
           // Role definitions ride inside subject data; bust conservatively.
           for (const [cacheKey, entry] of this.subjectCache) {
             if (entry.data.roles.some((r) => r.id === event.roleId)) {
-              this.subjectCache.delete(cacheKey);
+              this.bustSubject(cacheKey);
             }
           }
           break;
         case "catalog":
         case "all":
-          this.subjectCache.clear();
-          this.objectCache.clear();
+          for (const cacheKey of [...this.subjectCache.keys()]) {
+            this.bustSubject(cacheKey);
+          }
+          for (const scope of [...this.objectCache.keys()]) {
+            this.bustObject(scope);
+          }
           break;
       }
     });
+  }
+
+  private bustSubject(cacheKey: string): void {
+    this.subjectCache.delete(cacheKey);
+    this.subjectGen.set(cacheKey, (this.subjectGen.get(cacheKey) ?? 0) + 1);
+  }
+
+  private bustObject(scope: ScopeId): void {
+    this.objectCache.delete(scope);
+    this.objectGen.set(scope, (this.objectGen.get(scope) ?? 0) + 1);
   }
 
   /** Detach from the provider's invalidation stream and drop caches. */
@@ -163,6 +218,8 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     this.unsubscribe();
     this.subjectCache.clear();
     this.objectCache.clear();
+    this.subjectGen.clear();
+    this.objectGen.clear();
   }
 
   // -- data supply ----------------------------------------------------------
@@ -179,9 +236,20 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       const inFlight = this.subjectInFlight.get(key);
       if (inFlight) return inFlight;
     }
+    const generation = this.subjectGen.get(key) ?? 0;
     const fetching = this.provider.getSubjectAccess(principal).then((data) => {
-      this.subjectCache.set(key, { data, expiresAt: this.now() + this.ttl });
-      this.subjectInFlight.delete(key);
+      if ((this.subjectGen.get(key) ?? 0) === generation) {
+        this.subjectCache.set(key, {
+          data,
+          expiresAt: this.now() + this.subjectTtl,
+        });
+        // Bounded cache: evict oldest entries (Map preserves insertion order).
+        while (this.subjectCache.size > this.maxSubjects) {
+          const oldest = this.subjectCache.keys().next().value;
+          if (oldest === undefined) break;
+          this.subjectCache.delete(oldest);
+        }
+      }
       return data;
     });
     if (!fresh) this.subjectInFlight.set(key, fetching);
@@ -197,16 +265,27 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     fresh: boolean,
   ): Promise<ScopeId[]> {
     if (scope === undefined || scope === GLOBAL_SCOPE) return [GLOBAL_SCOPE];
+    const now = this.now();
     if (!fresh) {
       const cached = this.objectCache.get(scope);
-      if (cached) return cached;
+      if (cached && cached.expiresAt > now) return cached.chain;
     }
-    const closure = await objectClosureOf(scope, this.provider.resolveAncestors);
-    this.objectCache.set(scope, closure);
-    return closure;
+    const generation = this.objectGen.get(scope) ?? 0;
+    const chain = await objectClosureOf(scope, this.provider.resolveAncestors);
+    if ((this.objectGen.get(scope) ?? 0) === generation) {
+      this.objectCache.set(scope, {
+        chain,
+        expiresAt: this.now() + this.objectTtl,
+      });
+    }
+    return chain;
   }
 
   // -- checks ---------------------------------------------------------------
+
+  private ctxOf(data: SubjectAccessData): CheckContext {
+    return toCheckContext(data, this.now(), this.grantApplies);
+  }
 
   private async check(
     principal: PrincipalRef,
@@ -222,13 +301,15 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       this.objectClosure(scope, fresh),
     ]);
     if (!data.active) return false;
-    const ctx = toCheckContext(data, this.now());
+    const ctx = this.ctxOf(data);
     for (const k of keys) {
       if (checkKey(ctx, k, closure)) return true;
     }
     // Ancestor visibility (§7.5): a leaf marked impliedOnAncestors is implied
-    // on ancestors of any scope where it is (unsuppressed) granted.
-    if (scope !== undefined) {
+    // on PROPER ancestors of a granted scope — never at the global scope,
+    // which would turn one narrow share into the broadest possible check
+    // passing (can(u, key, "*") must agree with can(u, key)).
+    if (scope !== undefined && scope !== GLOBAL_SCOPE) {
       for (const k of keys) {
         if (!this.catalog.leaf(k)?.impliedOnAncestors) continue;
         if (await this.checkImplied(ctx, k, scope, fresh)) return true;
@@ -270,7 +351,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   async canAny(principal: PrincipalRef, pattern: P): Promise<boolean> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return false;
-    const ctx = toCheckContext(data, this.now());
+    const ctx = this.ctxOf(data);
     // Resolve each distinct granted scope's chain so revoke suppression is
     // exact rather than the conservative approximation.
     const scopes = new Set<ScopeId>();
@@ -317,21 +398,45 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     }
   }
 
-  /** `checkKey` with its work shown — the auditability surface. */
+  /**
+   * `checkKey` with its work shown — the auditability surface. Agrees with
+   * `can` exactly: ancestor implication is included and reported.
+   */
   async explain(
     principal: PrincipalRef,
     key: K,
     scope?: ScopeId,
-  ): Promise<CheckExplanation & { objectClosure: ScopeId[]; active: boolean }> {
+  ): Promise<
+    CheckExplanation & {
+      objectClosure: ScopeId[];
+      active: boolean;
+      /** Allowed only through §7.5 ancestor implication, not a direct match. */
+      implied: boolean;
+    }
+  > {
     const [data, closure] = await Promise.all([
       this.subjectData(principal, false),
       this.objectClosure(scope, false),
     ]);
-    const ctx = toCheckContext(data, this.now());
+    const ctx = this.ctxOf(data);
     const explanation = explainKey(ctx, key as PermissionKey, closure);
+    let allowed = explanation.allowed && data.active;
+    let implied = false;
+    if (
+      !allowed &&
+      data.active &&
+      explanation.matchedRevokes.length === 0 &&
+      scope !== undefined &&
+      scope !== GLOBAL_SCOPE &&
+      this.catalog.leaf(key as PermissionKey)?.impliedOnAncestors
+    ) {
+      implied = await this.checkImplied(ctx, key as PermissionKey, scope, false);
+      allowed = implied;
+    }
     return {
       ...explanation,
-      allowed: explanation.allowed && data.active,
+      allowed,
+      implied,
       objectClosure: closure,
       active: data.active,
     };
@@ -348,7 +453,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   ): Promise<{ granted: Set<ScopeId>; revoked: Set<ScopeId> }> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return { granted: new Set(), revoked: new Set() };
-    const ctx = toCheckContext(data, this.now());
+    const ctx = this.ctxOf(data);
     return {
       granted: grantedScopesFor(ctx, key as PermissionKey),
       revoked: revokedScopesFor(ctx, key as PermissionKey),
@@ -356,22 +461,28 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   }
 
   /**
-   * Every concrete catalog key the principal currently holds (at any scope),
-   * revokes applied at the global level. A debugging and administration
-   * surface, not a gate.
+   * Every concrete catalog key the principal holds SOMEWHERE: granted by an
+   * applicable unexpired row at any scope, suppressed only by global-scope
+   * revokes (a folder-scoped revoke narrows one subtree; it does not erase
+   * a key held elsewhere). A debugging and administration surface, not a
+   * gate — gates always use `can` at a concrete scope.
    */
   async effectiveKeys(principal: PrincipalRef): Promise<PermissionKey[]> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return [];
-    const ctx = toCheckContext(data, this.now());
-    const roles: ReadonlyMap<string, RoleDef> = ctx.rows.roles;
+    const ctx = this.ctxOf(data);
     const held: PermissionKey[] = [];
     for (const key of this.catalog.keys) {
       let granted = false;
       for (const grant of ctx.rows.grants) {
         if (!ctx.subjectClosure.has(grant.subject)) continue;
         if (isExpired(grant, ctx.now)) continue;
-        if (patternsOfGrant(grant, roles).some((p) => patternMatchesKey(p, key))) {
+        if (!this.grantApplies(key, grant.scope)) continue;
+        if (
+          patternsOfGrant(grant, ctx.rows.roles).some((p) =>
+            patternMatchesKey(p, key),
+          )
+        ) {
           granted = true;
           break;
         }
@@ -380,14 +491,16 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       const revoked =
         ctx.userId !== null &&
         ctx.rows.revokes.some(
-          (r) => r.userId === ctx.userId && patternMatchesKey(r.pattern, key),
+          (r) =>
+            r.userId === ctx.userId &&
+            r.scope === GLOBAL_SCOPE &&
+            patternMatchesKey(r.pattern, key),
         );
       if (!revoked) held.push(key);
     }
     return held;
   }
 }
-
 
 /**
  * Constructs a client whose `can`/`canAny` are typed by the catalog's

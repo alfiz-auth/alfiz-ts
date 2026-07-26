@@ -92,6 +92,15 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
   identifier in `forbidClientIdentifiers` and the verifier fails the build
   if it appears in a `"use client"` module.
 
+## Resource moves
+
+- Your application owns the object hierarchy. Whenever a resource's parent
+  pointer changes (a document moves folders), call
+  `app.notifyScopeMoved("<scopeType>:<id>")` in the same code path — this
+  busts cached ancestor chains immediately, which is what makes "moving a
+  sensitive document into a restricted folder takes effect at once" true.
+  The client's object-chain TTL only bounds the damage if you forget.
+
 ## Listing pages
 
 - Never per-row `can()` (N+1). Compute the granted scope set
