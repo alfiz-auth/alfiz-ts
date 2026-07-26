@@ -10,7 +10,7 @@
   "scripts": {
     "build": "tsc -b packages/core packages/application packages/prisma packages/verify",
     "build:all": "npm run build",
-    "publish:all": "npm --workspace=packages/core publish && npm --workspace=packages/application publish && npm --workspace=packages/verify publish && npm --workspace=packages/prisma publish",
+    "publish:all": "npm run build && npm --workspace=packages/core publish && npm --workspace=packages/application publish && npm --workspace=packages/verify publish && npm --workspace=packages/prisma publish",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "npm run build"
