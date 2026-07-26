@@ -18,6 +18,25 @@ export type ScopeId = string;
 /** A scope type key, dotted like a permission group: `docs.folder`. */
 export type ScopeType = string;
 
+/**
+ * The shape of a scope instance id for a known scope type: the catalog's
+ * derived scope union (`ScopeOf<typeof catalog>`) is built from these.
+ * `scopeId("docs.doc", row.id)` returns the narrowed form, so ids built
+ * through the helper flow into scope-hinted parameters without widening.
+ */
+export type ScopeInstanceId<T extends ScopeType = ScopeType> = `${T}:${string}`;
+
+/**
+ * A catalog-typed scope id that still admits runtime strings — the scope
+ * counterpart of `LooseKey`. Scope instance ids are runtime data by nature
+ * (`docs.doc:${row.id}`), so scope parameters HINT rather than gate:
+ * literal call sites autocomplete `*` and every declared
+ * `<scopeType>:` prefix, while ids from variables and databases flow
+ * through unchanged. Keys stay strictly typed; scopes stay honest about
+ * where their halves come from.
+ */
+export type LooseScopeId<S extends string = ScopeId> = S | (string & {});
+
 /** The global scope. A grant with no scope is a grant at `*`. */
 export const GLOBAL_SCOPE: ScopeId = "*";
 
@@ -26,7 +45,10 @@ export function isGlobalScope(scope: ScopeId): boolean {
 }
 
 /** Builds a scope instance id from its type and opaque instance id. */
-export function scopeId(type: ScopeType, instanceId: string): ScopeId {
+export function scopeId<T extends ScopeType>(
+  type: T,
+  instanceId: string,
+): ScopeInstanceId<T> {
   return `${type}:${instanceId}`;
 }
 

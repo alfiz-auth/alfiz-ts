@@ -13,10 +13,11 @@ import ts from "typescript";
 import type { AnyCatalog } from "@alfiz-auth/core";
 import {
   ALFIZ_INTERNAL_NAMESPACE,
+  formatAlternatives,
   isValidPattern,
   lintCatalog,
   namespaceOf,
-  suggestPattern,
+  unknownPermissionContext,
 } from "@alfiz-auth/core";
 
 export type VerifySeverity = "error" | "warning";
@@ -358,8 +359,10 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
                 // The near-miss a newcomer hits first: a GROUP path where a
                 // pattern belongs. `"admin"` is a valid shape and a declared
                 // namespace, but groups are folders — the project-root
-                // visibility idiom is `"admin.*"`. Say so.
-                const suggestion = suggestPattern(catalog, text);
+                // visibility idiom is `"admin.*"`. Say so; and for plain
+                // typos, name the closest declared keys.
+                const { suggestion, didYouMean, hint } =
+                  unknownPermissionContext(catalog, text, "pattern");
                 issues.push({
                   severity: "error",
                   rule: "unknown-pattern",
@@ -367,7 +370,11 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
                   line: lineOf(source, literal),
                   message: suggestion
                     ? `${JSON.stringify(text)} is a group, not a key — groups are folders, and subtree patterns end in .*: did you mean ${JSON.stringify(suggestion)}?`
-                    : `${JSON.stringify(text)} is not in the catalog (typo, or an undeclared key)`,
+                    : `${JSON.stringify(text)} is not in the catalog (typo, or an undeclared key)` +
+                      (didYouMean.length > 0
+                        ? ` — did you mean ${formatAlternatives(didYouMean)}?`
+                        : "") +
+                      (hint ? ` (${hint})` : ""),
                 });
               } else {
                 // A known group wildcard: mark every key under it referenced.

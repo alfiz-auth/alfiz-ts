@@ -13,9 +13,11 @@ import type {
   AlfizClient,
   CheckContext,
   KeyOf,
+  LooseScopeId,
   PatternOf,
   PrincipalRef,
   ScopeId,
+  ScopeOf,
   SubjectAccessData,
 } from "@alfiz-auth/core";
 import {
@@ -37,13 +39,17 @@ export interface SessionOptions {
   viewAs?: ViewAsState | null | undefined;
 }
 
-export class AlfizSession<K extends string = string, P extends string = string> {
+export class AlfizSession<
+  K extends string = string,
+  P extends string = string,
+  S extends string = string,
+> {
   readonly actorUserId: string;
   readonly viewAs: ViewAsState | null;
 
-  private readonly client: AlfizClient<K, P>;
+  private readonly client: AlfizClient<K, P, S>;
 
-  constructor(client: AlfizClient<K, P>, options: SessionOptions) {
+  constructor(client: AlfizClient<K, P, S>, options: SessionOptions) {
     this.client = client;
     this.actorUserId = options.actorUserId;
     this.viewAs = options.viewAs ?? null;
@@ -63,7 +69,7 @@ export class AlfizSession<K extends string = string, P extends string = string> 
   }
 
   /** Preview-narrowed check: subject allowed AND actor really allowed. */
-  async can(key: K | readonly K[], scope?: ScopeId): Promise<boolean> {
+  async can(key: K | readonly K[], scope?: LooseScopeId<S>): Promise<boolean> {
     if (!(await this.client.can(this.actorPrincipal, key, scope))) return false;
     if (this.viewAs === null) return true;
     if (this.viewAs.kind === "user") {
@@ -82,19 +88,26 @@ export class AlfizSession<K extends string = string, P extends string = string> 
     return this.rolePatternIntersects(this.viewAs.roleId, pattern);
   }
 
-  async require(key: K | readonly K[], scope?: ScopeId): Promise<void> {
+  async require(key: K | readonly K[], scope?: LooseScopeId<S>): Promise<void> {
     if (!(await this.can(key, scope))) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: key as string | readonly string[],
         scope,
+        // Attribution: the denial names the ACTOR — during a preview the
+        // narrowed subject is the render, but the person here is the actor.
+        principal: { userId: this.actorUserId },
       });
     }
   }
 
   async requireAny(pattern: P): Promise<void> {
     if (!(await this.canAny(pattern))) {
-      throw new AccessDeniedError({ reason: "forbidden", permission: pattern });
+      throw new AccessDeniedError({
+        reason: "forbidden",
+        permission: pattern,
+        principal: { userId: this.actorUserId },
+      });
     }
   }
 
@@ -159,18 +172,26 @@ export class AlfizSession<K extends string = string, P extends string = string> 
  * `viewAs` only after `assertCanViewAs` — or let this throw. Stopping a
  * preview is deliberately ungated (anti-lockout): build with `viewAs: null`.
  */
-export async function createSession<K extends string, P extends string>(
-  client: AlfizClient<K, P>,
+export async function createSession<
+  K extends string,
+  P extends string,
+  S extends string,
+>(
+  client: AlfizClient<K, P, S>,
   options: SessionOptions,
-): Promise<AlfizSession<K, P>> {
+): Promise<AlfizSession<K, P, S>> {
   if (options.viewAs != null) {
     await assertCanViewAs(client, options.actorUserId);
   }
   return new AlfizSession(client, options);
 }
 
-export async function assertCanViewAs<K extends string, P extends string>(
-  client: AlfizClient<K, P>,
+export async function assertCanViewAs<
+  K extends string,
+  P extends string,
+  S extends string,
+>(
+  client: AlfizClient<K, P, S>,
   actorUserId: string,
 ): Promise<void> {
   const key = "alfiz_internal.access.view_as";
@@ -181,7 +202,11 @@ export async function assertCanViewAs<K extends string, P extends string>(
   const allowed =
     client.catalog.hasKey(key) && (await client.can({ userId: actorUserId }, key as K));
   if (!allowed) {
-    throw new AccessDeniedError({ reason: "forbidden", permission: key });
+    throw new AccessDeniedError({
+      reason: "forbidden",
+      permission: key,
+      principal: { userId: actorUserId },
+    });
   }
 }
 
@@ -191,7 +216,7 @@ export async function assertCanViewAs<K extends string, P extends string>(
  * parameters. Completes the derived-type family with `KeyOf` / `PatternOf`
  * / `ClientOf` / `SnapshotOf`.
  */
-export type SessionOf<Cat> = AlfizSession<KeyOf<Cat>, PatternOf<Cat>>;
+export type SessionOf<Cat> = AlfizSession<KeyOf<Cat>, PatternOf<Cat>, ScopeOf<Cat>>;
 
 /** Cookie-safe serialization for view-as state. */
 export function serializeViewAs(state: ViewAsState): string {

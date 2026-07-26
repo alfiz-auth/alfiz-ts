@@ -32,6 +32,15 @@ export type PermissionPattern = string;
  */
 export type LooseKey<K extends string> = K | (string & {});
 
+/**
+ * The pattern-shaped sibling of {@link LooseKey}: catalog-typed patterns
+ * that still admit runtime strings. Used on write-path inputs (grants,
+ * revokes, roles, requests), where patterns routinely arrive from role
+ * editors and admin UIs at runtime — autocomplete and compile-checking
+ * survive for literal call sites, and the write path validates the rest.
+ */
+export type LoosePattern<P extends string> = P | (string & {});
+
 /** The reserved namespace for Alfiz's own administration permissions. */
 export const ALFIZ_INTERNAL_NAMESPACE = "alfiz_internal";
 

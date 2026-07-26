@@ -1,6 +1,92 @@
 # Changelog
 
-## 0.3.0 — second field report
+## 0.2.2 — typed end to end, errors that carry their fix
+
+No semantic changes: this release is developer experience — the derived
+types now cover every surface a human types a permission or scope into,
+and every error explains itself. Nothing breaks: new type parameters
+default to the old `string` behavior, and scope typing is a *hint*, not a
+gate.
+
+### The derived-type family grows a third member: scopes
+
+- **`ScopeOf<typeof catalog>`** — `"*" | "docs.folder:${string}" | …`,
+  derived from the declared `scopeTypes` exactly as `KeyOf` / `PatternOf`
+  derive from the tree. Carried by the client, snapshot, and session as a
+  third type parameter (defaulting to `string`).
+- Scope parameters (`can`, `require*`, `explain`, `snapshot({ scopes })`,
+  `resolve`) are **hints, not gates** (`LooseScopeId`): literal call sites
+  autocomplete `*` and every declared `<scopeType>:` prefix, while ids
+  from variables and databases flow through unchanged. Keys and patterns
+  remain strictly gated — a scope id's instance half is runtime data; a
+  permission key never is.
+- **`scopeId(type, id)` narrows**: it now returns `` `${T}:${string}` ``,
+  so ids built through the helper satisfy the derived scope union.
+
+### The write paths are typed
+
+- `GrantInput` / `RevokeInput` / `RequestInput` / `RoleInput` are generic
+  over the catalog's pattern and scope unions (defaulting to `string` — the
+  `AlfizProvider` wire contract is unchanged).
+- **`createApplication` now infers from the catalog** exactly as
+  `createAlfizClient` does, so seeding scripts, data migrations, and admin
+  actions autocomplete `pattern:` and `scope:` at the call site. Loose
+  (`LoosePattern`), deliberately: role editors legitimately pass runtime
+  strings, and the write path validates every one against the catalog
+  regardless.
+
+### Autocomplete crosses the wire: codegen
+
+- **`alfiz-verify codegen --catalog <doc.json> [--out <file>] [--prefix
+  <Name>]`** emits a dependency-free module of literal unions
+  (`AlfizKey` / `AlfizPattern` / `AlfizScopeType` / `AlfizScopeId`) from a
+  published `CatalogDocument`. Deterministic (sorted), so regeneration
+  diffs are exactly the catalog change. Programmatic form:
+  `generateCatalogTypes(document, options)`.
+- **`catalogFromDocument<K, P, S>(doc)`** pins the emitted unions back
+  onto a document-built catalog (`TypedCatalog<K, P, S>`), and
+  `createAlfizClient` picks them up — federated consumers of a published
+  catalog get the same typed `can` as the team that owns the source
+  module. Untyped calls still return `string`-typed catalogs, honestly.
+- `KeyOf` / `PatternOf` / `ScopeOf` now read the phantom members, so they
+  work uniformly for literal-built and document-typed catalogs.
+
+### Errors carry their fix
+
+- **Edit-distance "did you mean"** on every unknown-permission surface:
+  check paths (`UnknownPermissionError.didYouMean`), Application write
+  rejections, and `alfiz-verify` findings. `can(u, "docs.files.raed")` now
+  says *did you mean "docs.files.read"?* — and a right-leaf-wrong-group
+  string (`docs.approvals.decide_student`) names the key under the project
+  that actually declares it.
+- **Undeclared namespaces are called out**: `"stripe.charges.create"`
+  reports that `stripe` is not a namespace of this catalog, and lists the
+  declared ones — the "wrong catalog entirely" mistake stops reading like
+  a typo. (`unknownPermissionContext` / `closestPatterns` are exported for
+  wrappers that build their own messages.)
+- **`validateGrantableAt` says where the grant WOULD be valid**: unknown
+  scope types list the declared ones; non-grantable patterns list the
+  scope types their matched leaves declare (or say "global-only, add
+  `scopes`"); no-match patterns get a near-miss.
+- **`UnresolvedScopeError`** (new, typed) replaces the bare `Error` a
+  snapshot threw for an unresolvable scope — carrying the scope, its
+  type, whether it is declared, and the scopes the snapshot CAN evaluate,
+  with the pre-resolve recipes in the message.
+- **`AccessDeniedError` names the principal** (`for user:u1`) when the
+  throw site knew it — `requirePermission`, `snapshot.require`, session
+  gates — and points at `explain()` for the why. New `principal` field
+  for structured handling.
+
+### Regression-proofing the types themselves
+
+The silent failure mode of derived types is *widening*: one annotation of
+`Record<string, GroupInput>` in the wrong place and every call site still
+compiles — autocomplete just disappears. `vitest` now runs a typecheck
+suite (`packages/core/test/derived-types.test-d.ts`) asserting the unions
+stay **exactly** their literal members, that typos are compile errors, and
+that document-typed catalogs thread through `createAlfizClient`.
+
+## 0.2.1 — second field report
 
 From upgrading the same LMS to 0.2.0 and adopting the surface it added.
 Every 0.1.2 finding stayed fixed; this release is the friction the upgrade

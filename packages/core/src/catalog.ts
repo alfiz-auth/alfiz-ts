@@ -10,6 +10,7 @@
  * are reported by `lintCatalog` and enforced at build time by @alfiz-auth/verify.
  */
 
+import { formatAlternatives } from "./errors.js";
 import type { PermissionKey, PermissionPattern } from "./grammar.js";
 import {
   ALFIZ_INTERNAL_NAMESPACE,
@@ -217,11 +218,45 @@ export type CatalogPatterns<C extends CatalogInput> =
   | CatalogKeys<C>
   | `${ProjectGroupPaths<C> | InternalGroupsIncluded<C>}.*`;
 
+/** The scope types catalog input `C` declares, as a literal union. */
+export type CatalogScopeTypes<C extends CatalogInput> =
+  C["scopeTypes"] extends infer S
+    ? S extends Record<string, ScopeTypeInput>
+      ? StringKeys<S>
+      : never
+    : never;
+
+/**
+ * Every scope-id SHAPE valid for `C`: the global `*`, plus
+ * `<declaredScopeType>:${string}` for each declared scope type. The
+ * instance half is runtime data, so this is a template union, not a closed
+ * one — it exists so scope parameters autocomplete their declared prefixes
+ * and so `scopeId("docs.doc", id)` composes without widening.
+ */
+export type CatalogScopeIds<C extends CatalogInput> =
+  | "*"
+  | `${CatalogScopeTypes<C>}:${string}`;
+
+/**
+ * The derived-type family reads the phantom members, so it works uniformly
+ * for catalogs built from a literal (`defineCatalog`) and catalogs typed
+ * from a published document (`catalogFromDocument<K, P, S>` / codegen).
+ */
 /** The key type of a built catalog: `KeyOf<typeof catalog>`. */
-export type KeyOf<Cat> = Cat extends Catalog<infer C> ? CatalogKeys<C> : never;
+export type KeyOf<Cat> = Cat extends { readonly $key: infer K extends string }
+  ? K
+  : never;
 /** The pattern type of a built catalog: `PatternOf<typeof catalog>`. */
-export type PatternOf<Cat> = Cat extends Catalog<infer C>
-  ? CatalogPatterns<C>
+export type PatternOf<Cat> = Cat extends {
+  readonly $pattern: infer P extends string;
+}
+  ? P
+  : never;
+/** The scope-id type of a built catalog: `ScopeOf<typeof catalog>`. */
+export type ScopeOf<Cat> = Cat extends {
+  readonly $scope: infer S extends string;
+}
+  ? S
   : never;
 
 // ---------------------------------------------------------------------------
@@ -372,6 +407,7 @@ export interface AnyCatalog {
   readonly keys: PermissionKey[];
   readonly $key: string;
   readonly $pattern: string;
+  readonly $scope: string;
   hasKey(key: string): boolean;
   hasGroup(path: string): boolean;
   leaf(key: string): LeafMeta | undefined;
@@ -397,6 +433,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
   /** Phantom-only members carrying the derived types. Never set at runtime. */
   declare readonly $key: CatalogKeys<C>;
   declare readonly $pattern: CatalogPatterns<C>;
+  declare readonly $scope: CatalogScopeIds<C>;
 
   constructor(built: {
     namespace: string;
@@ -460,28 +497,43 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     if (scope === GLOBAL_SCOPE) return null;
     const type = scopeTypeOf(scope);
     if (type === null || !this.scopeTypes.has(type)) {
+      const declared = [...this.scopeTypes.keys()];
       return {
         severity: "error",
         path: scope,
-        message: `unknown scope type ${JSON.stringify(type)} — declare it in the catalog's scopeTypes`,
+        message:
+          `unknown scope type ${JSON.stringify(type)} — declare it in the catalog's scopeTypes` +
+          (declared.length > 0
+            ? ` (declared scope types: ${declared.join(", ")})`
+            : ` (this catalog declares no scope types yet)`),
       };
     }
     const matched = this.keysMatching(pattern);
     if (matched.length === 0) {
+      const near = closestPatterns(this, pattern, "pattern");
       return {
         severity: "error",
         path: pattern,
-        message: `pattern matches no catalog key`,
+        message:
+          `pattern matches no catalog key` +
+          (near.length > 0 ? ` — did you mean ${formatAlternatives(near)}?` : ""),
       };
     }
     const grantable = matched.some((key) =>
       this.leaves.get(key)!.scopes.includes(type),
     );
     if (!grantable) {
+      const declaredOnMatched = [
+        ...new Set(matched.flatMap((key) => this.leaves.get(key)!.scopes)),
+      ];
       return {
         severity: "error",
         path: pattern,
-        message: `not grantable at scope type ${JSON.stringify(type)} — no matched leaf declares it`,
+        message:
+          `not grantable at scope type ${JSON.stringify(type)} — no matched leaf declares it` +
+          (declaredOnMatched.length > 0
+            ? ` (matched leaves are grantable at: ${declaredOnMatched.join(", ")}, or globally at "*")`
+            : ` (matched leaves declare no scope types, so they are grantable at "*" only — add \`scopes\` on the leaf or an enclosing group)`),
       };
     }
     return null;
@@ -746,12 +798,152 @@ export function suggestPattern(
 }
 
 /**
+ * Bounded Levenshtein distance: `null` once the distance provably exceeds
+ * `max`, so scanning a large catalog for near-misses stays cheap.
+ */
+function editDistanceWithin(a: string, b: string, max: number): number | null {
+  if (Math.abs(a.length - b.length) > max) return null;
+  let prev: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr: number[] = [i];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const value = Math.min(
+        prev[j]! + 1,
+        curr[j - 1]! + 1,
+        prev[j - 1]! + cost,
+      );
+      curr.push(value);
+      if (value < rowMin) rowMin = value;
+    }
+    if (rowMin > max) return null;
+    prev = curr;
+  }
+  const distance = prev[b.length]!;
+  return distance <= max ? distance : null;
+}
+
+/**
+ * The "did you mean" for typos (where {@link suggestPattern} is the "did
+ * you mean" for the group-path idiom): declared keys — and, at pattern
+ * sites, group wildcards — near `value` by edit distance, closest first.
+ *
+ * Also surfaces right-leaf-wrong-group mistakes (`docs.approvals.decide`
+ * when the key lives under another project): keys sharing `value`'s final
+ * segment are included after the edit-distance matches, but only when few
+ * enough to be a real signal — a segment like `read` that ends a key in
+ * every tab names nothing.
+ */
+export function closestPatterns(
+  catalog: AnyCatalog,
+  value: string,
+  expected: "key" | "pattern",
+  limit = 3,
+): string[] {
+  const candidates: string[] =
+    expected === "key"
+      ? catalog.keys
+      : [
+          ...catalog.keys,
+          ...[...catalog.groups.keys()].map((path) => `${path}.*`),
+        ];
+  const max = Math.min(4, Math.max(2, Math.floor(value.length / 4)));
+  const scored: Array<{ candidate: string; distance: number }> = [];
+  for (const candidate of candidates) {
+    if (candidate === value) continue;
+    const distance = editDistanceWithin(value, candidate, max);
+    if (distance !== null) scored.push({ candidate, distance });
+  }
+  const lastSegment = value.split(".").at(-1);
+  if (lastSegment && lastSegment !== "" && !value.includes("*")) {
+    const sameLeaf = catalog.keys.filter(
+      (key) =>
+        key !== value &&
+        key.endsWith(`.${lastSegment}`) &&
+        !scored.some((s) => s.candidate === key),
+    );
+    if (sameLeaf.length <= limit) {
+      for (const key of sameLeaf) scored.push({ candidate: key, distance: max + 1 });
+    }
+  }
+  scored.sort(
+    (x, y) => x.distance - y.distance || x.candidate.localeCompare(y.candidate),
+  );
+  return scored.slice(0, limit).map((s) => s.candidate);
+}
+
+/**
+ * Everything an unknown-permission error message can be built from, in one
+ * catalog pass: the group-path suggestion, edit-distance near-misses, and
+ * the undeclared-namespace hint. Spread into `UnknownPermissionError`
+ * options (the client and snapshot do), or compose into a provider write
+ * rejection (the Application does).
+ */
+export function unknownPermissionContext(
+  catalog: AnyCatalog,
+  value: string,
+  expected: "key" | "pattern",
+): {
+  suggestion: string | null;
+  didYouMean: string[];
+  hint: string | undefined;
+} {
+  const suggestion = suggestPattern(catalog, value);
+  // A group path has ONE right answer; near-miss noise would bury it.
+  if (suggestion !== null) {
+    return { suggestion, didYouMean: [], hint: undefined };
+  }
+  const didYouMean = closestPatterns(catalog, value, expected);
+  let hint: string | undefined;
+  const ns = namespaceOf(value);
+  if (ns !== null && !catalog.namespaces.includes(ns)) {
+    hint =
+      `the first segment ${JSON.stringify(ns)} is not a namespace of this catalog — ` +
+      `declared namespaces: ${catalog.namespaces.join(", ")}`;
+  }
+  return { suggestion, didYouMean, hint };
+}
+
+/**
+ * A catalog whose derived unions are supplied explicitly rather than
+ * inferred from a literal — the type `catalogFromDocument` returns when a
+ * consumer pins the unions (typically to types emitted by
+ * `alfiz-verify codegen`). Feeds `createAlfizClient` exactly like a
+ * `defineCatalog` catalog does.
+ */
+export interface TypedCatalog<
+  K extends string = string,
+  P extends string = string,
+  S extends string = string,
+> extends AnyCatalog {
+  readonly $key: K;
+  readonly $pattern: P;
+  readonly $scope: S;
+}
+
+/**
  * Rebuilds a Catalog from its published wire shape — the read-model side of
  * catalog publishing: registries, tooling, and the static verifier consume
- * documents, not source modules. Derived types are erased to `string`
- * (a document is data, not a literal), hence `AnyCatalog`.
+ * documents, not source modules. A document is data, not a literal, so the
+ * derived unions default to `string` — but a consumer that knows them (the
+ * types `alfiz-verify codegen` emits from this same document) can pin them:
+ *
+ * ```ts
+ * import type { AlfizKey, AlfizPattern, AlfizScopeId } from "./alfiz-catalog.gen.js";
+ * const catalog = catalogFromDocument<AlfizKey, AlfizPattern, AlfizScopeId>(doc);
+ * const client = createAlfizClient({ catalog, provider }); // fully typed
+ * ```
+ *
+ * This is how autocomplete crosses the wire: federated apps consuming
+ * another team's published catalog get the same typed `can` as the team
+ * that owns the source module.
  */
-export function catalogFromDocument(document: CatalogDocument): AnyCatalog {
+export function catalogFromDocument<
+  K extends string = string,
+  P extends string = string,
+  S extends string = string,
+>(document: CatalogDocument): TypedCatalog<K, P, S> {
   if (document.formatVersion !== 1) {
     throw new CatalogError([
       {
@@ -761,7 +953,7 @@ export function catalogFromDocument(document: CatalogDocument): AnyCatalog {
       },
     ]);
   }
-  return new Catalog({
+  const built: AnyCatalog = new Catalog({
     namespace: document.namespace,
     namespaces: [...document.namespaces],
     leaves: new Map(document.leaves.map((l) => [l.key, l])),
@@ -769,6 +961,7 @@ export function catalogFromDocument(document: CatalogDocument): AnyCatalog {
     scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
     navigation: document.navigation,
   });
+  return built as TypedCatalog<K, P, S>;
 }
 
 // ---------------------------------------------------------------------------

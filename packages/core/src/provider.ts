@@ -12,9 +12,9 @@
 
 import type { GrantRow, Provenance, RevokeRow, RoleDef } from "./access.js";
 import type { CatalogDocument } from "./catalog.js";
-import type { PermissionPattern } from "./grammar.js";
+import type { LoosePattern, PermissionPattern } from "./grammar.js";
 import type { AccessRequest, ApprovalStage } from "./requests.js";
-import type { AncestryResolver, ScopeId } from "./scopes.js";
+import type { AncestryResolver, LooseScopeId, ScopeId } from "./scopes.js";
 import type { SubjectId } from "./subjects.js";
 
 // ---------------------------------------------------------------------------
@@ -95,11 +95,24 @@ export type Unsubscribe = () => void;
 // Row operations
 // ---------------------------------------------------------------------------
 
-export interface GrantInput {
+/**
+ * Write-path inputs are generic over the catalog's derived pattern and
+ * scope unions, defaulting to plain strings — the wire contract
+ * (`AlfizProvider`) stays string-typed, while `AlfizApplication`
+ * (constructed via `createAlfizApplication`) instantiates them so seeding
+ * scripts and admin code autocomplete patterns and scope prefixes. Loose
+ * (`LoosePattern` / `LooseScopeId`), not strict: role editors and admin
+ * UIs legitimately pass runtime strings, and the write path validates
+ * every one against the catalog regardless.
+ */
+export interface GrantInput<
+  P extends string = PermissionPattern,
+  S extends string = ScopeId,
+> {
   subject: SubjectId;
   roleId?: string | undefined;
-  pattern?: PermissionPattern | undefined;
-  scope?: ScopeId | undefined;
+  pattern?: LoosePattern<P> | undefined;
+  scope?: LooseScopeId<S> | undefined;
   expiresAt?: number | undefined;
   provenance: Provenance;
 }
@@ -112,18 +125,24 @@ export interface GrantQuery {
   roleId?: string | undefined;
 }
 
-export interface RevokeInput {
+export interface RevokeInput<
+  P extends string = PermissionPattern,
+  S extends string = ScopeId,
+> {
   userId: string;
-  pattern: PermissionPattern;
-  scope?: ScopeId | undefined;
+  pattern: LoosePattern<P>;
+  scope?: LooseScopeId<S> | undefined;
   provenance: Provenance;
 }
 
-export interface RequestInput {
+export interface RequestInput<
+  P extends string = PermissionPattern,
+  S extends string = ScopeId,
+> {
   requesterUserId: string;
   roleId?: string | undefined;
-  pattern?: PermissionPattern | undefined;
-  scope?: ScopeId | undefined;
+  pattern?: LoosePattern<P> | undefined;
+  scope?: LooseScopeId<S> | undefined;
   proposedExpiresAt?: number | undefined;
   justification?: Record<string, string> | undefined;
 }
@@ -147,7 +166,7 @@ export interface UserGroup {
   virtual?: boolean | undefined;
 }
 
-export interface RoleInput {
+export interface RoleInput<P extends string = PermissionPattern> {
   /**
    * Caller-supplied id. Omit for a generated one. Supply it when something
    * OUTSIDE the runtime must reference the role by id — a SQL data
@@ -159,7 +178,7 @@ export interface RoleInput {
   id?: string | undefined;
   name: string;
   description?: string | undefined;
-  patterns: PermissionPattern[];
+  patterns: LoosePattern<P>[];
   /** Nothing is requestable by default. */
   requestable?:
     | {

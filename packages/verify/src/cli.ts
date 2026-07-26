@@ -2,6 +2,13 @@
 /**
  * alfiz-verify — run the static checks from the command line.
  *
+ * Subcommand: `alfiz-verify codegen --catalog <doc.json> [--out <file>]
+ * [--prefix <Name>]` — emit derived key/pattern/scope-id type unions from a
+ * published catalog document (stdout when --out is omitted). This is how
+ * consumers of the WIRE shape (federated apps, other repos) get the same
+ * typed `can` as the catalog's own module: pin the emitted types with
+ * `catalogFromDocument<AlfizKey, AlfizPattern, AlfizScopeId>(doc)`.
+ *
  * Config (alfiz-verify.config.json, or --config <path>):
  *   {
  *     "catalog": "alfiz-catalog.json",        // catalog.toDocument() output
@@ -31,9 +38,10 @@
  * Exit code 1 when any error-severity issue is found.
  */
 
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { catalogFromDocument } from "@alfiz-auth/core";
+import { generateCatalogTypes } from "./codegen.js";
 import {
   DEFAULT_GATE_NAMES,
   DEFAULT_SERVER_FILE_PATTERNS,
@@ -77,7 +85,48 @@ function collectFiles(
   return files;
 }
 
+/** `--flag value` lookup; returns undefined when the flag is absent. */
+function flagValue(argv: string[], flag: string): string | undefined {
+  const idx = argv.indexOf(flag);
+  return idx >= 0 ? argv[idx + 1] : undefined;
+}
+
+function runCodegen(argv: string[]): number {
+  const catalogPath = flagValue(argv, "--catalog");
+  if (!catalogPath) {
+    console.error(
+      "alfiz-verify codegen: --catalog <catalog-document.json> is required " +
+        "(emit one with catalog.toDocument(); see the header of this CLI)",
+    );
+    return 2;
+  }
+  let document;
+  try {
+    document = JSON.parse(readFileSync(resolve(catalogPath), "utf8"));
+  } catch (err) {
+    console.error(
+      `alfiz-verify codegen: cannot read catalog ${catalogPath}: ${String(err)}`,
+    );
+    return 2;
+  }
+  // Round-trip through catalogFromDocument so a malformed document fails
+  // here, loudly, instead of emitting types from garbage.
+  catalogFromDocument(document);
+  const source = generateCatalogTypes(document, {
+    prefix: flagValue(argv, "--prefix"),
+  });
+  const out = flagValue(argv, "--out");
+  if (out) {
+    writeFileSync(resolve(out), source);
+    console.error(`alfiz-verify codegen: wrote ${out}`);
+  } else {
+    process.stdout.write(source);
+  }
+  return 0;
+}
+
 function main(argv: string[]): number {
+  if (argv[0] === "codegen") return runCodegen(argv.slice(1));
   const configFlag = argv.indexOf("--config");
   const configPath = resolve(
     configFlag >= 0 && argv[configFlag + 1]

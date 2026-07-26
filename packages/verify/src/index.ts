@@ -7,3 +7,4 @@
  */
 
 export * from "./verify.js";
+export * from "./codegen.js";

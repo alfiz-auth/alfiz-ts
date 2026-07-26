@@ -37,8 +37,8 @@ import {
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
-import type { AnyCatalog, KeyOf, PatternOf } from "./catalog.js";
-import { suggestPattern } from "./catalog.js";
+import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
+import { unknownPermissionContext } from "./catalog.js";
 import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
 import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
@@ -47,7 +47,7 @@ import type {
   PrincipalRef,
   SubjectAccessData,
 } from "./provider.js";
-import type { ScopeId } from "./scopes.js";
+import type { LooseScopeId, ScopeId } from "./scopes.js";
 import { GLOBAL_SCOPE, objectClosureOf } from "./scopes.js";
 import type { SnapshotOptions } from "./snapshot.js";
 import { AlfizSnapshot } from "./snapshot.js";
@@ -105,11 +105,11 @@ export function toCheckContext(
   };
 }
 
-export interface CanFn<K extends string> {
+export interface CanFn<K extends string, S extends string = string> {
   (
     principal: PrincipalRef,
     key: K | readonly K[],
-    scope?: ScopeId,
+    scope?: LooseScopeId<S>,
   ): Promise<boolean>;
   /**
    * Bypasses all caches: fresh closure supply, fresh ancestry. Use for
@@ -119,18 +119,26 @@ export interface CanFn<K extends string> {
   fresh(
     principal: PrincipalRef,
     key: K | readonly K[],
-    scope?: ScopeId,
+    scope?: LooseScopeId<S>,
   ): Promise<boolean>;
 }
 
 /**
- * Generic over the catalog's derived key and pattern unions. Construct with
- * `createAlfizClient(options)` to infer both from the catalog literal.
+ * Generic over the catalog's derived key, pattern, and scope-id unions.
+ * Construct with `createAlfizClient(options)` to infer all three from the
+ * catalog literal. Keys and patterns GATE at compile time; scope ids HINT
+ * (`LooseScopeId`): literal scopes autocomplete their declared
+ * `<scopeType>:` prefixes, while ids from variables flow through — the
+ * instance half of a scope id is runtime data by nature.
  */
-export class AlfizClient<K extends string = string, P extends string = string> {
+export class AlfizClient<
+  K extends string = string,
+  P extends string = string,
+  S extends string = string,
+> {
   readonly catalog: AnyCatalog;
   readonly provider: AlfizProvider;
-  readonly can: CanFn<K>;
+  readonly can: CanFn<K, S>;
 
   private readonly subjectTtl: number;
   private readonly objectTtl: number;
@@ -168,8 +176,8 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     const can = (async (
       principal: PrincipalRef,
       key: K | readonly K[],
-      scope?: ScopeId,
-    ) => this.check(principal, key, scope, false)) as CanFn<K>;
+      scope?: LooseScopeId<S>,
+    ) => this.check(principal, key, scope, false)) as CanFn<K, S>;
     can.fresh = async (principal, key, scope?) =>
       this.check(principal, key, scope, true);
     this.can = can;
@@ -312,7 +320,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       throw new UnknownPermissionError({
         permission: key,
         expected: "key",
-        suggestion: suggestPattern(this.catalog, key),
+        ...unknownPermissionContext(this.catalog, key, "key"),
       });
     }
   }
@@ -322,7 +330,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
     throw new UnknownPermissionError({
       permission: pattern,
       expected: "pattern",
-      suggestion: suggestPattern(this.catalog, pattern),
+      ...unknownPermissionContext(this.catalog, pattern, "pattern"),
     });
   }
 
@@ -398,8 +406,8 @@ export class AlfizClient<K extends string = string, P extends string = string> {
    */
   async snapshot(
     principal: PrincipalRef,
-    options?: SnapshotOptions,
-  ): Promise<AlfizSnapshot<K, P>> {
+    options?: SnapshotOptions<S>,
+  ): Promise<AlfizSnapshot<K, P, S>> {
     const fresh = options?.fresh ?? false;
     const data = await this.subjectData(principal, fresh);
     const ctx = this.ctxOf(data);
@@ -419,7 +427,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
         chains.set(scope, await this.objectClosure(scope, fresh));
       }),
     );
-    return new AlfizSnapshot<K, P>({
+    return new AlfizSnapshot<K, P, S>({
       catalog: this.catalog,
       principal,
       data,
@@ -458,7 +466,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   async requirePermission(
     principal: PrincipalRef,
     key: K | readonly K[],
-    scope?: ScopeId,
+    scope?: LooseScopeId<S>,
   ): Promise<void> {
     this.assertKeys(
       (Array.isArray(key) ? key : [key]) as readonly PermissionKey[],
@@ -469,6 +477,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
         reason: "inactive",
         permission: key as PermissionKey | readonly PermissionKey[],
         scope,
+        principal,
       });
     }
     if (!(await this.can(principal, key, scope))) {
@@ -476,6 +485,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
         reason: "forbidden",
         permission: key as PermissionKey | readonly PermissionKey[],
         scope,
+        principal,
       });
     }
   }
@@ -487,6 +497,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: pattern as PermissionKey,
+        principal,
       });
     }
   }
@@ -498,7 +509,7 @@ export class AlfizClient<K extends string = string, P extends string = string> {
   async explain(
     principal: PrincipalRef,
     key: LooseKey<K>,
-    scope?: ScopeId,
+    scope?: LooseScopeId<S>,
   ): Promise<
     CheckExplanation & {
       objectClosure: ScopeId[];
@@ -596,11 +607,12 @@ export class AlfizClient<K extends string = string, P extends string = string> {
 /**
  * Constructs a client whose `can`/`canAny` are typed by the catalog's
  * derived key and pattern unions — every key at every call site is
- * compile-time verified against the catalog.
+ * compile-time verified against the catalog — and whose scope parameters
+ * autocomplete the declared `<scopeType>:` prefixes.
  */
 export function createAlfizClient<Cat extends AnyCatalog>(
   options: Omit<AlfizClientOptions, "catalog"> & { catalog: Cat },
-): AlfizClient<Cat["$key"], Cat["$pattern"]> {
+): AlfizClient<Cat["$key"], Cat["$pattern"], Cat["$scope"]> {
   return new AlfizClient(options);
 }
 
@@ -608,6 +620,6 @@ export function createAlfizClient<Cat extends AnyCatalog>(
  * The client type for a catalog — `ClientOf<typeof catalog>` — so a client
  * stored on a context object needs no hand-written type parameters.
  * Completes the derived-type family with `KeyOf` / `PatternOf` /
- * `SnapshotOf`.
+ * `ScopeOf` / `SnapshotOf`.
  */
-export type ClientOf<Cat> = AlfizClient<KeyOf<Cat>, PatternOf<Cat>>;
+export type ClientOf<Cat> = AlfizClient<KeyOf<Cat>, PatternOf<Cat>, ScopeOf<Cat>>;

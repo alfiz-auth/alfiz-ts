@@ -378,13 +378,14 @@ describe("group-path near-miss", () => {
     expect(unknown[0]!.message).toContain("group");
   });
 
-  it("still reports plain typos without a bogus suggestion", () => {
+  it("plain typos get the closest declared key — never the bogus group idiom", () => {
     const report = run({
       "app/page.ts": `await client.can(user, "docs.files.raed");`,
     });
     const unknown = byRule(report.issues, "unknown-pattern");
     expect(unknown.length).toBe(1);
-    expect(unknown[0]!.message).not.toContain("did you mean");
+    expect(unknown[0]!.message).toContain('did you mean "docs.files.read"');
+    expect(unknown[0]!.message).not.toContain("group");
   });
 });
 

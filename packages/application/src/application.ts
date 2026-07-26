@@ -45,19 +45,20 @@ import {
   computeServiceClosure,
   computeSubjectClosure,
   findCycle,
+  formatAlternatives,
   isGlobalScope,
   isValidSubject,
   parseSubject,
   planVirtualParentDissolution,
   runAutoStages,
-  suggestPattern,
+  unknownPermissionContext,
   validateProvenance,
   validateGrantRow,
   validateJustification,
   validatePattern,
   validateScopeId,
 } from "@alfiz-auth/core";
-import type { AncestryResolver } from "@alfiz-auth/core";
+import type { AncestryResolver, LooseScopeId } from "@alfiz-auth/core";
 import { randomUUID } from "node:crypto";
 import type { StorageDriver, StoredUser } from "./storage.js";
 
@@ -128,7 +129,20 @@ export interface DirectoryImportResult {
   virtualParents: Array<{ id: string; members: string[] }>;
 }
 
-export class AlfizApplication implements AlfizProvider {
+/**
+ * Generic over the catalog's derived pattern and scope-id unions, so the
+ * write paths (grants, revokes, roles, requests) autocomplete at literal
+ * call sites — seeding scripts, data migrations, admin actions. Construct
+ * with `createAlfizApplication(options)` to infer both; the parameters are
+ * hints (`LoosePattern` / `LooseScopeId`), so runtime strings from role
+ * editors flow through unchanged and are validated against the catalog as
+ * always.
+ */
+export class AlfizApplication<
+  P extends string = string,
+  S extends string = string,
+> implements AlfizProvider
+{
   readonly catalog: AnyCatalog;
   readonly resolveAncestors: AncestryResolver;
 
@@ -174,7 +188,7 @@ export class AlfizApplication implements AlfizProvider {
    * at once". Without it, staleness is bounded only by the client's
    * object-chain TTL.
    */
-  notifyScopeMoved(scope: ScopeId): void {
+  notifyScopeMoved(scope: LooseScopeId<S>): void {
     this.emit({ type: "scope", scope });
   }
 
@@ -215,16 +229,27 @@ export class AlfizApplication implements AlfizProvider {
     if (issue) throw new ProviderWriteRejectedError(issue, "validation");
   }
 
-  /** The unknown-pattern rejection, with the group-path near-miss named. */
+  /**
+   * The unknown-pattern rejection, with the group-path near-miss named,
+   * edit-distance typos suggested, and undeclared namespaces called out —
+   * the same context the check-path `UnknownPermissionError` carries.
+   */
   private unknownPattern(pattern: string): ProviderWriteRejectedError {
-    const suggestion = suggestPattern(this.catalog, pattern);
-    return new ProviderWriteRejectedError(
-      `pattern ${JSON.stringify(pattern)} references nothing in the catalog` +
-        (suggestion
-          ? ` — it is a group, and groups are folders, never keys; the subtree pattern is ${JSON.stringify(suggestion)}`
-          : ""),
-      "validation",
+    const { suggestion, didYouMean, hint } = unknownPermissionContext(
+      this.catalog,
+      pattern,
+      "pattern",
     );
+    let message = `pattern ${JSON.stringify(pattern)} references nothing in the catalog`;
+    if (suggestion) {
+      message += ` — it is a group, and groups are folders, never keys; the subtree pattern is ${JSON.stringify(suggestion)}`;
+    } else {
+      if (didYouMean.length > 0) {
+        message += ` — did you mean ${formatAlternatives(didYouMean)}?`;
+      }
+      if (hint) message += ` (${hint})`;
+    }
+    return new ProviderWriteRejectedError(message, "validation");
   }
 
   // -- capabilities ---------------------------------------------------------
@@ -444,7 +469,7 @@ export class AlfizApplication implements AlfizProvider {
     return row;
   }
 
-  async createGrant(input: GrantInput): Promise<GrantRow> {
+  async createGrant(input: GrantInput<P, S>): Promise<GrantRow> {
     this.assertProvenance(input.provenance);
     await this.assertGrantWritable(input);
     const row = this.buildGrantRow(input, input.provenance);
@@ -470,7 +495,7 @@ export class AlfizApplication implements AlfizProvider {
    * migration wants.
    */
   async createGrants(
-    inputs: readonly Omit<GrantInput, "provenance">[],
+    inputs: readonly Omit<GrantInput<P, S>, "provenance">[],
     provenance: Provenance,
   ): Promise<GrantRow[]> {
     this.assertProvenance(provenance);
@@ -539,7 +564,7 @@ export class AlfizApplication implements AlfizProvider {
     });
   }
 
-  async createRevoke(input: RevokeInput): Promise<RevokeRow> {
+  async createRevoke(input: RevokeInput<P, S>): Promise<RevokeRow> {
     this.assertProvenance(input.provenance);
     const scope = input.scope ?? GLOBAL_SCOPE;
     if (isGlobalScope(scope)) this.requireOrgRoot("a global-scope revoke");
@@ -713,7 +738,7 @@ export class AlfizApplication implements AlfizProvider {
    * resources, call this once per deleted resource id.
    */
   async deleteScope(
-    scope: ScopeId,
+    scope: LooseScopeId<S>,
     provenance: Provenance,
   ): Promise<{ deletedGrants: number; deletedRevokes: number }> {
     this.assertProvenance(provenance);
@@ -868,7 +893,7 @@ export class AlfizApplication implements AlfizProvider {
     };
   }
 
-  async submitRequest(input: RequestInput): Promise<AccessRequest> {
+  async submitRequest(input: RequestInput<P, S>): Promise<AccessRequest> {
     const scope = input.scope ?? GLOBAL_SCOPE;
     if (isGlobalScope(scope)) {
       // Requests are homed where their proposed row would live.
@@ -1184,7 +1209,7 @@ export class AlfizApplication implements AlfizProvider {
   }
 
   async createRole(
-    input: RoleInput,
+    input: RoleInput<P>,
     provenance: Provenance,
   ): Promise<RoleRecord> {
     this.assertProvenance(provenance);
@@ -1217,7 +1242,7 @@ export class AlfizApplication implements AlfizProvider {
 
   async updateRole(
     roleId: string,
-    input: Partial<RoleInput>,
+    input: Partial<RoleInput<P>>,
     provenance: Provenance,
   ): Promise<RoleRecord> {
     this.assertProvenance(provenance);
@@ -1824,6 +1849,14 @@ export class AlfizApplication implements AlfizProvider {
   }
 }
 
-export function createApplication(options: ApplicationOptions): AlfizApplication {
+/**
+ * Constructs an Application whose write paths are typed by the catalog's
+ * derived pattern and scope-id unions — the write-side counterpart of
+ * `createAlfizClient`. Pass the catalog literal (or a `TypedCatalog` from
+ * a published document) and seeding scripts autocomplete grants.
+ */
+export function createApplication<Cat extends AnyCatalog>(
+  options: Omit<ApplicationOptions, "catalog"> & { catalog: Cat },
+): AlfizApplication<Cat["$pattern"], Cat["$scope"]> {
   return new AlfizApplication(options);
 }

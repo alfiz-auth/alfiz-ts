@@ -77,7 +77,36 @@ await snap.resolve(rowScopes);                   // list pages: extend after que
 ```
 
 Every check is verified against the catalog first: a key or pattern it does
-not declare raises `UnknownPermissionError` rather than being evaluated.
+not declare raises `UnknownPermissionError` rather than being evaluated —
+and the error names the closest declared keys, so the typo carries its own
+fix.
+
+### Typed end to end
+
+The catalog literal derives three unions, and everything downstream carries
+them: **keys** and **patterns** gate at compile time (a typo'd `can()` is a
+build error), and **scope ids** hint — literal scopes autocomplete every
+declared `<scopeType>:` prefix while ids from variables flow through,
+because the instance half of a scope id is runtime data.
+
+```ts
+type Key = KeyOf<typeof catalog>;      // "docs.files.read" | "docs.files.update_file" | …
+type Scope = ScopeOf<typeof catalog>;  // "*" | `docs.folder:${string}` | `docs.doc:${string}`
+
+// Context objects need no hand-written type parameters:
+const ctx: { alfiz: ClientOf<typeof catalog>; snap: SnapshotOf<typeof catalog> } = …;
+
+// Write paths are typed too — createApplication infers from the catalog,
+// so seeding scripts and migrations autocomplete grants:
+await app.createGrant({ subject: "group:teachers", pattern: "docs.files.*", … });
+```
+
+Code that consumes the *published* document instead of the source module
+(federated apps, other repos) gets the same treatment via codegen:
+`alfiz-verify codegen --catalog alfiz-catalog.json --out alfiz.gen.ts`
+emits the literal unions, and
+`catalogFromDocument<AlfizKey, AlfizPattern, AlfizScopeId>(doc)` pins them
+back on.
 Typed keys and `alfiz-verify` cover literal call sites; this covers the
 runtime-string paths they cannot see — and closes the hole where a
 misspelled gate key would pass for anyone holding a covering wildcard.

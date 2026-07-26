@@ -14,5 +14,14 @@ export default defineConfig({
   test: {
     include: ["packages/*/test/**/*.test.ts"],
     environment: "node",
+    // Type-level regression tests: the derived-union family fails SILENTLY
+    // (widening to `${string}` keeps everything compiling), so the exact
+    // assertions in *.test-d.ts run under tsc on every `vitest run`.
+    typecheck: {
+      enabled: true,
+      checker: "tsc",
+      include: ["packages/*/test/**/*.test-d.ts"],
+      tsconfig: "./tsconfig.typecheck.json",
+    },
   },
 });
