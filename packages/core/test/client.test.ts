@@ -278,6 +278,178 @@ describe("review regressions", () => {
   });
 });
 
+describe("cache hygiene", () => {
+  it("objectCache is bounded: least-recently-used chains evict first", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:root")],
+      parents: {
+        "docs.doc:1": "docs.folder:root",
+        "docs.doc:2": "docs.folder:root",
+        "docs.doc:3": "docs.folder:root",
+      },
+    });
+    const client = createAlfizClient({
+      catalog,
+      provider,
+      maxObjectCacheEntries: 2,
+    });
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:2");
+    // Hit doc:1 so doc:2 becomes the least recently used…
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    expect(provider.stats().resolves).toBe(2);
+    // …then doc:3 evicts doc:2, not doc:1.
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:3");
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    expect(provider.stats().resolves).toBe(3); // doc:1 still cached
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:2");
+    expect(provider.stats().resolves).toBe(4); // doc:2 was evicted
+  });
+
+  it("subjectCache eviction is LRU: a hit entry survives", async () => {
+    let fetches = 0;
+    const listeners = new Set<InvalidationListener>();
+    const provider: AlfizProvider = {
+      getSubjectAccess: async (p) => {
+        fetches++;
+        return {
+          userId: "userId" in p ? p.userId : null,
+          closure: ["userId" in p ? `user:${p.userId}` : `service:x`, "everyone"],
+          grants: [],
+          revokes: [],
+          roles: [],
+          managerChain: [],
+          unresolvedRoleIds: [],
+          active: true,
+        };
+      },
+      resolveAncestors: () => ["*"],
+      onInvalidate: (l) => {
+        listeners.add(l);
+        return () => listeners.delete(l);
+      },
+    } as unknown as AlfizProvider;
+    const client = createAlfizClient({
+      catalog,
+      provider,
+      maxSubjectCacheEntries: 2,
+    });
+    await client.can({ userId: "a" }, "docs.files.read");
+    await client.can({ userId: "b" }, "docs.files.read");
+    await client.can({ userId: "a" }, "docs.files.read"); // refresh a's recency
+    await client.can({ userId: "c" }, "docs.files.read"); // evicts b, not a
+    expect(fetches).toBe(3);
+    await client.can({ userId: "a" }, "docs.files.read"); // still cached
+    expect(fetches).toBe(3);
+    await client.can({ userId: "b" }, "docs.files.read"); // was evicted
+    expect(fetches).toBe(4);
+  });
+
+  it("concurrent object-chain misses for the same scope resolve once", async () => {
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    let resolves = 0;
+    const base = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:9")],
+      parents: { "docs.doc:1": "docs.folder:9" },
+    });
+    const provider = {
+      ...base,
+      resolveAncestors: async (scope: string) => {
+        resolves++;
+        await gate;
+        return base.resolveAncestors(scope);
+      },
+    };
+    const client = createAlfizClient({ catalog, provider });
+    const first = client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    const second = client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    release!();
+    expect(await first).toBe(true);
+    expect(await second).toBe(true);
+    expect(resolves).toBe(1);
+  });
+
+  it("a scope bust landing during an in-flight chain resolution is not lost", async () => {
+    let release: (() => void) | undefined;
+    let resolves = 0;
+    const base = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:9")],
+      parents: { "docs.doc:1": "docs.folder:9" },
+    });
+    const provider = {
+      ...base,
+      resolveAncestors: async (scope: string) => {
+        resolves++;
+        if (resolves === 1) {
+          await new Promise<void>((r) => {
+            release = r;
+          });
+        }
+        return base.resolveAncestors(scope);
+      },
+    };
+    const client = createAlfizClient({ catalog, provider });
+    const first = client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    provider.emit({ type: "scope", scope: "docs.doc:1" });
+    release!();
+    await first;
+    // The stale chain must not have been cached: the next check re-resolves.
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    expect(resolves).toBe(2);
+  });
+
+  it("internal maps drain once fetches settle and caches are busted", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { pattern: "docs.files.read" }, "docs.folder:9")],
+      parents: { "docs.doc:1": "docs.folder:9" },
+    });
+    const client = createAlfizClient({ catalog, provider });
+    await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    // Repeated bust/refetch cycles must not accumulate per-key state (the
+    // generation maps this design replaced grew one entry per busted key).
+    for (let i = 0; i < 5; i++) {
+      provider.emit({ type: "user", userId: "u1" });
+      provider.emit({ type: "scope", scope: "docs.doc:1" });
+      await client.can({ userId: "u1" }, "docs.files.read", "docs.doc:1");
+    }
+    const internals = client as unknown as {
+      subjectFetchStates: Map<string, unknown>;
+      objectFetchStates: Map<string, unknown>;
+      subjectInFlight: Map<string, unknown>;
+      objectInFlight: Map<string, unknown>;
+      closureIndex: Map<string, Set<string>>;
+      roleIndex: Map<string, Set<string>>;
+      chainIndex: Map<string, Set<string>>;
+    };
+    expect(internals.subjectFetchStates.size).toBe(0);
+    expect(internals.objectFetchStates.size).toBe(0);
+    expect(internals.subjectInFlight.size).toBe(0);
+    expect(internals.objectInFlight.size).toBe(0);
+    provider.emit({ type: "all" });
+    expect(internals.closureIndex.size).toBe(0);
+    expect(internals.roleIndex.size).toBe(0);
+    expect(internals.chainIndex.size).toBe(0);
+  });
+
+  it("role events bust exactly the entries referencing the role", async () => {
+    const provider = fakeProvider({
+      grants: [g("user:u1", { roleId: "editor" })],
+      roles: [{ id: "editor", name: "Editor", patterns: ["docs.files.*"] }],
+    });
+    const client = createAlfizClient({ catalog, provider });
+    expect(await client.can({ userId: "u1" }, "docs.files.read")).toBe(true);
+    provider.emit({ type: "role", roleId: "unrelated" });
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(provider.stats().fetches).toBe(1); // untouched by an unrelated role
+    provider.emit({ type: "role", roleId: "editor" });
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(provider.stats().fetches).toBe(2);
+  });
+});
+
 describe("ancestor visibility (impliedOnAncestors)", () => {
   it("a granted scope implies the marked leaf on its ancestors only", async () => {
     const provider = fakeProvider({

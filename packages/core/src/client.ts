@@ -44,6 +44,7 @@ import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
 import type {
   AlfizProvider,
+  InvalidationEvent,
   PrincipalRef,
   SubjectAccessData,
 } from "./provider.js";
@@ -68,8 +69,10 @@ export interface AlfizClientOptions {
    * bounds staleness when a move was never reported. Default 60s.
    */
   objectCacheTtlMs?: number;
-  /** Maximum cached principals before oldest entries are evicted. Default 10 000. */
+  /** Maximum cached principals before least-recently-used entries are evicted. Default 10 000. */
   maxSubjectCacheEntries?: number;
+  /** Maximum cached object chains before least-recently-used entries are evicted. Default 10 000. */
+  maxObjectCacheEntries?: number;
   clock?: () => number;
 }
 
@@ -143,20 +146,41 @@ export class AlfizClient<
   private readonly subjectTtl: number;
   private readonly objectTtl: number;
   private readonly maxSubjects: number;
+  private readonly maxObjects: number;
   private readonly now: () => number;
   private readonly subjectCache = new Map<string, SubjectCacheEntry>();
   private readonly objectCache = new Map<ScopeId, ObjectCacheEntry>();
   /**
-   * Bust-during-fetch protection: every invalidation bumps the generation
-   * for the affected key; a fetch only stores its result if no bust landed
-   * while it was in flight.
+   * Secondary indexes over the caches, so invalidation events bust in
+   * O(affected entries) instead of scanning every entry: subject id →
+   * cache keys whose closure contains it; role id → cache keys whose data
+   * references it; scope → cached scopes whose chain passes through it.
+   * Maintained exclusively by the store/drop pairs below — eviction and
+   * busting share them, so the indexes can never drift from the caches.
    */
-  private readonly subjectGen = new Map<string, number>();
-  private readonly objectGen = new Map<ScopeId, number>();
+  private readonly closureIndex = new Map<string, Set<string>>();
+  private readonly roleIndex = new Map<string, Set<string>>();
+  private readonly chainIndex = new Map<ScopeId, Set<ScopeId>>();
+  /**
+   * Bust-during-fetch protection: every in-flight fetch registers a
+   * cancellation record; a bust marks the key's records cancelled, and a
+   * fetch stores its result only if its own record survived. Records remove
+   * themselves on settle, so memory is bounded by in-flight fetches — not,
+   * as with the generation counters this replaces, by every key ever busted.
+   */
+  private readonly subjectFetchStates = new Map<
+    string,
+    Set<{ cancelled: boolean }>
+  >();
+  private readonly objectFetchStates = new Map<
+    ScopeId,
+    Set<{ cancelled: boolean }>
+  >();
   private readonly subjectInFlight = new Map<
     string,
     Promise<SubjectAccessData>
   >();
+  private readonly objectInFlight = new Map<ScopeId, Promise<ScopeId[]>>();
   private readonly unsubscribe: () => void;
   private readonly grantApplies: (
     key: PermissionKey,
@@ -169,6 +193,7 @@ export class AlfizClient<
     this.subjectTtl = options.subjectCacheTtlMs ?? 30_000;
     this.objectTtl = options.objectCacheTtlMs ?? 60_000;
     this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
+    this.maxObjects = options.maxObjectCacheEntries ?? 10_000;
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
@@ -182,67 +207,175 @@ export class AlfizClient<
       this.check(principal, key, scope, true);
     this.can = can;
 
-    this.unsubscribe = this.provider.onInvalidate((event) => {
-      switch (event.type) {
-        case "user":
-          this.bustSubject(`u:${event.userId}`);
-          break;
-        case "subject":
-          for (const [cacheKey, entry] of this.subjectCache) {
-            if (entry.data.closure.includes(event.subject)) {
-              this.bustSubject(cacheKey);
-            }
-          }
-          break;
-        case "scope":
-          // Object chains bust immediately on move: the moved scope's own
-          // chain, and every cached chain passing through it.
-          this.bustObject(event.scope);
-          for (const [cached, entry] of this.objectCache) {
-            if (entry.chain.includes(event.scope)) this.bustObject(cached);
-          }
-          break;
-        case "role":
-          // Role definitions ride inside subject data; bust conservatively.
-          for (const [cacheKey, entry] of this.subjectCache) {
-            if (entry.data.roles.some((r) => r.id === event.roleId)) {
-              this.bustSubject(cacheKey);
-            }
-          }
-          break;
-        case "catalog":
-        case "all":
-          for (const cacheKey of [...this.subjectCache.keys()]) {
-            this.bustSubject(cacheKey);
-          }
-          for (const scope of [...this.objectCache.keys()]) {
-            this.bustObject(scope);
-          }
-          break;
-      }
-    });
+    this.unsubscribe = this.provider.onInvalidate((event) =>
+      this.applyInvalidation(event),
+    );
+  }
+
+  /**
+   * The single event → cache-entry mapping. The live provider stream feeds
+   * it directly; anything replaying persisted events (cross-process
+   * revalidation) must produce identical busts, so both run through here.
+   */
+  private applyInvalidation(event: InvalidationEvent): void {
+    switch (event.type) {
+      case "user":
+        this.bustSubject(`u:${event.userId}`);
+        break;
+      case "subject":
+        for (const cacheKey of [
+          ...(this.closureIndex.get(event.subject) ?? []),
+        ]) {
+          this.bustSubject(cacheKey);
+        }
+        break;
+      case "scope":
+        // Object chains bust immediately on move: the moved scope's own
+        // chain, and every cached chain passing through it.
+        this.bustObject(event.scope);
+        for (const cached of [...(this.chainIndex.get(event.scope) ?? [])]) {
+          this.bustObject(cached);
+        }
+        break;
+      case "role":
+        // Role definitions ride inside subject data; bust conservatively.
+        for (const cacheKey of [...(this.roleIndex.get(event.roleId) ?? [])]) {
+          this.bustSubject(cacheKey);
+        }
+        break;
+      case "catalog":
+      case "all":
+        for (const cacheKey of [...this.subjectCache.keys()]) {
+          this.bustSubject(cacheKey);
+        }
+        for (const scope of [...this.objectCache.keys()]) {
+          this.bustObject(scope);
+        }
+        break;
+    }
+  }
+
+  // -- cache maintenance ----------------------------------------------------
+  // All cache and index mutation goes through these four: store on fetch,
+  // drop on eviction, bust (drop + cancel in-flight) on invalidation.
+
+  private storeSubject(cacheKey: string, entry: SubjectCacheEntry): void {
+    this.dropSubject(cacheKey);
+    this.subjectCache.set(cacheKey, entry);
+    for (const subject of entry.data.closure) {
+      let keys = this.closureIndex.get(subject);
+      if (keys === undefined) this.closureIndex.set(subject, (keys = new Set()));
+      keys.add(cacheKey);
+    }
+    for (const role of entry.data.roles) {
+      let keys = this.roleIndex.get(role.id);
+      if (keys === undefined) this.roleIndex.set(role.id, (keys = new Set()));
+      keys.add(cacheKey);
+    }
+    // Bounded cache: evict least-recently-used (hits refresh recency, so
+    // Map insertion order IS recency order).
+    while (this.subjectCache.size > this.maxSubjects) {
+      const oldest = this.subjectCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropSubject(oldest);
+    }
+  }
+
+  private dropSubject(cacheKey: string): void {
+    const entry = this.subjectCache.get(cacheKey);
+    if (entry === undefined) return;
+    this.subjectCache.delete(cacheKey);
+    for (const subject of entry.data.closure) {
+      const keys = this.closureIndex.get(subject);
+      if (keys === undefined) continue;
+      keys.delete(cacheKey);
+      if (keys.size === 0) this.closureIndex.delete(subject);
+    }
+    for (const role of entry.data.roles) {
+      const keys = this.roleIndex.get(role.id);
+      if (keys === undefined) continue;
+      keys.delete(cacheKey);
+      if (keys.size === 0) this.roleIndex.delete(role.id);
+    }
+  }
+
+  private storeObject(scope: ScopeId, entry: ObjectCacheEntry): void {
+    this.dropObject(scope);
+    this.objectCache.set(scope, entry);
+    for (const ancestor of entry.chain) {
+      let scopes = this.chainIndex.get(ancestor);
+      if (scopes === undefined) this.chainIndex.set(ancestor, (scopes = new Set()));
+      scopes.add(scope);
+    }
+    while (this.objectCache.size > this.maxObjects) {
+      const oldest = this.objectCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropObject(oldest);
+    }
+  }
+
+  private dropObject(scope: ScopeId): void {
+    const entry = this.objectCache.get(scope);
+    if (entry === undefined) return;
+    this.objectCache.delete(scope);
+    for (const ancestor of entry.chain) {
+      const scopes = this.chainIndex.get(ancestor);
+      if (scopes === undefined) continue;
+      scopes.delete(scope);
+      if (scopes.size === 0) this.chainIndex.delete(ancestor);
+    }
   }
 
   private bustSubject(cacheKey: string): void {
-    this.subjectCache.delete(cacheKey);
-    this.subjectGen.set(cacheKey, (this.subjectGen.get(cacheKey) ?? 0) + 1);
+    this.dropSubject(cacheKey);
+    for (const state of this.subjectFetchStates.get(cacheKey) ?? []) {
+      state.cancelled = true;
+    }
   }
 
   private bustObject(scope: ScopeId): void {
-    this.objectCache.delete(scope);
-    this.objectGen.set(scope, (this.objectGen.get(scope) ?? 0) + 1);
+    this.dropObject(scope);
+    for (const state of this.objectFetchStates.get(scope) ?? []) {
+      state.cancelled = true;
+    }
   }
 
   /** Detach from the provider's invalidation stream and drop caches. */
   close(): void {
     this.unsubscribe();
-    this.subjectCache.clear();
-    this.objectCache.clear();
-    this.subjectGen.clear();
-    this.objectGen.clear();
+    for (const cacheKey of [...this.subjectCache.keys()]) {
+      this.bustSubject(cacheKey);
+    }
+    for (const scope of [...this.objectCache.keys()]) {
+      this.bustObject(scope);
+    }
+    for (const states of this.subjectFetchStates.values()) {
+      for (const state of states) state.cancelled = true;
+    }
+    for (const states of this.objectFetchStates.values()) {
+      for (const state of states) state.cancelled = true;
+    }
   }
 
   // -- data supply ----------------------------------------------------------
+
+  /** Registers a cancellation record for an in-flight fetch on `key`. */
+  private static trackFetch<K>(
+    states: Map<K, Set<{ cancelled: boolean }>>,
+    key: K,
+  ): { state: { cancelled: boolean }; done: () => void } {
+    const state = { cancelled: false };
+    let set = states.get(key);
+    if (set === undefined) states.set(key, (set = new Set()));
+    set.add(state);
+    return {
+      state,
+      done: () => {
+        set.delete(state);
+        if (set.size === 0 && states.get(key) === set) states.delete(key);
+      },
+    };
+  }
 
   private async subjectData(
     principal: PrincipalRef,
@@ -252,23 +385,19 @@ export class AlfizClient<
     const now = this.now();
     if (!fresh) {
       const cached = this.subjectCache.get(key);
-      if (cached && cached.expiresAt > now) return cached.data;
+      if (cached && cached.expiresAt > now) {
+        // Refresh recency: Map insertion order doubles as the LRU order.
+        this.subjectCache.delete(key);
+        this.subjectCache.set(key, cached);
+        return cached.data;
+      }
       const inFlight = this.subjectInFlight.get(key);
       if (inFlight) return inFlight;
     }
-    const generation = this.subjectGen.get(key) ?? 0;
+    const { state, done } = AlfizClient.trackFetch(this.subjectFetchStates, key);
     const fetching = this.provider.getSubjectAccess(principal).then((data) => {
-      if ((this.subjectGen.get(key) ?? 0) === generation) {
-        this.subjectCache.set(key, {
-          data,
-          expiresAt: this.now() + this.subjectTtl,
-        });
-        // Bounded cache: evict oldest entries (Map preserves insertion order).
-        while (this.subjectCache.size > this.maxSubjects) {
-          const oldest = this.subjectCache.keys().next().value;
-          if (oldest === undefined) break;
-          this.subjectCache.delete(oldest);
-        }
+      if (!state.cancelled) {
+        this.storeSubject(key, { data, expiresAt: this.now() + this.subjectTtl });
       }
       return data;
     });
@@ -276,6 +405,7 @@ export class AlfizClient<
     try {
       return await fetching;
     } finally {
+      done();
       this.subjectInFlight.delete(key);
     }
   }
@@ -288,17 +418,30 @@ export class AlfizClient<
     const now = this.now();
     if (!fresh) {
       const cached = this.objectCache.get(scope);
-      if (cached && cached.expiresAt > now) return cached.chain;
+      if (cached && cached.expiresAt > now) {
+        this.objectCache.delete(scope);
+        this.objectCache.set(scope, cached);
+        return cached.chain;
+      }
+      const inFlight = this.objectInFlight.get(scope);
+      if (inFlight) return inFlight;
     }
-    const generation = this.objectGen.get(scope) ?? 0;
-    const chain = await objectClosureOf(scope, this.provider.resolveAncestors);
-    if ((this.objectGen.get(scope) ?? 0) === generation) {
-      this.objectCache.set(scope, {
-        chain,
-        expiresAt: this.now() + this.objectTtl,
-      });
+    const { state, done } = AlfizClient.trackFetch(this.objectFetchStates, scope);
+    const resolving = objectClosureOf(scope, this.provider.resolveAncestors).then(
+      (chain) => {
+        if (!state.cancelled) {
+          this.storeObject(scope, { chain, expiresAt: this.now() + this.objectTtl });
+        }
+        return chain;
+      },
+    );
+    if (!fresh) this.objectInFlight.set(scope, resolving);
+    try {
+      return await resolving;
+    } finally {
+      done();
+      this.objectInFlight.delete(scope);
     }
-    return chain;
   }
 
   // -- checks ---------------------------------------------------------------
