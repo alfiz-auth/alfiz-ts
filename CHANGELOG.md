@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — caching that survives more than one process
+## 0.3.0 — the relay seam, and caching that survives more than one process
 
 The staleness bound stops being "a TTL per process" and becomes "one
 revalidation window, any number of processes" — opt-in, with defaults
