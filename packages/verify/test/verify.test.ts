@@ -40,7 +40,7 @@ describe("unknown-pattern", () => {
   it("errors on keys and patterns the catalog does not declare", () => {
     const report = run({
       "app/page.ts": `
-        await client.requirePermission(user, "docs.files.raed");
+        await client.require(user, "docs.files.raed");
         await client.can(user, "docs.ghost.*");
       `,
     });
@@ -88,15 +88,23 @@ describe("visibility-as-gate", () => {
           await client.requireAny(user, "docs.*");
         }
       `,
+      "app/holds-action.ts": `
+        "use server";
+        export async function doOther() {
+          // holds is the "any scope" probe — never a gate.
+          if (await client.holds(user, "docs.files.read")) return;
+        }
+      `,
       "app/page.ts": `
         await client.canAny(user, "docs.*"); // fine in pages/components
       `,
     });
     const bad = byRule(report.issues, "visibility-as-gate");
-    expect(bad.length).toBe(2);
+    expect(bad.length).toBe(3);
     expect(bad.map((i) => i.file).sort()).toEqual([
       "app/actions.ts",
       "app/api/thing/route.ts",
+      "app/holds-action.ts",
     ]);
   });
 });

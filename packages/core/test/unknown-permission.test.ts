@@ -75,7 +75,7 @@ describe("the gate-path fail-open, closed", () => {
       c.can({ userId: "u1" }, "docs.files.raed" as never),
     ).rejects.toBeInstanceOf(UnknownPermissionError);
     await expect(
-      c.requirePermission({ userId: "u1" }, "docs.files.raed" as never),
+      c.require({ userId: "u1" }, "docs.files.raed" as never),
     ).rejects.toThrow(/not a permission key/);
     // A key from a namespace the catalog never declared, likewise.
     await expect(
@@ -140,7 +140,7 @@ describe("the visibility-path silent false, closed", () => {
 });
 
 describe("the introspection paths — where runtime strings live", () => {
-  it("LooseKey paths validate too: explain, grantedScopes, holdsAnywhere", async () => {
+  it("LooseKey paths validate too: explain, grantedScopes, holds", async () => {
     const c = client();
     const runtimeTypo: string = "docs.files.raed";
     await expect(c.explain({ userId: "u1" }, runtimeTypo)).rejects.toBeInstanceOf(
@@ -150,11 +150,11 @@ describe("the introspection paths — where runtime strings live", () => {
       c.grantedScopes({ userId: "u1" }, runtimeTypo),
     ).rejects.toBeInstanceOf(UnknownPermissionError);
     await expect(
-      c.holdsAnywhere({ userId: "u1" }, runtimeTypo),
+      c.holds({ userId: "u1" }, runtimeTypo),
     ).rejects.toBeInstanceOf(UnknownPermissionError);
     // A real key still flows through the escape hatch.
     const realKey: string = "docs.files.read";
-    expect(await c.holdsAnywhere({ userId: "u1" }, realKey)).toBe(true);
+    expect(await c.holds({ userId: "u1" }, realKey)).toBe(true);
   });
 });
 

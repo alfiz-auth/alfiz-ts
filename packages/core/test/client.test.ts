@@ -259,7 +259,7 @@ describe("review regressions", () => {
     expect(await client.can({ userId: "u1" }, "docs.files.delete", "docs.doc:1")).toBe(false);
   });
 
-  it("effectiveKeys ignores scoped revokes (they narrow one subtree, not the held set)", async () => {
+  it("heldKeys ignores scoped revokes (they narrow one subtree, not the held set)", async () => {
     const provider = fakeProvider({
       grants: [g("user:u1", { pattern: "docs.files.read" })],
       revokes: [
@@ -274,7 +274,7 @@ describe("review regressions", () => {
       ],
     });
     const client = createAlfizClient({ catalog, provider });
-    expect(await client.effectiveKeys({ userId: "u1" })).toContain("docs.files.read");
+    expect(await client.heldKeys({ userId: "u1" })).toContain("docs.files.read");
   });
 });
 
@@ -306,27 +306,27 @@ describe("AlfizClient.canAny and require*", () => {
     expect(await client.canAny({ userId: "u1" }, "docs.files.*")).toBe(true);
   });
 
-  it("requirePermission throws typed denials", async () => {
+  it("require throws typed denials", async () => {
     const provider = fakeProvider({ grants: [] });
     const client = createAlfizClient({ catalog, provider });
     await expect(
-      client.requirePermission({ userId: "u1" }, "docs.files.read"),
+      client.require({ userId: "u1" }, "docs.files.read"),
     ).rejects.toThrow(AccessDeniedError);
     await expect(
-      client.requirePermission({ userId: "u1" }, "docs.files.read"),
+      client.require({ userId: "u1" }, "docs.files.read"),
     ).rejects.toMatchObject({ reason: "forbidden" });
   });
 
-  it("requirePermission distinguishes inactive principals", async () => {
+  it("require distinguishes inactive principals", async () => {
     const provider = fakeProvider({ grants: [g("user:u1", { pattern: "*" })], active: false });
     const client = createAlfizClient({ catalog, provider });
     await expect(
-      client.requirePermission({ userId: "u1" }, "docs.files.read"),
+      client.require({ userId: "u1" }, "docs.files.read"),
     ).rejects.toMatchObject({ reason: "inactive" });
   });
 });
 
-describe("explain / effectiveKeys / grantedScopes", () => {
+describe("explain / heldKeys / grantedScopes", () => {
   it("explain shows the winning rows", async () => {
     const grant = g("user:u1", { pattern: "docs.*" });
     const revoke: RevokeRow = {
@@ -345,7 +345,7 @@ describe("explain / effectiveKeys / grantedScopes", () => {
     expect(explained.matchedRevokes.map((m) => m.id)).toEqual(["r1"]);
   });
 
-  it("effectiveKeys lists held catalog keys minus revokes", async () => {
+  it("heldKeys lists held catalog keys minus revokes", async () => {
     const provider = fakeProvider({
       grants: [g("user:u1", { pattern: "docs.files.*" })],
       revokes: [
@@ -360,7 +360,7 @@ describe("explain / effectiveKeys / grantedScopes", () => {
       ],
     });
     const client = createAlfizClient({ catalog, provider });
-    expect(await client.effectiveKeys({ userId: "u1" })).toEqual([
+    expect(await client.heldKeys({ userId: "u1" })).toEqual([
       "docs.files.read",
       "docs.files.read_listing",
       "docs.files.update_file",

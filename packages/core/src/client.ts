@@ -4,12 +4,19 @@
  * parameterized by provider invalidation events; decisions are never cached.
  *
  * Check shapes: `can` (the only gate shape), `canAny` (visibility affordance
- * only), their throwing `require*` forms, and `can.fresh`, which bypasses all
- * caches — the intended pairing for destructive actions and time-bound
- * elevations. Server-rendered request handling has a third surface:
+ * only), their throwing `require*` forms, `holds`/`heldKeys` (the "held at
+ * any scope" probes), and `can.fresh`, which bypasses all caches — the
+ * intended pairing for destructive actions and time-bound elevations.
+ * Server-rendered request handling has a third surface:
  * `snapshot(principal)` fetches once and then checks SYNCHRONOUSLY — see
  * snapshot.ts; it is the intended shape wherever render helpers cannot be
  * async.
+ *
+ * The naming rule, held everywhere: ONE NAME PER QUESTION, on every surface.
+ * `can`/`require` gate, `canAny`/`requireAny` guard visibility,
+ * `holds`/`heldKeys` probe unscoped possession, `explain` shows the work,
+ * `grantedScopes` feeds listing — identically named on the client, the
+ * snapshot, and the session surfaces.
  *
  * Every check is verified against the catalog before it is evaluated: a key
  * or pattern the catalog does not declare raises `UnknownPermissionError`
@@ -106,6 +113,12 @@ export function toCheckContext(
 }
 
 export interface CanFn<K extends string, S extends string = string> {
+  /**
+   * The gate: may the principal do `key` at `scope`? An array of keys is
+   * any-of. NO SCOPE MEANS THE GLOBAL SCOPE — "may they do this
+   * everywhere?", the strictest check, NOT "may they do this anywhere?".
+   * The anywhere question is `holds`, and it is never a gate.
+   */
   (
     principal: PrincipalRef,
     key: K | readonly K[],
@@ -462,8 +475,11 @@ export class AlfizClient<
     return checkAny(ctx, pattern, this.catalog.keys, closures);
   }
 
-  /** Throwing form of `can`. */
-  async requirePermission(
+  /**
+   * Throwing form of `can` — same name on every surface (`client.require`,
+   * `snapshot.require`, `session.require`).
+   */
+  async require(
     principal: PrincipalRef,
     key: K | readonly K[],
     scope?: LooseScopeId<S>,
@@ -490,7 +506,13 @@ export class AlfizClient<
     }
   }
 
-  /** Throwing form of `canAny` — project-root visibility (`requireAny("project.*")`). */
+  /**
+   * Throwing form of `canAny`, and exactly as narrow: it exists for ONE
+   * pattern — the page-top visibility guard (`requireAny("project.*")` →
+   * your 404/redirect) on a page that still gates its own read with
+   * `require`. It is never an action gate; the static verifier errors on
+   * `canAny`/`requireAny` in server actions and route handlers.
+   */
   async requireAny(principal: PrincipalRef, pattern: P): Promise<void> {
     this.assertPattern(pattern);
     if (!(await this.canAny(principal, pattern))) {
@@ -567,16 +589,16 @@ export class AlfizClient<
   }
 
   /**
-   * Does the principal hold `key` at ANY scope? The single-key "holds it
-   * anywhere" probe (see `keyHeldAnywhere` for the exact semantics). This is
-   * a legitimate — and under scoped grants, the RIGHT — question for
-   * unscoped conditional UI: an instructor holding `publish_course` only at
-   * the courses they teach should still see the button surface exist.
-   * Never a gate: the action behind the button still gates with `can` at
-   * its concrete scope. O(rows) for one key; for many keys per request,
-   * prefer `snapshot(principal).heldKeys`.
+   * Does the principal hold `key` at ANY scope? (See `keyHeldAnywhere` for
+   * the exact semantics.) This is a legitimate — and under scoped grants,
+   * the RIGHT — question for unscoped conditional UI: an instructor holding
+   * `publish_course` only at the courses they teach should still see the
+   * button surface exist. Never a gate: the action behind the button still
+   * gates with `can` at its concrete scope. Same name on every surface
+   * (`snapshot.holds`, session snapshot `holds`). O(rows) for one key; for
+   * many keys per request, prefer `snapshot(principal).heldKeys`.
    */
-  async holdsAnywhere(
+  async holds(
     principal: PrincipalRef,
     key: LooseKey<K>,
   ): Promise<boolean> {
@@ -590,13 +612,14 @@ export class AlfizClient<
    * Every concrete catalog key the principal holds SOMEWHERE: granted by an
    * applicable unexpired row at any scope, suppressed only by global-scope
    * revokes (a folder-scoped revoke narrows one subtree; it does not erase
-   * a key held elsewhere). "Not a gate" does not mean "not useful": this is
-   * the right feed for unscoped conditional UI under scoped grants — it is
-   * simply never the thing that AUTHORIZES an action, which always gates
-   * with `can` at a concrete scope. O(catalog); call once per request and
-   * reuse — `snapshot(principal).heldKeys` does exactly that.
+   * a key held elsewhere). The many-key form of `holds`, same name on every
+   * surface (`snapshot.heldKeys`). "Not a gate" does not mean "not useful":
+   * this is the right feed for unscoped conditional UI under scoped grants
+   * — it is simply never the thing that AUTHORIZES an action, which always
+   * gates with `can` at a concrete scope. O(catalog); call once per request
+   * and reuse — `snapshot(principal).heldKeys` does exactly that.
    */
-  async effectiveKeys(principal: PrincipalRef): Promise<PermissionKey[]> {
+  async heldKeys(principal: PrincipalRef): Promise<PermissionKey[]> {
     const data = await this.subjectData(principal, false);
     if (!data.active) return [];
     const ctx = this.ctxOf(data);

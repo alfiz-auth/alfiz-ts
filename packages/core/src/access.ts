@@ -358,10 +358,9 @@ export function grantedScopesFor(
  * (A scoped revoke narrows one subtree; it does not erase a key held
  * elsewhere.) This is the right question for unscoped conditional UI under
  * scoped grants — "should this button exist at all" when the concrete scope
- * is not yet known — and the shared engine behind
- * `AlfizClient.effectiveKeys`, `AlfizClient.holdsAnywhere`, and
- * `AlfizSnapshot.heldKeys`. Never a gate: gates use `checkKey` at a
- * concrete scope.
+ * is not yet known — and the shared engine behind `holds` and `heldKeys`
+ * on the client, the snapshot, and the session snapshot. Never a gate:
+ * gates use `checkKey` at a concrete scope.
  */
 export function keyHeldAnywhere(ctx: CheckContext, key: PermissionKey): boolean {
   let granted = false;

@@ -284,12 +284,12 @@ describe("snapshot: one round-trip, synchronous checks", () => {
     expect(snap.heldKeys.has("docs.files.delete")).toBe(false);
     expect(snap.heldKeys.has("lms.courses.read")).toBe(false);
     // Agrees with the client-side probes.
-    expect(await client.holdsAnywhere({ userId: "u1" }, "lms.courses.publish_course")).toBe(true);
-    expect(await client.effectiveKeys({ userId: "u1" })).toContain("docs.files.read");
+    expect(await client.holds({ userId: "u1" }, "lms.courses.publish_course")).toBe(true);
+    expect(await client.heldKeys({ userId: "u1" })).toContain("docs.files.read");
     // The wrapper escape hatch: plain strings flow through LooseKey paths.
     const permission: string = "lms.courses.publish_course";
     expect(snap.holds(permission)).toBe(true);
-    expect(await client.holdsAnywhere({ userId: "u1" }, permission)).toBe(true);
+    expect(await client.holds({ userId: "u1" }, permission)).toBe(true);
   });
 
   it("grantedScopes is sync and feeds the listing plan", async () => {

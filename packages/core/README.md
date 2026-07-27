@@ -25,8 +25,10 @@ data a provider supplies — no storage, no I/O.
   layers), pure stage evaluation.
 - **Client** (`client.ts`) — `createAlfizClient`: `can` / `canAny` /
   `require*` / `can.fresh`, closure caches parameterized by provider
-  invalidation events, `explain`, `grantedScopes`, `effectiveKeys`,
-  `holdsAnywhere`. Every check is verified against the catalog first —
+  invalidation events, `explain`, `grantedScopes`, `holds` / `heldKeys`.
+  One name per question, on every surface — the client, the snapshot, and
+  the session spell each check shape identically.
+  Every check is verified against the catalog first —
   an undeclared key or pattern raises `UnknownPermissionError` (a
   programming error: map it to 500, never 403) instead of being evaluated,
   which is what keeps a misspelled gate from passing for wildcard holders.

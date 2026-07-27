@@ -56,7 +56,7 @@ const app = createApplication({
 const alfiz = createAlfizClient({ catalog, provider: app });
 
 await alfiz.can({ userId }, "docs.files.read", "docs.doc:123");
-await alfiz.requirePermission({ userId }, "docs.files.update_file", "docs.doc:123");
+await alfiz.require({ userId }, "docs.files.update_file", "docs.doc:123");
 await alfiz.canAny({ userId }, "docs.*");            // visibility only, never a gate
 await alfiz.can.fresh({ userId }, "docs.files.delete", "docs.folder:9"); // destructive: bypass caches
 ```

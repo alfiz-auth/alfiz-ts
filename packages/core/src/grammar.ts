@@ -26,7 +26,7 @@ export type PermissionPattern = string;
  * (`assertCanDo(actor, thing, permission: string)`). Autocomplete and
  * compile-checking survive for literal call sites; a plain `string` flows
  * through without `as never`. Used on the INTROSPECTION paths only
- * (`grantedScopes`, `explain`, `holdsAnywhere`) — gates (`can`, `require*`)
+ * (`grantedScopes`, `explain`, `holds`) — gates (`can`, `require*`)
  * stay strictly typed, because a gate on an unchecked key is exactly the
  * typo class the derived types exist to prevent.
  */

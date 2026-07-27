@@ -1,6 +1,51 @@
 # Changelog
 
-## 0.2.2 — typed end to end, errors that carry their fix
+## Unreleased — one name per question, on every surface
+
+The check surface is the same set of questions it was; what changed is that
+each question now has exactly one name, spelled identically wherever it is
+asked. If you know the question, you know the method name — on the client,
+the snapshot, the session, and the new session snapshot.
+
+### Renames (breaking)
+
+- **`client.requirePermission` → `client.require`** — matching
+  `snapshot.require` and `session.require`. (The verifier's
+  `DEFAULT_GATE_NAMES` still recognizes `requirePermission`, so host-app
+  wrappers by that name keep counting as gates.)
+- **`client.holdsAnywhere` → `client.holds`** — matching `snapshot.holds`.
+  Same semantics: held at ANY scope, never a gate.
+- **`client.effectiveKeys` → `client.heldKeys`** — matching
+  `snapshot.heldKeys`. Same semantics: every catalog key held somewhere.
+
+### Session snapshots: view-as joins the one-snapshot-per-request pattern
+
+- **`session.snapshot(options?)`** — one fetch per identity, then
+  synchronous, preview-narrowed checks: `can` / `canAny` / `require` /
+  `requireAny` / `holds` / `heldKeys`, each the actor ∩ preview
+  intersection, plus `resolve(scopes)` extending both identities at once.
+  Render paths under view-as no longer fall back to per-button `await` —
+  the gap where the prescribed render pattern was impossible is closed.
+  Role previews evaluate synchronously with no extra resolution (role
+  patterns are global-scope by construction); unknown role ids fail
+  closed. `SessionSnapshotOf<Cat>` completes the derived-type family.
+- Denials thrown from a session snapshot name the ACTOR, exactly as on the
+  async session methods — attribution never follows the preview.
+
+### Sharper edges, stated where you hit them
+
+- **`holds` is now verifier-enforced as never-a-gate**: it joins
+  `canAny`/`requireAny` in `DEFAULT_VISIBILITY_NAMES`, so a `holds` call
+  inside a server action or route handler is a build error, not a
+  convention.
+- **`requireAny`'s one sanctioned use is now stated on the method**: the
+  page-top visibility guard on a page that still gates its own read.
+  Never an action gate.
+- **`can` with no scope means the GLOBAL scope** — "may they do this
+  everywhere?", not "anywhere?" — now documented on the gate itself, with
+  the pointer to `holds` for the anywhere question.
+
+No package versions were bumped; these land with the next release.
 
 No semantic changes: this release is developer experience — the derived
 types now cover every surface a human types a permission or scope into,

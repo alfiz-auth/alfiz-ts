@@ -92,11 +92,18 @@ export const DEFAULT_GATE_NAMES = [
   "can",
   "fresh",
   "require",
+  // Not an Alfiz method (the client's is `require`); recognized because it
+  // is a common host-app wrapper name, like the two below.
   "requirePermission",
   "gateAction",
   "apiRequirePermission",
 ] as const;
-export const DEFAULT_VISIBILITY_NAMES = ["canAny", "requireAny"] as const;
+/**
+ * Names that are never valid as gates: the visibility affordances
+ * (`canAny`/`requireAny`) and the "held at any scope" probe (`holds` —
+ * `heldKeys` is a property access, not a call, so it cannot read as a gate).
+ */
+export const DEFAULT_VISIBILITY_NAMES = ["canAny", "requireAny", "holds"] as const;
 export const DEFAULT_SERVER_FILE_PATTERNS: readonly RegExp[] = [
   /app\/.*route\.(t|j)sx?$/,
   /pages\/api\//,
