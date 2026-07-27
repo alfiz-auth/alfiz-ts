@@ -38,11 +38,25 @@ delegate-surface change that would force `as unknown as
 AlfizPrismaDelegates` on adopters fails this package's own build instead.
 The match holds under `exactOptionalPropertyTypes` too.
 
+## The invalidation log (AlfizEpoch / AlfizEvent)
+
+The fragment includes two models backing the Application's
+`events: { persist: true }` option — the persisted invalidation log that
+lets clients on OTHER processes revalidate their caches with one
+single-row read (`AlfizEpoch`) instead of waiting out a TTL. They are
+additive: merge them and `prisma migrate dev` as usual; the epoch row is
+lazily created on first append, no seed required. A client generated
+WITHOUT them still satisfies the driver interface — the driver then omits
+the optional event methods and `events.persist` refuses at construction.
+
 ## Multi-node deployments: pass an advisory lock
 
 `runExclusive` defaults to an in-process mutex, which serializes graph
 writes within one process only. If several nodes share the database, supply
-a database advisory lock so two nodes cannot jointly write a graph cycle:
+a database advisory lock so two nodes cannot jointly write a graph cycle —
+and, with event persistence on, so two nodes cannot interleave sequence
+allocation in the invalidation log (event appends serialize under the same
+lock, key `alfiz:events`):
 
 ```ts
 const storage = prismaDriver(prisma, {

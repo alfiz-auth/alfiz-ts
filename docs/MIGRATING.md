@@ -353,3 +353,33 @@ driver-level error naming a column you never wrote.
 After that, the capabilities your old system lacked — cohort grants,
 time-bound elevation, access requests, per-resource roles — are single
 grant rows away, not features to build.
+
+## 11. Adopting the caching upgrades (0.3)
+
+Everything is opt-in; defaults reproduce the previous behavior. The only
+observable default changes are strictly improving: the object-chain cache
+is now bounded (10 000 entries) and both caches evict least-recently-used
+instead of oldest-inserted.
+
+To tighten cross-process staleness from the TTLs to a revalidation window:
+
+1. Merge the `AlfizEpoch` / `AlfizEvent` models from the Prisma fragment
+   and migrate (additive — no backfill, no seed).
+2. Turn on persistence: `createApplication({ ..., events: { persist: true } })`.
+   Multi-node deployments must already be passing a database advisory lock
+   to `prismaDriver` — event appends serialize under it too.
+3. Give clients a window: `createAlfizClient({ ..., revalidateAfterMs: 5_000 })`.
+   Quiet systems stop refetching entirely (validated TTL renewal); a write
+   anywhere propagates within one window.
+4. Serverless / large fleets, optionally: pass `cacheStore` (any
+   `CacheStore`; `respCacheStore(redisClient)` covers the RESP family) so
+   cold processes skip the closure fan-out. Private, authenticated cache
+   infrastructure only.
+5. Long-lived multi-node fleets, optionally: `startEventPoller(app)` for
+   push-like invalidation between revalidations.
+
+`notifyScopeMoved` now returns a promise (durability of the move event);
+fire-and-forget callers need no change. Custom `StorageDriver`
+implementations keep compiling — the new methods (`getRoles`, the four
+event methods) are optional, and the Application falls back or fails
+loudly (never silently) when they are absent.

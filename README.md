@@ -172,6 +172,22 @@ with destructive actions and just-in-time elevations. Nothing on your
 request path is ever metered, priced, or throttled: checks are unmeterable
 by construction.
 
+Those TTL bounds are per process. To tighten them across processes — other
+nodes, serverless invocations — turn on the **event log**: the Application
+persists its invalidation events (`events: { persist: true }`, two extra
+tables), and clients revalidate against it (`revalidateAfterMs`) with one
+constant-cost read per window that renews caches while writes are quiet and
+replays exactly the missed events when they are not. An optional shared
+cache (`cacheStore`, with a first-party adapter for any RESP-compatible
+service) gives cold processes warm closures under the same freshness rules.
+
+| Mode | Cross-process staleness bound | Steady-state cost per check |
+| --- | --- | --- |
+| TTL only (default) | subject/object TTL (30s / 60s) | 0 queries warm; full closure fetch per TTL expiry |
+| + event log & `revalidateAfterMs` | revalidation window (e.g. 5s) + one request | 0 queries warm; ONE single-row read per window, amortized over all principals |
+| + `cacheStore` (L2) | same as above | cold starts read one cache entry + one head read instead of the closure fan-out |
+| epoch unreachable (failure) | falls back to the TTL bounds | fail-closed to the database — stale data is never served past its window |
+
 ## Packages
 
 - [`@alfiz-auth/core`](packages/core) — the Client.

@@ -314,6 +314,16 @@ The two sides carry **different policies** matching their dynamics. Subject clos
 
 **Staleness is bounded and stated.** Bounded staleness means bounded over-access after a revocation (Zanzibar's "new enemy problem"). The documentation states the bound rather than implying instantaneity, and the API provides `can.fresh(...)`, which bypasses all caches. The shipped examples use `can.fresh` for destructive actions and time-bound elevations — the intended pairing with the standalone destructive leaves of §3.2.
 
+### 12.1 Revalidation and the event log
+
+The live invalidation stream never leaves the writing process, so in a multi-process deployment the TTL was the only cross-process bound — and in a serverless one, where every invocation starts cold, the caches barely applied at all. The remedy is to make the events durable: with **event persistence** on, the Application appends every invalidation event it emits to a sequenced log in the same database before the write returns, and exposes the log on the provider as `epoch` (`head()` / `since(seq)`). One single-row read — constant cost, independent of organization size, grant count, and event volume — answers "did anything change anywhere?".
+
+A client configured with a **revalidation window** passes cached reads through a freshness gate: within the window, a clock comparison; past it, one `head()` read shared by every concurrent check. An unchanged head proves every cached closure still exact, and entry TTLs are **renewed** — this is a conscious amendment to the TTL contract above: with revalidation on, the TTL is no longer the staleness bound but the *fallback* bound, and the operative bound becomes the revalidation window (plus one in-flight request). A changed head is caught up selectively: `since(cursor)` returns only the missed events, replayed through the same busting logic the live stream feeds — identical semantics, different arrival path. A cursor older than the log's retention gets a *gap* and busts everything. Renewal is generation-guarded: an entry whose fetch overlapped a replay may hold state the replay could not bust (it was not yet cached), so it keeps its original TTL rather than being renewed — the one race where renewal would otherwise unbound staleness.
+
+Failure is closed toward the database, never toward the cache: an unreadable epoch renews nothing, entries lapse on their TTLs, and misses pay full provider fetches. Under epoch failure the system degrades to exactly the pre-epoch contract, never below it.
+
+An optional **shared cache tier** (`CacheStore`) extends the same discipline to cold processes: closures — never decisions — are mirrored to an external cache under a versioned envelope stamped with the head the writer had validated. A cold process serves an entry only when the stamp equals the current head (with an epoch) or within the same TTL that bounds the in-process tier (without one); every error or mismatch is a miss. The store sits inside the server trust boundary. For long-lived multi-node deployments that want push-like latency without pub/sub infrastructure, an optional poller tails the log and re-emits foreign events locally; it is sugar over the mechanism, never the mechanism.
+
 ## 13. Enforcement and tooling (Client)
 
 ### 13.1 Check shapes and enforcement points

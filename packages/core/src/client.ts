@@ -26,6 +26,15 @@
  * must be reported via `AlfizApplication.notifyScopeMoved` (or an equivalent
  * provider event) for immediate effect — the TTL is the backstop, not the
  * mechanism.
+ *
+ * With `revalidateAfterMs` set against a provider exposing `epoch` (the
+ * persisted event log), the bounds tighten: the operative staleness bound
+ * becomes the revalidation window — one constant-cost head read per window
+ * validates both caches for every principal, renewing TTLs while writes are
+ * quiet and replaying only the missed events when they are not. The TTLs
+ * then bound staleness only when the epoch is unreachable (fail-closed to
+ * the database: unvalidated entries lapse and refetch). An optional
+ * `cacheStore` (L2) extends the same freshness rules to cold processes.
  */
 
 import type { CheckContext, CheckExplanation } from "./access.js";

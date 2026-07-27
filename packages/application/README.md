@@ -35,7 +35,27 @@ What lives here:
 - `notifyScopeMoved(scope)` — the move hook: the host application owns the
   hierarchy behind `resolveAncestors`, so it must report parent-pointer
   changes; this emits the `scope` invalidation that busts cached ancestor
-  chains immediately.
+  chains immediately. (Now async: with event persistence on, it resolves
+  once the move event is durable to other processes.)
+- **Event persistence** (`events: { persist: true }`) — every invalidation
+  event is appended to a sequenced log in your database before the write
+  returns, and exposed as `provider.epoch` — the signal clients use
+  (`revalidateAfterMs`) to revalidate their caches across processes with
+  one single-row read. Requires a driver implementing the optional event
+  methods (the memory and Prisma drivers do; construction fails loudly
+  otherwise). Retention defaults to 7 days / 100 000 rows, pruned
+  opportunistically; a client whose cursor predates retention busts
+  everything and resumes. `ingestEvents(events)` re-emits foreign events
+  into local listeners; `startEventPoller(app)` (from `events.ts`) tails
+  the log on an interval for push-like invalidation on long-lived nodes —
+  optional sugar, correctness never depends on it.
+- **Closure-supply performance** — the group-parent topology is cached
+  per Application (`groupTopologyTtlMs`, default 30s, `0` disables),
+  busted synchronously by local group writes and by ingested events, so a
+  cache miss no longer re-reads every group in the organization; roles
+  referenced by a grant set are batch-read once (`StorageDriver.getRoles`,
+  optional, with a parallel per-id fallback); independent queries run
+  concurrently.
 - `deleteSubject(subject, provenance)` / `deleteScope(scope, provenance)` —
   the deletion hooks, same discipline as moves: grants key on subject and
   scope STRINGS, so the code path that deletes a principal or a resource
