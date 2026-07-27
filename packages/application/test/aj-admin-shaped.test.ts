@@ -8,61 +8,45 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createAlfizClient, defineCatalog, parentPointerResolver, planListing } from "@alfiz-auth/core";
+import { createAlfizClient, defineCatalog, group, parentPointerResolver, planListing } from "@alfiz-auth/core";
 import { createApplication, createSession, memoryDriver } from "@alfiz-auth/application";
 
 const catalog = defineCatalog({
-  namespace: "mathaniyy",
-  additionalNamespaces: ["diploma", "admin", "groups", "payments"],
-  projects: {
-    mathaniyy: {
-      groups: {
-        approvals: {
-          permissions: {
-            read_student: true,
-            read_teacher: true,
-            decide_student: true,
-            decide_teacher: true,
-          },
-        },
-        students: {
-          permissions: { read: true, read_pii: true, update_student: true },
-        },
-      },
+  namespaces: ["mathaniyy", "diploma", "admin", "groups", "payments"],
+  permissions: [
+    {
+      "mathaniyy.approvals.read_student": true,
+      "mathaniyy.approvals.read_teacher": true,
+      "mathaniyy.approvals.decide_student": true,
+      "mathaniyy.approvals.decide_teacher": true,
     },
-    diploma: {
-      groups: {
-        applicants: {
-          permissions: { read: true, advance_stage: true, delete: true },
-        },
-      },
+    {
+      "mathaniyy.students.read": true,
+      "mathaniyy.students.read_pii": true,
+      "mathaniyy.students.update_student": true,
     },
-    admin: {
-      groups: {
-        access: { permissions: { read: true, manage_roles: true } },
-        // AJ-Admin's skip-code blanket-vs-namespaced key family becomes ONE
-        // key granted at different scopes.
-        skip_codes: {
-          permissions: {
-            read: true,
-            issue_code: { scopes: ["payments.namespace"] },
-            revoke_code: { scopes: ["payments.namespace"] },
-          },
-        },
-      },
+    {
+      "diploma.applicants.read": true,
+      "diploma.applicants.advance_stage": true,
+      "diploma.applicants.delete": true,
     },
-    groups: {
-      groups: {
-        attendance: {
-          permissions: {
-            read: { scopes: ["groups.folder"] },
-            manage_folder: { scopes: ["groups.folder"] },
-            delete: { scopes: ["groups.folder"] },
-          },
-        },
-      },
+    {
+      "admin.access.read": true,
+      "admin.access.manage_roles": true,
     },
-  },
+    // AJ-Admin's skip-code blanket-vs-namespaced key family becomes ONE key
+    // granted at different scopes.
+    group("admin.skip_codes", { scopes: ["payments.namespace"] }, {
+      "admin.skip_codes.read": { scopes: [] },
+      "admin.skip_codes.issue_code": true,
+      "admin.skip_codes.revoke_code": true,
+    }),
+    group("groups.attendance", { scopes: ["groups.folder"] }, {
+      "groups.attendance.read": true,
+      "groups.attendance.manage_folder": true,
+      "groups.attendance.delete": true,
+    }),
+  ],
   scopeTypes: {
     "groups.folder": { parent: "groups.folder" }, // folders nest in folders
     "payments.namespace": { parent: null }, // genuinely flat: chains are [scope, *]

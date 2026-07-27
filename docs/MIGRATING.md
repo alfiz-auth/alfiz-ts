@@ -13,26 +13,82 @@ you skim the rest.
 
 ## 1. Keep your keys
 
-`defineCatalog` wants `<project>.<tab>.<permission>`, and your existing keys
-already have *some* shape. Two escape hatches exist so that stored patterns
-and call sites never have to change:
+You already have a constants file of dotted key strings. `defineCatalog`
+takes exactly that — permissions are declared by their full dotted key — so
+step one is usually a paste and a reformat, with no key renamed:
 
-- **`additionalNamespaces`** — if your keys span several top-level prefixes
-  (`admin.*`, `billing.*`, `lms.*`), declare each one and give each a
-  top-level project. Your keys keep their exact spelling.
-- **`allowArbitraryDepth`** — if your keys are two or four levels deep,
-  opt out of the three-level convention instead of renaming. New keys can
-  still follow the blessed shape.
+```ts
+defineCatalog({
+  namespaces: ["admin", "billing", "lms"],
+  permissions: {
+    "admin.access.read": { kind: "read" },
+    "admin.access.manage_roles": true,
+    "billing.invoices.read": { kind: "read" },
+    // …your existing keys, verbatim
+  },
+});
+```
 
-Two catalog conveniences worth using from day one:
+Two things that stop a brownfield catalog from needing renames:
 
-- A group-level `scopes: [...]` declares the default scope types for every
-  leaf under it — declare it once per tab instead of on forty sibling
-  leaves. A leaf's own `scopes` (including an explicit `[]` for
-  global-only) overrides it.
+- **`namespaces`** — if your keys span several top-level prefixes
+  (`admin.*`, `billing.*`, `lms.*`), declare each one. Your keys keep their
+  exact spelling. Group levels are inferred from the keys themselves;
+  nothing needs declaring per tab.
+- **`conventions: { depth }`** — if your keys are two or four levels deep,
+  declare the depth you actually use (or `"any"` for a mixed catalog)
+  instead of renaming. This is a linter setting, not a structural gate: a
+  catalog that deviates still builds, and `alfiz-verify` reports the
+  deviation at build time. New keys can still follow the blessed shape.
+
+Three catalog conveniences worth using from day one:
+
+- `group("<path>", { … }, { … })` bundles one tab's keys into a named,
+  foldable block carrying its label and scope defaults. Past ~30 keys,
+  blocks are what keep the catalog readable — and because keys are
+  absolute, each block can live in its own file next to the feature it
+  gates. Small catalogs don't need them at all.
+- A group-level `scopes: [...]` (on a block, or via the `groups` map)
+  declares the default scope types for every leaf under it — declare it
+  once per tab instead of on forty sibling leaves. A leaf's own `scopes`
+  (including an explicit `[]` for global-only) overrides it.
 - `label` on leaves and groups is the short picker text; `description` is
   the longer help text. Keeping both in the catalog is what stops UI copy
   drifting into side tables.
+
+<details>
+<summary>Upgrading a 0.3.x catalog</summary>
+
+The nested `projects` → `groups` → `permissions` shape still builds and is
+deprecated, not removed. To convert, flatten each leaf to its full key:
+
+```ts
+// 0.3.x
+projects: { docs: { groups: { files: {
+  scopes: ["docs.folder"],
+  permissions: { read: true, delete: { destructive: true } },
+} } } }
+
+// 0.4.0
+permissions: [
+  group("docs.files", { scopes: ["docs.folder"] }, {
+    "docs.files.read": true,
+    "docs.files.delete": { destructive: true },
+  }),
+]
+```
+
+`namespace` + `additionalNamespaces` become `namespaces` (first is
+primary), and `allowArbitraryDepth: true` becomes
+`conventions: { depth: "any" }`. Every key, pattern, grant row, and
+published document is unchanged — this is a source-level change only.
+
+One behavior change to know about: a key at the wrong depth used to throw
+from `defineCatalog`. It is now a lint error reported by `lintCatalog` and
+failed by `alfiz-verify`, so a catalog that deviates boots and CI catches
+it. If you relied on the boot throw, keep `alfiz-verify` in CI.
+
+</details>
 
 ## 2. Everything you are migrating becomes one table
 
@@ -335,7 +391,7 @@ driver-level error naming a column you never wrote.
 
 ## 10. The checklist
 
-1. Catalog: keys unchanged (`additionalNamespaces` / `allowArbitraryDepth`),
+1. Catalog: keys unchanged (`namespaces` / `conventions: { depth }`),
    scope types declared (`parent: null` only if instances are truly flat),
    group-level `scopes` for scoped tabs.
 2. Roles imported **split**: global halves and scoped halves (§3).

@@ -5,11 +5,12 @@ data a provider supplies — no storage, no I/O.
 
 - **Grammar** (`grammar.ts`) — key/pattern validation, forward-inclusive
   subtree wildcard matching, pattern intersection.
-- **Catalog** (`catalog.ts`) — `defineCatalog`, derived template-literal key
-  and pattern types (`KeyOf`, `PatternOf`, plus `ClientOf` / `SnapshotOf`
-  for context objects), scope types, navigation wiring,
-  requestability, `lintCatalog`, the reserved `alfiz_internal.*` project,
-  `toDocument()`/`catalogFromDocument()` (the publish wire shape).
+- **Catalog** (`catalog.ts`) — `defineCatalog` (permissions declared by their
+  full dotted key; `group()` blocks to organize a large one), derived
+  template-literal key and pattern types (`KeyOf`, `PatternOf`, plus
+  `ClientOf` / `SnapshotOf` for context objects), scope types, navigation
+  wiring, requestability, `lintCatalog`, the reserved `alfiz_internal.*`
+  project, `toDocument()`/`catalogFromDocument()` (the publish wire shape).
 - **Subjects & scopes** (`subjects.ts`, `scopes.ts`) — subject ids and
   closure computation (groups, ancestors, implicit `directs:`/`orgof:`
   groups from reporting edges, orgs, `everyone`); scope ids, the

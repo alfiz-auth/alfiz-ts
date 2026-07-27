@@ -4,10 +4,45 @@
  * Declared explicitly in code — never inferred from call sites, never
  * configured in a dashboard.
  *
+ * Permissions are declared by their FULL DOTTED KEY, the same notation every
+ * check, grant, role, and nav entry uses — so a key at a call site greps
+ * straight to its declaration:
+ *
+ * ```ts
+ * defineCatalog({
+ *   namespaces: ["lms"],
+ *   permissions: {
+ *     "lms.courses.read": { kind: "read" },
+ *     "lms.courses.delete": { destructive: true },
+ *   },
+ * });
+ * ```
+ *
+ * Past a handful of keys, `group()` blocks keep the flat map from becoming a
+ * wall: each block is a named, foldable unit carrying its own label and scope
+ * defaults, and `permissions` accepts an array of them (mixed freely with
+ * bare maps). Blocks are absolute keys too, so nothing is lost:
+ *
+ * ```ts
+ * export const courses = group("lms.courses", { label: "Courses", scopes: ["lms.course"] }, {
+ *   "lms.courses.read": { kind: "read" },
+ *   "lms.courses.delete": { destructive: true },
+ * });
+ *
+ * defineCatalog({ namespaces: ["lms"], permissions: [courses, enrollments] });
+ * ```
+ *
+ * Blocks are OPTIONAL. A small catalog that declares ten keys in one flat map
+ * is a complete, idiomatic catalog; groups exist to organize large ones, not
+ * as a tax on small ones. Group levels are still folders — every dotted
+ * prefix of a declared key is a group, inferred automatically, and only leaves
+ * are grantable or checkable.
+ *
  * `defineCatalog` throws on structural invalidity (bad segments, namespace
- * violations, depth without the opt-out) — a broken catalog should fail at
- * boot. Semantic convention violations (the naming floor, style, nav wiring)
- * are reported by `lintCatalog` and enforced at build time by @alfiz-auth/verify.
+ * violations, a key that is also a group path) — a broken catalog should fail
+ * at boot. CONVENTIONS — the blessed key depth, the naming floor, style, nav
+ * wiring — are reported by `lintCatalog` and enforced at build time by
+ * @alfiz-auth/verify, never thrown at boot.
  */
 
 import { formatAlternatives } from "./errors.js";
@@ -19,6 +54,7 @@ import {
   namespaceOf,
   patternMatchesKey,
   patternsIntersect,
+  validateKey,
   validatePattern,
 } from "./grammar.js";
 import type { ScopeId, ScopeType } from "./scopes.js";
@@ -51,10 +87,10 @@ export interface PermissionLeafInput {
   /**
    * Scope types this permission is grantable at, in addition to the global
    * scope. Omitted = inherited from the nearest enclosing group that
-   * declares `scopes`, else grantable at `*` only. Declare explicitly
-   * (including `[]` for global-only) to override the inherited default.
-   * Granting at an undeclared scope type is a validation error at the
-   * write path.
+   * declares `scopes` (a `group()` block or a `groups` entry), else
+   * grantable at `*` only. Declare explicitly (including `[]` for
+   * global-only) to override the inherited default. Granting at an
+   * undeclared scope type is a validation error at the write path.
    */
   scopes?: readonly ScopeType[];
   /**
@@ -67,8 +103,17 @@ export interface PermissionLeafInput {
 
 export type LeafInput = true | PermissionLeafInput;
 
+/** A map of full dotted permission keys to their leaf declarations. */
+export type LeafMap = Record<string, LeafInput>;
+
+/**
+ * Metadata for a group path. Groups themselves are never declared into
+ * existence — every dotted prefix of a declared key IS a group. This carries
+ * only what a group adds: display copy for pickers, and the scope defaults
+ * its leaves inherit.
+ */
 export interface GroupInput {
-  /** Short human-facing name for pickers; `description` is the longer help text. */
+  /** Short human-facing name for pickers; falls back to the path segment. */
   label?: string;
   description?: string;
   /**
@@ -78,9 +123,100 @@ export interface GroupInput {
    * tab is scoped to one resource type.
    */
   scopes?: readonly ScopeType[];
-  permissions?: Record<string, LeafInput>;
-  groups?: Record<string, GroupInput>;
 }
+
+/**
+ * A named, foldable unit of a catalog: one group's metadata plus the leaves
+ * declared under it, keyed by their FULL dotted key. Produced by
+ * {@link group}; the unit that makes per-feature catalog files possible
+ * (`export const courses = group(...)`), because absolute keys compose by
+ * concatenation where nested trees would need a deep merge.
+ */
+export interface PermissionBlock<
+  P extends string = string,
+  L extends LeafMap = LeafMap,
+> {
+  readonly kind: "block";
+  readonly path: P;
+  readonly group: GroupInput;
+  readonly leaves: L;
+}
+
+/**
+ * Compile-time proof that every key in a block lives under the block's path.
+ * A stray key's VALUE slot resolves to a message string, so the error reads
+ * as the fix rather than as a structural mismatch.
+ */
+type KeysUnderPath<P extends string, L> = {
+  [K in keyof L]: K extends `${P}.${string}`
+    ? L[K]
+    : `alfiz: this key must start with "${P}."`;
+};
+
+/**
+ * Declares a group and the permissions under it. Every key must live strictly
+ * under `path` — a compile error otherwise, so the block's prefix cannot
+ * silently drift from its contents:
+ *
+ * ```ts
+ * export const courses = group("lms.courses", { label: "Courses", scopes: ["lms.course"] }, {
+ *   "lms.courses.read": { kind: "read" },
+ *   "lms.courses.publish": true,
+ * });
+ * ```
+ *
+ * Keys may be deeper than `path` (`lms.courses.drafts.read`); the
+ * intervening groups are inferred like any other.
+ */
+export function group<const P extends string, const L extends LeafMap>(
+  path: P,
+  leaves: L & KeysUnderPath<P, L>,
+): PermissionBlock<P, L>;
+export function group<const P extends string, const L extends LeafMap>(
+  path: P,
+  meta: GroupInput,
+  leaves: L & KeysUnderPath<P, L>,
+): PermissionBlock<P, L>;
+export function group(
+  path: string,
+  metaOrLeaves: GroupInput | LeafMap,
+  maybeLeaves?: LeafMap,
+): PermissionBlock {
+  const meta = (maybeLeaves === undefined ? {} : metaOrLeaves) as GroupInput;
+  const leaves = (maybeLeaves ?? metaOrLeaves) as LeafMap;
+  return { kind: "block", path, group: meta, leaves };
+}
+
+/**
+ * What `permissions` accepts: one flat map, one block, or an array mixing
+ * both. The array form is what per-feature catalog files compose into.
+ */
+export type PermissionsInput =
+  | LeafMap
+  | PermissionBlock
+  | readonly (LeafMap | PermissionBlock)[];
+
+/** The conventions `lintCatalog` (and so `alfiz-verify`) enforces. */
+export interface CatalogConventionsInput {
+  /**
+   * The blessed key depth. `3` — `<project>.<tab>.<permission>` — is the
+   * default because depth that maps to UI structure keeps permission trees
+   * comprehensible to the humans administering them. Set a different number
+   * for a shallower or deeper house style, or `"any"` to opt out.
+   *
+   * This is a CONVENTION: a violation is a lint error reported by
+   * `lintCatalog` and failed by `alfiz-verify` at build time, never a boot
+   * throw. Structural invalidity still throws.
+   */
+  depth?: number | "any";
+}
+
+export interface CatalogConventions {
+  depth: number | "any";
+}
+
+/** The default blessed key depth: `<project>.<tab>.<permission>`. */
+export const DEFAULT_KEY_DEPTH = 3;
 
 export interface ScopeTypeInput {
   description?: string;
@@ -128,34 +264,70 @@ export interface NavItemInput {
   children?: readonly NavItemInput[];
 }
 
+/**
+ * The legacy nested input shape (`projects` → `groups` → `permissions`),
+ * accepted and deprecated as of 0.4.0. See `docs/MIGRATING.md`.
+ *
+ * @deprecated Declare permissions by their full dotted key instead.
+ */
+export interface LegacyGroupInput extends GroupInput {
+  permissions?: Record<string, LeafInput>;
+  groups?: Record<string, LegacyGroupInput>;
+}
+
 export interface CatalogInput {
   /**
-   * The application's namespace — its key prefix. Required even standalone,
-   * where it is locally redundant: catalogs are federation-shaped from the
-   * first commit.
+   * The namespaces this application owns — its key prefixes. The first is the
+   * primary. Required even standalone, where it is locally redundant:
+   * catalogs are federation-shaped from the first commit.
    */
-  namespace: string;
+  namespaces?: readonly string[];
+  /**
+   * The application's primary namespace.
+   *
+   * @deprecated Use `namespaces: ["yourapp"]`.
+   */
+  namespace?: string;
   /**
    * Additional namespaces this application owns (multi-project portals).
-   * Each top-level project must be a declared namespace.
+   *
+   * @deprecated Fold into `namespaces`.
    */
   additionalNamespaces?: readonly string[];
-  /** Top-level groups — projects. Blessed shape: project → tab → permission. */
-  projects: Record<string, GroupInput>;
+  /**
+   * The permissions, keyed by their full dotted key: one flat map, one
+   * `group()` block, or an array mixing both. Groups are inferred from the
+   * keys — declaring blocks is an organizing convenience, never a
+   * requirement.
+   */
+  permissions?: PermissionsInput;
+  /**
+   * Metadata for group paths you did not declare a `group()` block for —
+   * typically the project level (`{ lms: { label: "Learning" } }`). Purely
+   * optional: an undecorated group falls back to its path segment.
+   */
+  groups?: Record<string, GroupInput>;
   scopeTypes?: Record<string, ScopeTypeInput>;
   navigation?: readonly NavItemInput[];
-  /**
-   * The blessed convention is exactly three levels. Setting this permits
-   * arbitrary depth (2-level integration catalogs like `zoom.host`, deeper
-   * nesting) — an explicit opt-out, not a default.
-   */
-  allowArbitraryDepth?: boolean;
+  /** House conventions enforced by `lintCatalog` / `alfiz-verify`. */
+  conventions?: CatalogConventionsInput;
   /**
    * Alfiz's own administration permissions ship under `alfiz_internal.*` so
    * they can never collide with the organization's needs. Included by
    * default; set false for catalogs that render no Alfiz admin surface.
    */
   includeAlfizInternal?: boolean;
+  /**
+   * Top-level groups — projects — in the legacy nested shape.
+   *
+   * @deprecated Use `permissions` with full dotted keys.
+   */
+  projects?: Record<string, LegacyGroupInput>;
+  /**
+   * @deprecated Use `conventions: { depth: "any" }`. Depth is a convention
+   * enforced by the linter, not a boot-time error.
+   */
+  allowArbitraryDepth?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -165,6 +337,24 @@ export interface CatalogInput {
 
 type StringKeys<T> = Extract<keyof T, string>;
 
+/**
+ * Every proper dotted prefix of `S`: the group paths a key implies.
+ * `"lms.courses.read"` → `"lms" | "lms.courses"`.
+ */
+type Prefixes<S extends string> = S extends `${infer Head}.${infer Rest}`
+  ? Head | `${Head}.${Prefixes<Rest>}`
+  : never;
+
+/** The keys one `permissions` entry contributes (block or bare map). */
+type EntryKeys<E> = E extends { readonly kind: "block"; readonly leaves: infer L }
+  ? StringKeys<L>
+  : StringKeys<E>;
+
+type PermissionsKeys<P> = P extends readonly unknown[]
+  ? EntryKeys<P[number]>
+  : EntryKeys<P>;
+
+/** Legacy: keys under one nested group. */
 type KeysUnder<G, Prefix extends string> =
   | (G extends { permissions?: infer P }
       ? P extends Record<string, unknown>
@@ -181,42 +371,30 @@ type KeysUnder<G, Prefix extends string> =
         : never
       : never);
 
-type GroupPathsUnder<G, Prefix extends string> =
-  | Prefix
-  | (G extends { groups?: infer S }
-      ? S extends Record<string, unknown>
-        ? string extends StringKeys<S>
-          ? `${Prefix}.${string}` // broad (non-literal) input: stop recursing
-          : {
-              [K in StringKeys<S>]: GroupPathsUnder<S[K], `${Prefix}.${K}`>;
-            }[StringKeys<S>]
-        : never
-      : never);
-
-type ProjectKeys<C extends CatalogInput> = {
-  [P in StringKeys<C["projects"]>]: KeysUnder<C["projects"][P], P>;
-}[StringKeys<C["projects"]>];
-
-type ProjectGroupPaths<C extends CatalogInput> = {
-  [P in StringKeys<C["projects"]>]: GroupPathsUnder<C["projects"][P], P>;
-}[StringKeys<C["projects"]>];
+type LegacyKeys<C extends CatalogInput> = C["projects"] extends infer PR
+  ? PR extends Record<string, unknown>
+    ? { [P in StringKeys<PR>]: KeysUnder<PR[P], P> }[StringKeys<PR>]
+    : never
+  : never;
 
 type InternalIncluded<C extends CatalogInput> =
   C["includeAlfizInternal"] extends false ? never : AlfizInternalKey;
 
-type InternalGroupsIncluded<C extends CatalogInput> =
-  C["includeAlfizInternal"] extends false ? never : AlfizInternalGroupPath;
-
 /** Every concrete permission key of catalog input `C`. */
 export type CatalogKeys<C extends CatalogInput> =
-  | ProjectKeys<C>
+  | PermissionsKeys<C["permissions"]>
+  | LegacyKeys<C>
   | InternalIncluded<C>;
 
-/** Every valid pattern of `C`: keys, group wildcards, and the bare `*`. */
+/**
+ * Every valid pattern of `C`: keys, group wildcards, and the bare `*`.
+ * Group paths are the dotted prefixes of the keys — groups are folders that
+ * exist because keys live under them, never declared into being.
+ */
 export type CatalogPatterns<C extends CatalogInput> =
   | "*"
   | CatalogKeys<C>
-  | `${ProjectGroupPaths<C> | InternalGroupsIncluded<C>}.*`;
+  | `${Prefixes<CatalogKeys<C>>}.*`;
 
 /** The scope types catalog input `C` declares, as a literal union. */
 export type CatalogScopeTypes<C extends CatalogInput> =
@@ -268,52 +446,79 @@ export type ScopeOf<Cat> = Cat extends {
  * to prevent collision with the organization's actual needs; follows the same
  * naming floor as everything else.
  */
-export const ALFIZ_INTERNAL_PROJECT = {
-  description: "Alfiz administration",
-  groups: {
-    access: {
-      description: "Roles, groups, grants, revokes, hierarchy, view-as",
-      permissions: {
-        read: { description: "View the access administration surface", kind: "read" },
-        manage_roles: { description: "Create, edit, delete roles" },
-        manage_groups: { description: "Create, edit, delete user groups and their parentage" },
-        manage_grants: { description: "Create and delete grants" },
-        manage_revokes: { description: "Create and delete personal revokes" },
-        manage_reporting: { description: "Edit reporting (manager) edges" },
-        view_as: { description: "Preview the product as a role or an individual" },
+export const ALFIZ_INTERNAL_BLOCKS = [
+  group(
+    "alfiz_internal.access",
+    { description: "Roles, groups, grants, revokes, hierarchy, view-as" },
+    {
+      "alfiz_internal.access.read": {
+        description: "View the access administration surface",
+        kind: "read",
+      },
+      "alfiz_internal.access.manage_roles": {
+        description: "Create, edit, delete roles",
+      },
+      "alfiz_internal.access.manage_groups": {
+        description: "Create, edit, delete user groups and their parentage",
+      },
+      "alfiz_internal.access.manage_grants": {
+        description: "Create and delete grants",
+      },
+      "alfiz_internal.access.manage_revokes": {
+        description: "Create and delete personal revokes",
+      },
+      "alfiz_internal.access.manage_reporting": {
+        description: "Edit reporting (manager) edges",
+      },
+      "alfiz_internal.access.view_as": {
+        description: "Preview the product as a role or an individual",
       },
     },
-    requests: {
-      description: "Access requests and approvals",
-      permissions: {
-        read: { description: "View the approvals inbox", kind: "read" },
-        decide_request: { description: "Approve or deny an access request" },
+  ),
+  group(
+    "alfiz_internal.requests",
+    { description: "Access requests and approvals" },
+    {
+      "alfiz_internal.requests.read": {
+        description: "View the approvals inbox",
+        kind: "read",
+      },
+      "alfiz_internal.requests.decide_request": {
+        description: "Approve or deny an access request",
       },
     },
-    audit: {
-      description: "The audit log",
-      permissions: {
-        read: { description: "Read the audit log", kind: "read" },
+  ),
+  group(
+    "alfiz_internal.audit",
+    { description: "The audit log" },
+    {
+      "alfiz_internal.audit.read": {
+        description: "Read the audit log",
+        kind: "read",
       },
     },
-    catalog: {
-      description: "Catalog administration",
-      permissions: {
-        read: { description: "View the published catalog", kind: "read" },
-        publish_catalog: { description: "Publish a verified catalog to the provider" },
+  ),
+  group(
+    "alfiz_internal.catalog",
+    { description: "Catalog administration" },
+    {
+      "alfiz_internal.catalog.read": {
+        description: "View the published catalog",
+        kind: "read",
+      },
+      "alfiz_internal.catalog.publish_catalog": {
+        description: "Publish a verified catalog to the provider",
       },
     },
-  },
-} as const satisfies GroupInput;
+  ),
+] as const;
 
-export type AlfizInternalKey = KeysUnder<
-  typeof ALFIZ_INTERNAL_PROJECT,
-  typeof ALFIZ_INTERNAL_NAMESPACE
->;
-export type AlfizInternalGroupPath = GroupPathsUnder<
-  typeof ALFIZ_INTERNAL_PROJECT,
-  typeof ALFIZ_INTERNAL_NAMESPACE
->;
+const ALFIZ_INTERNAL_GROUPS: Record<string, GroupInput> = {
+  [ALFIZ_INTERNAL_NAMESPACE]: { description: "Alfiz administration" },
+};
+
+export type AlfizInternalKey = EntryKeys<(typeof ALFIZ_INTERNAL_BLOCKS)[number]>;
+export type AlfizInternalGroupPath = Prefixes<AlfizInternalKey>;
 
 // ---------------------------------------------------------------------------
 // Built catalog
@@ -378,6 +583,11 @@ export interface CatalogDocument {
   groups: readonly GroupMeta[];
   scopeTypes: readonly ScopeTypeMeta[];
   navigation: readonly NavItem[];
+  /**
+   * The house conventions the linter enforces. Additive since 0.4.0 —
+   * documents written before it read back as the default depth.
+   */
+  conventions?: CatalogConventions;
 }
 
 export class CatalogError extends Error {
@@ -404,6 +614,7 @@ export interface AnyCatalog {
   readonly groups: ReadonlyMap<string, GroupMeta>;
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
+  readonly conventions: CatalogConventions;
   readonly keys: PermissionKey[];
   readonly $key: string;
   readonly $pattern: string;
@@ -429,6 +640,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
   readonly groups: ReadonlyMap<string, GroupMeta>;
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
+  readonly conventions: CatalogConventions;
 
   /** Phantom-only members carrying the derived types. Never set at runtime. */
   declare readonly $key: CatalogKeys<C>;
@@ -442,6 +654,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     groups: ReadonlyMap<string, GroupMeta>;
     scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
     navigation: readonly NavItem[];
+    conventions?: CatalogConventions;
   }) {
     this.namespace = built.namespace;
     this.namespaces = built.namespaces;
@@ -449,6 +662,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     this.groups = built.groups;
     this.scopeTypes = built.scopeTypes;
     this.navigation = built.navigation;
+    this.conventions = built.conventions ?? { depth: DEFAULT_KEY_DEPTH };
   }
 
   /** All concrete keys, sorted. */
@@ -567,6 +781,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
       groups: [...this.groups.values()],
       scopeTypes: [...this.scopeTypes.values()],
       navigation: [...this.navigation],
+      conventions: { ...this.conventions },
     };
   }
 }
@@ -586,6 +801,21 @@ const inferDestructive = (name: string): boolean =>
   name.startsWith("purge_") ||
   name === "purge";
 
+const isBlock = (value: unknown): value is PermissionBlock =>
+  typeof value === "object" &&
+  value !== null &&
+  (value as { kind?: unknown }).kind === "block";
+
+/** Every proper dotted prefix of a key, outermost first. */
+const prefixesOf = (key: string): string[] => {
+  const segments = key.split(".");
+  const out: string[] = [];
+  for (let i = 1; i < segments.length; i++) {
+    out.push(segments.slice(0, i).join("."));
+  }
+  return out;
+};
+
 export function defineCatalog<const C extends CatalogInput>(
   input: C,
 ): Catalog<C> {
@@ -593,117 +823,165 @@ export function defineCatalog<const C extends CatalogInput>(
   const err = (path: string, message: string) =>
     errors.push({ severity: "error", path, message });
 
-  const namespace = input.namespace;
-  if (!isValidSegment(namespace)) {
-    err(namespace, "namespace must be a single valid segment");
-  }
-  if (namespace === ALFIZ_INTERNAL_NAMESPACE) {
-    err(namespace, `${ALFIZ_INTERNAL_NAMESPACE} is reserved for Alfiz itself`);
-  }
-  const declared = new Set<string>([namespace]);
-  for (const extra of input.additionalNamespaces ?? []) {
-    if (!isValidSegment(extra)) err(extra, "namespace must be a single valid segment");
-    if (extra === ALFIZ_INTERNAL_NAMESPACE) {
-      err(extra, `${ALFIZ_INTERNAL_NAMESPACE} is reserved for Alfiz itself`);
-    }
-    declared.add(extra);
-  }
-
-  const includeInternal = input.includeAlfizInternal !== false;
-  const projects: Record<string, GroupInput> = { ...input.projects };
-  if (ALFIZ_INTERNAL_NAMESPACE in projects) {
+  // --- Namespaces -----------------------------------------------------------
+  const namespaceList = [
+    ...(input.namespaces ?? []),
+    ...(input.namespace !== undefined ? [input.namespace] : []),
+    ...(input.additionalNamespaces ?? []),
+  ];
+  if (namespaceList.length === 0) {
     err(
-      ALFIZ_INTERNAL_NAMESPACE,
-      `${ALFIZ_INTERNAL_NAMESPACE} is reserved and added automatically`,
+      "(catalog)",
+      'declare at least one namespace: `namespaces: ["yourapp"]` — catalogs are federation-shaped from the first commit',
     );
-    delete projects[ALFIZ_INTERNAL_NAMESPACE];
   }
-  if (includeInternal) {
-    projects[ALFIZ_INTERNAL_NAMESPACE] = ALFIZ_INTERNAL_PROJECT;
+  const declared = new Set<string>();
+  for (const ns of namespaceList) {
+    if (!isValidSegment(ns)) {
+      err(ns, "namespace must be a single valid segment");
+      continue;
+    }
+    if (ns === ALFIZ_INTERNAL_NAMESPACE) {
+      err(ns, `${ALFIZ_INTERNAL_NAMESPACE} is reserved for Alfiz itself`);
+      continue;
+    }
+    declared.add(ns);
+  }
+  const primaryNamespace = namespaceList[0] ?? "";
+
+  // --- Collect leaves and group metadata ------------------------------------
+  const leafInputs = new Map<string, PermissionLeafInput>();
+  const groupInputs = new Map<string, GroupInput>();
+
+  const addLeaf = (key: string, value: LeafInput) => {
+    if (leafInputs.has(key)) {
+      err(key, "duplicate permission key");
+      return;
+    }
+    leafInputs.set(key, value === true ? {} : value);
+  };
+
+  const addGroup = (path: string, meta: GroupInput) => {
+    const existing = groupInputs.get(path);
+    // A block's own metadata wins over a `groups` entry field by field, so a
+    // per-feature block and a root-level label can coexist without a merge
+    // order to remember.
+    groupInputs.set(path, existing ? { ...existing, ...meta } : { ...meta });
+  };
+
+  const addLeafMap = (map: LeafMap, blockPath: string | null) => {
+    for (const [key, value] of Object.entries(map)) {
+      if (blockPath !== null && !key.startsWith(`${blockPath}.`)) {
+        err(
+          key,
+          `is not under the block path ${JSON.stringify(blockPath)} — every key in a group() block starts with its path`,
+        );
+        continue;
+      }
+      addLeaf(key, value);
+    }
+  };
+
+  const entries: Array<LeafMap | PermissionBlock> = Array.isArray(
+    input.permissions,
+  )
+    ? [...(input.permissions as readonly (LeafMap | PermissionBlock)[])]
+    : input.permissions !== undefined
+      ? [input.permissions as LeafMap | PermissionBlock]
+      : [];
+  if (input.includeAlfizInternal !== false) {
+    entries.push(...ALFIZ_INTERNAL_BLOCKS);
+    for (const [path, meta] of Object.entries(ALFIZ_INTERNAL_GROUPS)) {
+      addGroup(path, meta);
+    }
+  }
+  for (const [path, meta] of Object.entries(input.groups ?? {})) {
+    addGroup(path, meta);
+  }
+  for (const entry of entries) {
+    if (isBlock(entry)) {
+      addGroup(entry.path, entry.group);
+      addLeafMap(entry.leaves, entry.path);
+    } else {
+      addLeafMap(entry, null);
+    }
   }
 
-  const leaves = new Map<PermissionKey, LeafMeta>();
-  const groups = new Map<string, GroupMeta>();
-  /** Group-declared scope defaults, validated against scopeTypes below. */
-  const groupScopeRefs: Array<{ path: string; scopes: readonly ScopeType[] }> = [];
-
-  const walk = (
-    path: string,
-    group: GroupInput,
-    inheritedScopes: readonly ScopeType[],
-  ) => {
-    // The nearest enclosing `scopes` declaration wins; leaves override last.
-    const defaultScopes = group.scopes ?? inheritedScopes;
-    if (group.scopes) groupScopeRefs.push({ path, scopes: group.scopes });
-    const childGroups: string[] = [];
-    const childLeaves: PermissionKey[] = [];
-    for (const [name, leafInput] of Object.entries(group.permissions ?? {})) {
+  // --- Legacy nested shape --------------------------------------------------
+  const walkLegacy = (path: string, node: LegacyGroupInput) => {
+    addGroup(path, {
+      ...(node.label !== undefined ? { label: node.label } : {}),
+      ...(node.description !== undefined ? { description: node.description } : {}),
+      ...(node.scopes !== undefined ? { scopes: node.scopes } : {}),
+    });
+    for (const [name, leafInput] of Object.entries(node.permissions ?? {})) {
       if (!isValidSegment(name)) {
         err(`${path}.${name}`, "invalid permission segment");
         continue;
       }
-      const key = `${path}.${name}`;
-      const leaf: PermissionLeafInput = leafInput === true ? {} : leafInput;
-      const depth = key.split(".").length;
-      if (depth !== 3 && input.allowArbitraryDepth !== true) {
-        err(
-          key,
-          `keys are <project>.<tab>.<permission> (3 levels) — this is ${depth}; set allowArbitraryDepth to opt out`,
-        );
-      }
-      if (leaves.has(key)) {
-        err(key, "duplicate permission key");
-        continue;
-      }
-      leaves.set(key, {
-        key,
-        groupPath: path,
-        name,
-        label: leaf.label,
-        description: leaf.description,
-        kind: leaf.kind ?? inferKind(name),
-        destructive: leaf.destructive ?? inferDestructive(name),
-        scopes: leaf.scopes ?? defaultScopes,
-        impliedOnAncestors: leaf.impliedOnAncestors ?? false,
-      });
-      childLeaves.push(key);
+      addLeaf(`${path}.${name}`, leafInput);
     }
-    for (const [name, sub] of Object.entries(group.groups ?? {})) {
+    for (const [name, sub] of Object.entries(node.groups ?? {})) {
       if (!isValidSegment(name)) {
         err(`${path}.${name}`, "invalid group segment");
         continue;
       }
-      const subPath = `${path}.${name}`;
-      childGroups.push(subPath);
-      walk(subPath, sub, defaultScopes);
+      walkLegacy(`${path}.${name}`, sub);
     }
-    groups.set(path, {
-      path,
-      label: group.label,
-      description: group.description,
-      groups: childGroups,
-      permissions: childLeaves,
-    });
   };
-
-  for (const [projectName, project] of Object.entries(projects)) {
+  for (const [projectName, project] of Object.entries(input.projects ?? {})) {
     if (!isValidSegment(projectName)) {
       err(projectName, "invalid project segment");
       continue;
     }
-    if (
-      projectName !== ALFIZ_INTERNAL_NAMESPACE &&
-      !declared.has(projectName)
-    ) {
+    if (projectName === ALFIZ_INTERNAL_NAMESPACE) {
       err(
-        projectName,
-        `project is not a declared namespace (namespace/additionalNamespaces) — catalogs must be federation-shaped from the first commit`,
+        ALFIZ_INTERNAL_NAMESPACE,
+        `${ALFIZ_INTERNAL_NAMESPACE} is reserved and added automatically`,
       );
+      continue;
     }
-    walk(projectName, project, []);
+    walkLegacy(projectName, project);
   }
 
-  // Scope types.
+  // --- Structural validation of keys ---------------------------------------
+  const groupPaths = new Set<string>(groupInputs.keys());
+  for (const key of leafInputs.keys()) {
+    const issue = validateKey(key);
+    if (issue !== null) {
+      err(key, issue.reason);
+      continue;
+    }
+    if (!key.includes(".")) {
+      err(
+        key,
+        "a permission key needs at least two segments — the first is its namespace, and a namespace is a group, never a permission",
+      );
+      continue;
+    }
+    const ns = namespaceOf(key);
+    if (ns !== null && ns !== ALFIZ_INTERNAL_NAMESPACE && !declared.has(ns)) {
+      err(
+        key,
+        `the first segment ${JSON.stringify(ns)} is not a declared namespace — add it to \`namespaces\`; catalogs must be federation-shaped from the first commit`,
+      );
+      continue;
+    }
+    for (const prefix of prefixesOf(key)) groupPaths.add(prefix);
+  }
+  // Groups are folders, never permissions: a key that another key extends is
+  // both, which the nested shape made impossible by construction and flat keys
+  // do not.
+  for (const key of leafInputs.keys()) {
+    if (groupPaths.has(key)) {
+      err(
+        key,
+        "is both a permission and a group path (other keys live under it) — group levels are folders, never permissions; only the leaf is grantable",
+      );
+    }
+  }
+
+  // --- Scope types ----------------------------------------------------------
   const scopeTypes = new Map<ScopeType, ScopeTypeMeta>();
   for (const [type, def] of Object.entries(input.scopeTypes ?? {})) {
     if (!isValidKey(type)) {
@@ -730,22 +1008,98 @@ export function defineCatalog<const C extends CatalogInput>(
       );
     }
   }
-  // Leaf scope references (group defaults are already resolved onto leaves).
-  for (const leaf of leaves.values()) {
-    for (const type of leaf.scopes) {
+
+  // --- Resolve leaves -------------------------------------------------------
+  /** The nearest enclosing group that declares `scopes`; leaves override last. */
+  const inheritedScopes = (key: string): readonly ScopeType[] => {
+    const prefixes = prefixesOf(key);
+    for (let i = prefixes.length - 1; i >= 0; i--) {
+      const scopes = groupInputs.get(prefixes[i]!)?.scopes;
+      if (scopes !== undefined) return scopes;
+    }
+    return [];
+  };
+
+  const leaves = new Map<PermissionKey, LeafMeta>();
+  for (const [key, leaf] of leafInputs) {
+    const segments = key.split(".");
+    const name = segments.at(-1)!;
+    const scopes = leaf.scopes ?? inheritedScopes(key);
+    for (const type of scopes) {
       if (!scopeTypes.has(type)) {
-        err(leaf.key, `references undeclared scope type ${JSON.stringify(type)}`);
+        err(key, `references undeclared scope type ${JSON.stringify(type)}`);
       }
     }
+    leaves.set(key, {
+      key,
+      groupPath: segments.slice(0, -1).join("."),
+      name,
+      label: leaf.label,
+      description: leaf.description,
+      kind: leaf.kind ?? inferKind(name),
+      destructive: leaf.destructive ?? inferDestructive(name),
+      scopes,
+      impliedOnAncestors: leaf.impliedOnAncestors ?? false,
+    });
   }
   // Group-declared defaults too — a group with no leaves must still not
   // reference a scope type nobody declared.
-  for (const ref of groupScopeRefs) {
-    for (const type of ref.scopes) {
+  for (const [path, meta] of groupInputs) {
+    for (const type of meta.scopes ?? []) {
       if (!scopeTypes.has(type)) {
-        err(ref.path, `references undeclared scope type ${JSON.stringify(type)}`);
+        err(path, `references undeclared scope type ${JSON.stringify(type)}`);
       }
     }
+  }
+
+  // --- Build groups ---------------------------------------------------------
+  // Children keep DECLARATION order — pickers and role editors render a group
+  // in the order its author wrote it (`read` before `decide`), so only the
+  // top-level maps are sorted.
+  const childGroups = new Map<string, string[]>();
+  const childLeaves = new Map<string, PermissionKey[]>();
+  const pushChild = (
+    into: Map<string, string[]>,
+    parent: string,
+    child: string,
+  ) => {
+    const existing = into.get(parent);
+    if (existing) existing.push(child);
+    else into.set(parent, [child]);
+  };
+  for (const path of groupPaths) {
+    if (!path.includes(".")) continue;
+    const parent = path.slice(0, path.lastIndexOf("."));
+    // A group whose ancestors nobody declared keys under still needs them
+    // registered; the Set is iterated live, so seeded parents are visited too.
+    groupPaths.add(parent);
+    pushChild(childGroups, parent, path);
+  }
+  for (const key of leafInputs.keys()) {
+    pushChild(childLeaves, key.slice(0, key.lastIndexOf(".")), key);
+  }
+
+  const groups = new Map<string, GroupMeta>();
+  for (const path of groupPaths) {
+    const meta = groupInputs.get(path);
+    groups.set(path, {
+      path,
+      label: meta?.label,
+      description: meta?.description,
+      groups: childGroups.get(path) ?? [],
+      permissions: childLeaves.get(path) ?? [],
+    });
+  }
+
+  // --- Conventions ----------------------------------------------------------
+  const depth =
+    input.conventions?.depth ??
+    (input.allowArbitraryDepth === true ? "any" : DEFAULT_KEY_DEPTH);
+  if (depth !== "any" && (!Number.isInteger(depth) || depth < 2)) {
+    err(
+      "(conventions)",
+      `conventions.depth must be an integer of at least 2, or "any" — got ${JSON.stringify(depth)}`,
+    );
   }
 
   // Navigation (structure only; reference validity is a lint concern).
@@ -767,15 +1121,18 @@ export function defineCatalog<const C extends CatalogInput>(
   );
 
   return new Catalog<C>({
-    namespace,
+    namespace: primaryNamespace,
     namespaces: [
       ...declared,
-      ...(includeInternal ? [ALFIZ_INTERNAL_NAMESPACE] : []),
+      ...(input.includeAlfizInternal !== false
+        ? [ALFIZ_INTERNAL_NAMESPACE]
+        : []),
     ],
     leaves: sortedLeaves,
     groups: sortedGroups,
     scopeTypes,
     navigation: buildNav(input.navigation ?? []),
+    conventions: { depth },
   });
 }
 
@@ -960,6 +1317,7 @@ export function catalogFromDocument<
     groups: new Map(document.groups.map((g) => [g.path, g])),
     scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
     navigation: document.navigation,
+    conventions: document.conventions ?? { depth: DEFAULT_KEY_DEPTH },
   });
   return built as TypedCatalog<K, P, S>;
 }
@@ -989,6 +1347,27 @@ export function lintCatalog(catalog: AnyCatalog): CatalogIssue[] {
   const issues: CatalogIssue[] = [];
   const push = (severity: "error" | "warning", path: string, message: string) =>
     issues.push({ severity, path, message });
+
+  // The blessed key depth is a CONVENTION, checked here rather than thrown at
+  // boot: a two-level integration catalog (`zoom.host`) or a deeper feature
+  // tree is a house-style decision, not a structural error.
+  const { depth } = catalog.conventions;
+  if (depth !== "any") {
+    for (const leaf of catalog.leaves.values()) {
+      const actual = leaf.key.split(".").length;
+      if (actual !== depth) {
+        push(
+          "error",
+          leaf.key,
+          `is ${actual} levels deep; this catalog's convention is ${depth} (${
+            depth === DEFAULT_KEY_DEPTH
+              ? "<project>.<tab>.<permission>"
+              : `${depth} dot-separated segments`
+          }) — set \`conventions: { depth: ${actual} }\` or \`"any"\` to opt out`,
+        );
+      }
+    }
+  }
 
   for (const group of catalog.groups.values()) {
     // A "tab" is a group that carries permissions directly.

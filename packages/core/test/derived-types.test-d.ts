@@ -24,24 +24,17 @@ import {
   catalogFromDocument,
   createAlfizClient,
   defineCatalog,
+  group,
   scopeId,
 } from "../src/index.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
+  namespaces: ["docs"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: true,
-            update_file: { scopes: ["docs.folder"] },
-            delete: { destructive: true, scopes: ["docs.folder"] },
-          },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": true,
+    "docs.files.update_file": { scopes: ["docs.folder"] },
+    "docs.files.delete": { destructive: true, scopes: ["docs.folder"] },
   },
   scopeTypes: {
     "docs.folder": { parent: "docs.folder" },
@@ -80,11 +73,56 @@ describe("derived unions stay EXACT literal unions (the anti-widening guard)", (
 
   it("a catalog with no scope types derives the global scope only", () => {
     const flat = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true } } } } },
+      permissions: { "a.t.read": true },
     });
     expectTypeOf<ScopeOf<typeof flat>>().toEqualTypeOf<"*">();
+  });
+
+  it("group() blocks and bare maps compose into one exact union", () => {
+    const composed = defineCatalog({
+      namespaces: ["lms", "zoom"],
+      includeAlfizInternal: false,
+      conventions: { depth: "any" },
+      permissions: [
+        group("lms.courses", { label: "Courses" }, {
+          "lms.courses.read": true,
+          "lms.courses.publish": true,
+        }),
+        { "zoom.host": true },
+      ],
+    });
+    expectTypeOf<KeyOf<typeof composed>>().toEqualTypeOf<
+      "lms.courses.read" | "lms.courses.publish" | "zoom.host"
+    >();
+    // Group wildcards come from the dotted prefixes of the keys — depth-neutral.
+    expectTypeOf<PatternOf<typeof composed>>().toEqualTypeOf<
+      | "*"
+      | KeyOf<typeof composed>
+      | "lms.*"
+      | "lms.courses.*"
+      | "zoom.*"
+    >();
+  });
+
+  it("a key outside its block's path is a compile error", () => {
+    group("lms.courses", {
+      // @ts-expect-error — every key in a block starts with the block path
+      "lms.enrollments.read": true,
+    });
+  });
+
+  it("the legacy nested shape still derives its exact union", () => {
+    const legacy = defineCatalog({
+      namespace: "a",
+      includeAlfizInternal: false,
+      projects: { a: { groups: { t: { permissions: { read: true, do_thing: true } } } } },
+    });
+    expectTypeOf<KeyOf<typeof legacy>>().toEqualTypeOf<"a.t.read" | "a.t.do_thing">();
+    expectTypeOf<PatternOf<typeof legacy>>().toEqualTypeOf<
+      "*" | "a.t.read" | "a.t.do_thing" | "a.*" | "a.t.*"
+    >();
   });
 });
 

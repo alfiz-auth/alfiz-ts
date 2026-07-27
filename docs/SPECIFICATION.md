@@ -102,7 +102,9 @@ Every permission key is dot-separated. The blessed convention is exactly three l
 <project>.<tab>.<permission>
 ```
 
-`<project>` and `<tab>` are group levels — folders, never permissions themselves. `<permission>` is the leaf: the only grantable, checkable unit. The Client permits arbitrary depth as an explicit opt-out, but ships three levels as the default because depth that maps to UI structure (project → section → action) keeps permission trees comprehensible to the humans administering them.
+`<project>` and `<tab>` are group levels — folders, never permissions themselves. `<permission>` is the leaf: the only grantable, checkable unit. Group levels are *inferred*: every dotted prefix of a declared key is a group, which is why depth is free and why a key that another key extends — being both a folder and a leaf — is rejected.
+
+Depth is a **convention, not a structural rule**. The Client permits any depth and ships three levels as the default because depth that maps to UI structure (project → section → action) keeps permission trees comprehensible to the humans administering them; a catalog declaring a different house style (`conventions: { depth }`) builds, and the deviation is reported by catalog lint at build time (§13.2) rather than thrown at boot. Structural invalidity — a malformed segment, an undeclared namespace, a key that is also a group path — still fails at boot.
 
 ### 3.2 Naming conventions
 
@@ -116,7 +118,9 @@ Broad-versus-narrow authority over a resource family — "may issue codes in eve
 
 ## 4. The catalog
 
-The catalog module declares the application's permission tree, scope types (§7.1), navigation wiring, per-scope-type grantability, and requestability (§9.2). It is the single source of truth for the application: template-literal types are derived from it, static verification checks call sites against it, and the administration components render from it. The catalog is authored against the Client and verified by the Client; *publishing* it is a provider operation — the Application stores it locally, the Service versions and registers it (§5). The catalog is application-domain, not organizational-domain: each application owns its namespace's catalog at every topology, which is why catalogs publish rather than promote.
+The catalog module declares the application's permission tree, scope types (§7.1), navigation wiring, per-scope-type grantability, and requestability (§9.2). It is the single source of truth for the application: template-literal types are derived from it, static verification checks call sites against it, and the administration components render from it.
+
+Permissions are declared by their **full dotted key** — the same notation every check, grant, role pattern, and navigation entry uses — so the catalog reads in the language of the system it describes and a key at a call site greps to its declaration. Grouping is an organizing affordance layered on top, never a requirement: a small catalog is one flat map of keys, and a large one is composed from `group()` blocks, each a named unit carrying one group's metadata and scope defaults. Because keys are absolute, blocks compose by concatenation rather than by structural merge, which is what makes a per-feature catalog file — declared next to the code it gates — a supported layout rather than a workaround. The catalog is authored against the Client and verified by the Client; *publishing* it is a provider operation — the Application stores it locally, the Service versions and registers it (§5). The catalog is application-domain, not organizational-domain: each application owns its namespace's catalog at every topology, which is why catalogs publish rather than promote.
 
 ## 5. Federation
 
@@ -338,7 +342,7 @@ Every action or surface gates at four points, and is not done until all four hol
 
 ### 13.2 Static verification
 
-The four-point checklist is enforced by tooling, not discipline. The Client ships build-time checks: **typed keys** via template-literal types derived from the catalog, so every key and pattern at every call site is compile-time verified; **coverage linting**, warning on catalog leaves referenced by no gate and erroring on exported server actions containing no gate at all; **gate-shape linting**, erroring on `canAny` used in server actions or route handlers; and **catalog linting**, erroring on tabs below the "read + one-permission-per-action" floor, on scope-type violations, on requestable declarations without a resolvable policy, and on missing namespace declarations. These checks are what makes the shipped convention document trustworthy for agent use: agents are exactly the users who will skip step three of four, and verification catches what convention alone would not.
+The four-point checklist is enforced by tooling, not discipline. The Client ships build-time checks: **typed keys** via template-literal types derived from the catalog, so every key and pattern at every call site is compile-time verified; **coverage linting**, warning on catalog leaves referenced by no gate and erroring on exported server actions containing no gate at all; **gate-shape linting**, erroring on `canAny` used in server actions or route handlers; and **catalog linting**, erroring on keys that deviate from the catalog's declared depth convention, on tabs below the "read + one-permission-per-action" floor, on scope-type violations, on requestable declarations without a resolvable policy, and on missing namespace declarations. The split is deliberate and load-bearing: what is structurally broken fails at boot, what is merely off-convention fails in CI — so a house style is a setting the linter enforces rather than a law the constructor imposes. These checks are what makes the shipped convention document trustworthy for agent use: agents are exactly the users who will skip step three of four, and verification catches what convention alone would not.
 
 ### 13.3 View-as
 
