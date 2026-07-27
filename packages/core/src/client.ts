@@ -37,6 +37,7 @@ import {
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
+import type { CacheStore } from "./cache.js";
 import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
@@ -92,6 +93,35 @@ export interface AlfizClientOptions {
    * exactly the pre-epoch behavior.
    */
   revalidateAfterMs?: number;
+  /**
+   * Optional shared cache tier (L2) between the in-process maps and the
+   * provider — see {@link CacheStore}. Read order is L1 → L2 → provider;
+   * the win is COLD processes (serverless invocations, fresh deploys)
+   * finding a warm closure instead of paying the full fan-out.
+   *
+   * An L2 entry is served only when provably fresh: with epoch
+   * revalidation on, only when it was written under exactly the current
+   * event-log head (any intervening write anywhere discards it — strict,
+   * and still a hit whenever writes are quiet, which is the common case);
+   * without an epoch, only within the same TTL that bounds L1. Every L2
+   * failure — errors, timeouts, unparseable or version-mismatched
+   * envelopes — is a miss, never an answer. Writes are fire-and-forget.
+   *
+   * The store holds closure data inside the server trust boundary: point
+   * it only at authenticated, private cache infrastructure.
+   */
+  cacheStore?: CacheStore;
+  /** Key prefix for L2 entries. Default "alfiz:v1:". */
+  cacheKeyPrefix?: string;
+  /**
+   * Storage TTL (ms) for L2 entries. With epoch revalidation this only
+   * bounds storage growth — freshness comes from the sequence check — so
+   * it defaults to 10 minutes; without an epoch it IS the freshness bound
+   * and defaults to the corresponding L1 TTL.
+   */
+  cacheStoreTtlMs?: number;
+  /** Observes swallowed L2 errors (metrics/logging). Failures are misses either way. */
+  onCacheStoreError?: (error: unknown) => void;
   clock?: () => number;
 }
 
@@ -219,6 +249,10 @@ export class AlfizClient<
   private lastValidatedAt = 0;
   private validationGen = 0;
   private revalidating: Promise<void> | null = null;
+  private readonly cacheStore: CacheStore | undefined;
+  private readonly cachePrefix: string;
+  private readonly cacheStoreTtl: number;
+  private readonly onCacheStoreError: ((error: unknown) => void) | undefined;
   private readonly unsubscribe: () => void;
   private readonly grantApplies: (
     key: PermissionKey,
@@ -233,6 +267,17 @@ export class AlfizClient<
     this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
     this.maxObjects = options.maxObjectCacheEntries ?? 10_000;
     this.revalidateAfter = options.revalidateAfterMs;
+    this.cacheStore = options.cacheStore;
+    this.cachePrefix = options.cacheKeyPrefix ?? "alfiz:v1:";
+    this.cacheStoreTtl =
+      options.cacheStoreTtlMs ??
+      (options.revalidateAfterMs !== undefined
+        ? 600_000
+        : Math.max(
+            options.subjectCacheTtlMs ?? 30_000,
+            options.objectCacheTtlMs ?? 60_000,
+          ));
+    this.onCacheStoreError = options.onCacheStoreError;
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
@@ -482,6 +527,94 @@ export class AlfizClient<
     }
   }
 
+  // -- the shared cache tier (L2) --------------------------------------------
+  // Envelopes are versioned JSON; `seq` is the event-log head the writer
+  // had validated when the fetch began (null when it could not vouch for
+  // one), `freshUntil` the wall-clock bound for epoch-less deployments.
+  // Every failure or mismatch on the read side is a miss — the L2 can make
+  // checks cheaper, never wronger.
+
+  private l2Fresh(envelope: {
+    v?: number;
+    seq?: number | null;
+    freshUntil?: number;
+  }): boolean {
+    if (envelope.v !== 1) return false;
+    if (this.revalidateAfter !== undefined && this.provider.epoch !== undefined) {
+      // Strict rule: written under exactly the current head, else discard.
+      // Still a hit whenever writes are quiet — the common case. (A finer
+      // rule could replay events between envelope.seq and knownSeq against
+      // just this entry; start strict, it is trivially correct.)
+      return (
+        typeof envelope.seq === "number" && envelope.seq === this.knownSeq
+      );
+    }
+    return (
+      typeof envelope.freshUntil === "number" &&
+      envelope.freshUntil > this.now()
+    );
+  }
+
+  private writeL2(key: string, envelope: Record<string, unknown>): void {
+    const store = this.cacheStore;
+    if (store === undefined) return;
+    void store
+      .set(key, JSON.stringify(envelope), this.cacheStoreTtl)
+      .catch((error) => this.onCacheStoreError?.(error));
+  }
+
+  private async subjectFromL2(
+    cacheKey: string,
+  ): Promise<SubjectAccessData | null> {
+    const store = this.cacheStore;
+    if (store === undefined) return null;
+    try {
+      const raw = await store.get(`${this.cachePrefix}sub:${cacheKey}`);
+      if (raw === null) return null;
+      const envelope = JSON.parse(raw) as {
+        v?: number;
+        seq?: number | null;
+        freshUntil?: number;
+        data?: SubjectAccessData;
+      };
+      if (!this.l2Fresh(envelope) || envelope.data === undefined) return null;
+      this.storeSubject(cacheKey, {
+        data: envelope.data,
+        expiresAt: this.now() + this.subjectTtl,
+        gen: this.validationGen,
+      });
+      return envelope.data;
+    } catch (error) {
+      this.onCacheStoreError?.(error);
+      return null;
+    }
+  }
+
+  private async objectFromL2(scope: ScopeId): Promise<ScopeId[] | null> {
+    const store = this.cacheStore;
+    if (store === undefined) return null;
+    try {
+      const raw = await store.get(`${this.cachePrefix}obj:${scope}`);
+      if (raw === null) return null;
+      const envelope = JSON.parse(raw) as {
+        v?: number;
+        seq?: number | null;
+        freshUntil?: number;
+        chain?: ScopeId[];
+      };
+      if (!this.l2Fresh(envelope) || envelope.chain === undefined) return null;
+      this.storeObject(scope, {
+        chain: envelope.chain,
+        expiresAt: this.now() + this.objectTtl,
+        gen: this.validationGen,
+      });
+      return envelope.chain;
+    } catch (error) {
+      this.onCacheStoreError?.(error);
+      return null;
+    }
+  }
+
   // -- data supply ----------------------------------------------------------
 
   /** Registers a cancellation record for an in-flight fetch on `key`. */
@@ -519,6 +652,10 @@ export class AlfizClient<
       }
       const inFlight = this.subjectInFlight.get(key);
       if (inFlight) return inFlight;
+      if (this.cacheStore) {
+        const fromL2 = await this.subjectFromL2(key);
+        if (fromL2) return fromL2;
+      }
     }
     const gen = this.validationGen;
     const { state, done } = AlfizClient.trackFetch(this.subjectFetchStates, key);
@@ -528,6 +665,14 @@ export class AlfizClient<
           data,
           expiresAt: this.now() + this.subjectTtl,
           gen,
+        });
+        this.writeL2(`${this.cachePrefix}sub:${key}`, {
+          v: 1,
+          // Vouch for a head only if no replay intervened since this fetch
+          // began — the same generation guard that gates TTL renewal.
+          seq: this.validationGen === gen ? this.knownSeq : null,
+          freshUntil: this.now() + this.subjectTtl,
+          data,
         });
       }
       return data;
@@ -557,6 +702,10 @@ export class AlfizClient<
       }
       const inFlight = this.objectInFlight.get(scope);
       if (inFlight) return inFlight;
+      if (this.cacheStore) {
+        const fromL2 = await this.objectFromL2(scope);
+        if (fromL2) return fromL2;
+      }
     }
     const gen = this.validationGen;
     const { state, done } = AlfizClient.trackFetch(this.objectFetchStates, scope);
@@ -567,6 +716,12 @@ export class AlfizClient<
             chain,
             expiresAt: this.now() + this.objectTtl,
             gen,
+          });
+          this.writeL2(`${this.cachePrefix}obj:${scope}`, {
+            v: 1,
+            seq: this.validationGen === gen ? this.knownSeq : null,
+            freshUntil: this.now() + this.objectTtl,
+            chain,
           });
         }
         return chain;
