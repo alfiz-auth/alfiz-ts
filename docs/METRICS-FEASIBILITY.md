@@ -50,22 +50,40 @@ high-cardinality dimensions. Effectively free, as conjectured.
 
 These are not blockers; they dictate the shape of the design.
 
-**The Client does no I/O** (§2.1: "The Client holds no storage and performs
-no I/O of its own"). A metrics collector with a flush timer inside
-`AlfizClient` would violate the layer rule. The conforming shape is the
-mirror image of the invalidation-event seam: the provider pushes
-invalidation events *in*; the client pushes check observations *out*
-through an injected observer. Pure aggregation (windowed counters, merge
-logic) can live in core as pure functions; the flush timer and transport
-live in the host application or the Application layer. Layer assignment
-per the §16 governing rule:
+**The Client reports; the provider stores.** §2.1's "the Client holds no
+storage and performs no I/O of its own" has never meant the Client is
+hermetic — every closure fetch is I/O *through the provider contract*.
+The conforming delivery channel for metrics is therefore the same one:
+a batch-report method on `AlfizProvider` (mirroring how audit is served
+over the contract), capability-gated by a `metrics` flag exactly like
+`audit`. The Client accumulates windowed counters **in memory only** —
+ephemeral evaluation state with the same standing as the closure caches
+(§12), never durable — because snapshot checks are synchronous and gates
+are hot, so per-check provider calls are impossible; it then delivers
+batches through the contract, and the provider owns storage and
+retention. Nothing durable ever lives client-side.
+
+This structure also buys topology-transparency for free: standalone, the
+Application stores usage locally; federated, the *Application* decides
+whether batches flow further up. Since a Client only ever attaches to its
+local Application, the Client never reports toward the Service in any
+topology — the §5 question collapses to one opt-in at the
+Application→Service boundary, exactly where the audit-stream precedent
+already sits.
+
+Beneath the contract method, a host-injectable observer remains the
+right primitive: it is the BYO-sink seam (§6) for deployments piping
+into their own metrics stack, and "batch to the provider" is simply its
+default consumer. Layer assignment per the §16 governing rule:
 
 | Piece | Home | Why |
 | --- | --- | --- |
-| Observation emission (observer option, `CheckObservation` type) | Client | Pure emission during evaluation |
-| Windowed aggregation, counter merge | Client (pure utility) | Pure functions over observations |
-| Flush scheduling, persistence, retention | Application / host | I/O and storage |
+| Observation emission (observer seam, `CheckObservation` type) | Client | Pure emission during evaluation |
+| Windowed in-memory aggregation, counter merge | Client | Ephemeral evaluation state, like closure caches |
+| Batch delivery | Provider contract (optional capability) | The Client's one sanctioned I/O channel |
+| Storage, retention, compaction | Application | Durable rows in the local database |
 | Usage read surface for admin components | Provider contract (optional capability) | Same pattern as `audit` |
+| Uplink of aggregates (opt-in) | Application → Service | Same boundary as the hosted audit stream |
 | Cross-application aggregation, hosted dashboard | Service | Cross-application vantage |
 
 **Snapshot checks are synchronous.** `snapshot.can()` is the blessed shape
@@ -174,9 +192,13 @@ Service. That converts "impossible by construction" into "we promise not
 to price it" — a real weakening of a differentiating guarantee, and it
 must be a deliberate spec amendment, not a side effect of a feature.
 
-The saving precedent already exists: the opt-in hosted audit stream
-(§2.7) — "the only data that flows up, and it is append-only history,
-never evaluated." Metrics can ride an identical posture, and the guarantee
+The Client-reports-to-provider structure (§2) contains this decision to
+a single boundary: the Client only ever delivers batches to its local
+Application, so nothing metrics-shaped can reach the Service except by
+the Application choosing to forward it. The saving precedent for that
+forwarding already exists: the opt-in hosted audit stream (§2.7) — "the
+only data that flows up, and it is append-only history, never
+evaluated." Metrics can ride an identical posture, and the guarantee
 survives in a slightly narrowed, still-honest form:
 
 1. **Opt-in per deployment**, default off. Standalone and linked-without-
@@ -240,12 +262,14 @@ No contract change, no storage, no spec change. Roughly 200–400 LOC plus
 tests. This alone unlocks per-action metrics into any existing metrics
 stack, today.
 
-**Phase 2 — Application usage store + safeguards.** `metrics` capability
-flag, optional `StorageDriver` methods (memory + Prisma), rolling per-
-grant/per-revoke buckets with batch flush and retention compaction, a
-provider read surface, and usage/warning rendering in the headless grant
-and revoke components. This is the largest in-repo phase: schema, two
-drivers, retention policy, component work. Still bounded and conventional.
+**Phase 2 — Contract delivery + Application usage store + safeguards.**
+`metrics` capability flag, the batch-report and usage-read methods on
+`AlfizProvider` (with "batch to the provider" wired up as the default
+observer consumer, per §2), optional `StorageDriver` methods (memory +
+Prisma), rolling per-grant/per-revoke buckets with retention compaction,
+and usage/warning rendering in the headless grant and revoke components.
+This is the largest in-repo phase: contract surface, schema, two drivers,
+retention policy, component work. Still bounded and conventional.
 
 **Phase 3 — Service uplink + hosted dashboard.** Rides the audit-stream
 pattern; mostly lives outside this repo. **Blocked on the §17/§18
