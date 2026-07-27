@@ -22,21 +22,15 @@ runs in-process against your catalog, your rows, and your resolver.
 import { defineCatalog, createAlfizClient, parentPointerResolver } from "@alfiz-auth/core";
 import { createApplication, memoryDriver } from "@alfiz-auth/application";
 
-// 1. The catalog: the single source of truth, in code.
+// 1. The catalog: the single source of truth, in code. Permissions are
+//    declared by their full dotted key — the same notation every check,
+//    grant, and nav entry uses, so a key greps straight to its declaration.
 export const catalog = defineCatalog({
-  namespace: "docs",
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: { scopes: ["docs.folder", "docs.doc"] },
-            update_file: { scopes: ["docs.folder", "docs.doc"] },
-            delete: { scopes: ["docs.folder"] }, // destructive: stands alone
-          },
-        },
-      },
-    },
+  namespaces: ["docs"],
+  permissions: {
+    "docs.files.read": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.update_file": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.delete": { scopes: ["docs.folder"] }, // destructive: stands alone
   },
   scopeTypes: {
     "docs.folder": { parent: null },
@@ -158,6 +152,11 @@ Alfiz is unopinionated about storage, transport, and deployment — and
   migration, and [`docs/MIGRATING.md`](docs/MIGRATING.md) walks it.
 - **The naming floor.** `<project>.<tab>.<permission>`; every tab has a
   `read`; actions are `<verb>_<noun>`; destructive actions stand alone.
+  Depth is a *convention* the linter enforces, not a structural law: a
+  two-level integration catalog (`zoom.host`) declares
+  `conventions: { depth: 2 }` and builds. Group levels are folders, inferred
+  from the keys — `group()` blocks exist to organize a large catalog, never
+  as a requirement for a small one.
 
 ## Staleness, honestly
 

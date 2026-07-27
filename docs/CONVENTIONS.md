@@ -7,9 +7,15 @@ fail the build.
 
 ## Permission keys
 
-- Shape: `<project>.<tab>.<permission>` — exactly three dot-separated levels.
+- Shape: `<project>.<tab>.<permission>` — three dot-separated levels. This is
+  a CONVENTION checked by the linter, not a structural law: a catalog with a
+  different house style declares `conventions: { depth: 2 }` (or `"any"`) and
+  builds. Structural errors — bad segments, an undeclared namespace, a key
+  that is also a group path — still throw at boot.
 - `<project>` and `<tab>` are folders, never permissions. Only the leaf is
-  grantable or checkable.
+  grantable or checkable. Group levels are INFERRED from the keys: every
+  dotted prefix of a declared key is a group. A key that another key extends
+  (`docs.files` alongside `docs.files.read`) would be both, and is an error.
 - Reads are `read`, or `read_<thing>` when a tab exposes distinct readable
   surfaces (`read` alongside `read_pii`).
 - Actions are `<verb>_<noun>`: `decide_student`, `advance_stage`, `issue_code`.
@@ -28,6 +34,39 @@ fail the build.
   `@alfiz-auth/core`. It is the single source of truth: types, verification, and
   admin UI all derive from it. Never infer permissions from call sites; never
   configure them in a dashboard.
+- Permissions are declared by their FULL DOTTED KEY, so a key at a call site
+  greps straight to its declaration:
+
+  ```ts
+  defineCatalog({
+    namespaces: ["docs"],
+    permissions: {
+      "docs.files.read": { kind: "read" },
+      "docs.files.delete": { destructive: true, scopes: ["docs.folder"] },
+    },
+  });
+  ```
+
+- Past a handful of keys, organize with `group()` blocks — each is a named,
+  foldable unit carrying its own label and scope defaults, and `permissions`
+  takes an array of them mixed freely with bare maps:
+
+  ```ts
+  export const files = group("docs.files", { label: "Files", scopes: ["docs.folder"] }, {
+    "docs.files.read": { kind: "read" },
+    "docs.files.delete": { destructive: true },
+  });
+
+  defineCatalog({ namespaces: ["docs"], permissions: [files, folders] });
+  ```
+
+  Every key in a block must start with the block's path — a compile error
+  otherwise. Because keys are absolute, blocks compose by concatenation, so a
+  large catalog splits into one file per feature (`export const files = …`
+  next to the code it gates) with no deep merge to reason about.
+- Blocks are OPTIONAL. A ten-permission app writing one flat map is a
+  complete, idiomatic catalog. Reach for `group()` when a catalog gets big
+  enough that folding and labels earn their keep — not before.
 - Adding a surface means adding its keys to the catalog FIRST. The derived
   types (`KeyOf<typeof catalog>`) then make every call site compile-checked.
 - Scope types (`docs.folder`, `docs.doc`) are declared in the catalog with

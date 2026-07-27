@@ -19,21 +19,12 @@ import { UnknownPermissionError, isUnknownPermission } from "../src/errors.js";
 import type { AlfizProvider, SubjectAccessData } from "../src/provider.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
-  additionalNamespaces: ["admin"],
+  namespaces: ["docs", "admin"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: { scopes: ["docs.folder"] },
-            update_file: { scopes: ["docs.folder"] },
-          },
-        },
-      },
-    },
-    admin: { groups: { access: { permissions: { read: true } } } },
+  permissions: {
+    "docs.files.read": { scopes: ["docs.folder"] },
+    "docs.files.update_file": { scopes: ["docs.folder"] },
+    "admin.access.read": true,
   },
   scopeTypes: { "docs.folder": { parent: null } },
 });

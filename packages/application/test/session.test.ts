@@ -46,9 +46,9 @@ describe("view-as against a catalog with no Alfiz admin surface", () => {
     // license to explode on a page that would otherwise render.
     const { app } = makeApp({
       catalog: defineCatalog({
-        namespace: "docs",
+        namespaces: ["docs"],
         includeAlfizInternal: false,
-        projects: { docs: { groups: { files: { permissions: { read: true } } } } },
+        permissions: { "docs.files.read": true },
       }),
     });
     const client = createAlfizClient({

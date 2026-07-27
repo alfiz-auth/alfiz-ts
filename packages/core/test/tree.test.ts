@@ -10,25 +10,15 @@ import {
 import type { PermTreeNode } from "../src/tree.js";
 
 const catalog = defineCatalog({
-  namespace: "mathaniyy",
-  additionalNamespaces: ["diploma"],
+  namespaces: ["mathaniyy", "diploma"],
   includeAlfizInternal: false,
-  projects: {
-    mathaniyy: {
-      groups: {
-        approvals: {
-          permissions: { read_student: true, decide_student: true },
-        },
-        schedule: {
-          permissions: { read: true, update_slot: true },
-        },
-      },
-    },
-    diploma: {
-      groups: {
-        applicants: { permissions: { read: true, advance_stage: true } },
-      },
-    },
+  permissions: {
+    "mathaniyy.approvals.read_student": true,
+    "mathaniyy.approvals.decide_student": true,
+    "mathaniyy.schedule.read": true,
+    "mathaniyy.schedule.update_slot": true,
+    "diploma.applicants.read": true,
+    "diploma.applicants.advance_stage": true,
   },
 });
 

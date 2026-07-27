@@ -1,4 +1,4 @@
-import { defineCatalog } from "@alfiz-auth/core";
+import { defineCatalog, group } from "@alfiz-auth/core";
 import type { AncestryResolver } from "@alfiz-auth/core";
 import { parentPointerResolver } from "@alfiz-auth/core";
 import { createApplication, memoryDriver } from "@alfiz-auth/application";
@@ -6,26 +6,18 @@ import type { ApplicationOptions } from "@alfiz-auth/application";
 
 export const testCatalog = () =>
   defineCatalog({
-    namespace: "docs",
-    projects: {
-      docs: {
-        groups: {
-          files: {
-            permissions: {
-              read: { scopes: ["docs.folder", "docs.doc"] },
-              update_file: { scopes: ["docs.folder", "docs.doc"] },
-              delete: { scopes: ["docs.folder"] },
-            },
-          },
-          admin: {
-            permissions: {
-              read: true,
-              manage_settings: true,
-            },
-          },
-        },
+    namespaces: ["docs"],
+    permissions: [
+      group("docs.files", { scopes: ["docs.folder", "docs.doc"] }, {
+        "docs.files.read": true,
+        "docs.files.update_file": true,
+        "docs.files.delete": { scopes: ["docs.folder"] },
+      }),
+      {
+        "docs.admin.read": true,
+        "docs.admin.manage_settings": true,
       },
-    },
+    ],
     scopeTypes: {
       // Folders nest in folders (see testParents): self-referencing parent.
       "docs.folder": {

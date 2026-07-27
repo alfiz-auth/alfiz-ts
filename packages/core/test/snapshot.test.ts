@@ -10,32 +10,15 @@ import type {
 } from "../src/provider.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
-  additionalNamespaces: ["lms"],
+  namespaces: ["docs", "lms"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: { scopes: ["docs.folder", "docs.doc"] },
-            read_listing: { scopes: ["docs.folder"], impliedOnAncestors: true },
-            update_file: { scopes: ["docs.folder", "docs.doc"] },
-            delete: { scopes: ["docs.folder"] },
-          },
-        },
-      },
-    },
-    lms: {
-      groups: {
-        courses: {
-          permissions: {
-            read: { scopes: ["lms.course"] },
-            publish_course: { scopes: ["lms.course"] },
-          },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.read_listing": { scopes: ["docs.folder"], impliedOnAncestors: true },
+    "docs.files.update_file": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.delete": { scopes: ["docs.folder"] },
+    "lms.courses.read": { scopes: ["lms.course"] },
+    "lms.courses.publish_course": { scopes: ["lms.course"] },
   },
   scopeTypes: {
     "docs.folder": { parent: "docs.folder" }, // hierarchical: folders nest

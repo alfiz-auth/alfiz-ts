@@ -1,5 +1,110 @@
 # Changelog
 
+## 0.4.0 — the catalog says what it means
+
+The catalog input was overcommitted to a shape the data model never had.
+`projects` → `groups` → `permissions` spelled out a three-level hierarchy in
+three different keywords while the built catalog, the published document, and
+every consumer of both were already flat lists of leaves and groups — and
+reading `mathaniyy.approvals.decide_student` out of that nesting meant
+traversing four levels of indentation and mentally deleting two of them. The
+key you check with was never the key you could grep for.
+
+Permissions are now declared by their **full dotted key** — the notation
+every check, grant, role pattern, and nav entry already used.
+
+```ts
+defineCatalog({
+  namespaces: ["docs"],
+  permissions: {
+    "docs.files.read": { kind: "read" },
+    "docs.files.delete": { destructive: true, scopes: ["docs.folder"] },
+  },
+});
+```
+
+Nothing about the permission grammar, the wire format, or evaluation changed.
+This is a source-level change to how a catalog is *written*.
+
+### Groups are inferred, and optional
+
+Every dotted prefix of a declared key is a group. Nothing declares them into
+existence, so depth costs nothing and a small catalog needs no grouping
+construct at all — ten keys in one flat map is a complete, idiomatic catalog.
+
+For catalogs big enough that a flat map becomes a wall, `group()` bundles one
+group's keys into a named, foldable unit carrying its label and scope
+defaults, and `permissions` accepts an array of blocks mixed freely with bare
+maps:
+
+```ts
+export const courses = group("lms.courses", { label: "Courses", scopes: ["lms.course"] }, {
+  "lms.courses.read": { kind: "read" },
+  "lms.courses.publish": true,
+});
+
+defineCatalog({ namespaces: ["lms"], permissions: [courses, enrollments] });
+```
+
+A key that does not start with its block's path is a **compile error** naming
+the fix, so a block's prefix cannot drift from its contents. And because keys
+are absolute, blocks compose by concatenation — a large catalog splits into
+one file per feature, declared next to the code it gates, with no deep merge
+to reason about. That composition is the reason for absolute keys, not a
+side effect of them.
+
+- **`namespaces: [...]`** replaces `namespace` + `additionalNamespaces` (first
+  is primary). Two lists that had to mirror the project keys by hand become
+  one.
+- **`groups: { … }`** is an optional metadata map for paths you did not write
+  a block for — typically the project level.
+- Group children keep **declaration order** in pickers and role editors, as
+  before; only the top-level maps are sorted.
+
+### Depth is a convention, not a boot error (behavior change)
+
+`defineCatalog` used to throw when a key was not exactly three levels deep,
+escapable by one global `allowArbitraryDepth` boolean. But a two-level
+integration catalog (`zoom.host`) is a house-style decision, not a structural
+error — and the module's own contract already said structural invalidity
+throws while convention violations lint. It now follows it:
+
+```ts
+conventions: { depth: 3 }      // the default
+conventions: { depth: 2 }      // an integration catalog
+conventions: { depth: "any" }  // opt out
+```
+
+A deviation is a `lintCatalog` error, failed by `alfiz-verify` in CI. If you
+relied on the boot throw, keep the verifier in CI. Structural invalidity
+still fails at boot — and gains a check flat keys make possible that nesting
+made unreachable: a key that is also a group path (`docs.files` declared
+alongside `docs.files.read`) would be both a folder and a leaf, and is
+rejected.
+
+### Breaking: the nested shape is gone
+
+Alfiz is pre-1.0 and this ships no compatibility shim. `projects`,
+`namespace`, `additionalNamespaces`, and `allowArbitraryDepth` are **removed**
+— `namespaces` and `permissions` are now required, and everything else about
+`CatalogInput` is optional.
+
+Every key, pattern, stored grant row, and published document is unchanged, so
+this is a source edit with no data migration. `docs/MIGRATING.md` has the
+conversion, which is mechanical: flatten each leaf to its full key.
+
+`CatalogDocument` gains an optional `conventions` field at the same
+`formatVersion: 1`; documents written before 0.4.0 read back at the default
+depth.
+
+### Types
+
+Deriving keys from absolute strings is materially cheaper than walking two
+sibling records per level: `CatalogKeys` is now a union of the entries' own
+key sets, and group wildcards come from a prefix-splitting template type. The
+anti-widening suite (`derived-types.test-d.ts`) covers the new surface,
+including the compile error for an out-of-block key.
+
 ## 0.3.0 — the relay seam, and caching that survives more than one process
 
 The staleness bound stops being "a TTL per process" and becomes "one

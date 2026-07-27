@@ -20,28 +20,14 @@ import {
 import type { AlfizProvider, SubjectAccessData } from "../src/provider.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
-  additionalNamespaces: ["mathaniyy"],
+  namespaces: ["docs", "mathaniyy"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: true,
-            update_file: { scopes: ["docs.folder"] },
-            delete: { scopes: ["docs.folder"] },
-          },
-        },
-      },
-    },
-    mathaniyy: {
-      groups: {
-        approvals: {
-          permissions: { read: true, decide_student: true },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": true,
+    "docs.files.update_file": { scopes: ["docs.folder"] },
+    "docs.files.delete": { scopes: ["docs.folder"] },
+    "mathaniyy.approvals.read": true,
+    "mathaniyy.approvals.decide_student": true,
   },
   scopeTypes: {
     "docs.folder": { parent: "docs.folder" },

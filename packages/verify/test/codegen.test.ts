@@ -3,16 +3,11 @@ import { defineCatalog } from "@alfiz-auth/core";
 import { generateCatalogTypes } from "../src/codegen.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
+  namespaces: ["docs"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: { read: true, update_file: true },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": true,
+    "docs.files.update_file": true,
   },
   scopeTypes: {
     "docs.folder": { parent: null },
@@ -51,9 +46,9 @@ describe("generateCatalogTypes", () => {
 
   it("honors the prefix and degrades to scope-less catalogs", () => {
     const flat = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true } } } } },
+      permissions: { "a.t.read": true },
     });
     const source = generateCatalogTypes(flat.toDocument(), { prefix: "My" });
     expect(source).toContain("export type MyKey =");
