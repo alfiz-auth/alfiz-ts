@@ -118,6 +118,28 @@ model AlfizCatalog {
   document Json
 }
 
+/// The invalidation-log head — a singleton (always id = 1). `seq` is the
+/// sequence of the newest AlfizEvent row; `prunedThrough` the newest pruned
+/// one, so readers with an older cursor learn they cannot catch up
+/// selectively. One tiny indexed read of this row answers "did anything
+/// change anywhere?" — the cross-process cache-freshness signal.
+model AlfizEpoch {
+  id            Int    @id @default(1)
+  seq           BigInt
+  prunedThrough BigInt @default(0)
+}
+
+/// Persisted invalidation events, contiguous by `seq`. The same events the
+/// in-process stream carries, durable so other processes can replay them.
+model AlfizEvent {
+  seq     BigInt @id
+  type    String
+  payload Json
+  at      BigInt
+
+  @@index([at])
+}
+
 /// Append-only audit log, ordered by `at` (epoch ms).
 model AlfizAudit {
   id     String @id

@@ -530,6 +530,91 @@ interface P7AuditDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizEpoch + AlfizEvent (the persisted invalidation log)
+// ---------------------------------------------------------------------------
+
+interface P7BigIntFieldUpdateOperationsInput {
+  set?: bigint | number;
+  increment?: bigint | number;
+  decrement?: bigint | number;
+  multiply?: bigint | number;
+  divide?: bigint | number;
+}
+
+interface P7EpochPayload {
+  id: number;
+  seq: bigint;
+  prunedThrough: bigint;
+}
+
+interface P7EpochCreateInput {
+  id?: number;
+  seq: bigint | number;
+  prunedThrough?: bigint | number;
+}
+
+interface P7EpochUpdateInput {
+  seq?: bigint | number | P7BigIntFieldUpdateOperationsInput;
+  prunedThrough?: bigint | number | P7BigIntFieldUpdateOperationsInput;
+}
+
+interface P7EpochDelegate {
+  upsert(args: {
+    where: P7AtLeast<{ id: number }, "id">;
+    create: P7EpochCreateInput;
+    update: P7EpochUpdateInput;
+    select?: unknown;
+  }): Promise<P7EpochPayload>;
+  update(args: {
+    where: P7AtLeast<{ id: number }, "id">;
+    data: P7EpochUpdateInput;
+    select?: unknown;
+  }): Promise<P7EpochPayload>;
+  findUnique(args: {
+    where: P7AtLeast<{ id: number }, "id">;
+    select?: unknown;
+  }): Promise<P7EpochPayload | null>;
+}
+
+interface P7EventPayload {
+  seq: bigint;
+  type: string;
+  payload: P7JsonValue;
+  at: bigint;
+}
+
+interface P7EventCreateManyInput {
+  seq: bigint | number;
+  type: string;
+  payload: P7JsonNullValueInput | P7InputJsonValue;
+  at: bigint | number;
+}
+
+type P7EventWhereInput = P7Where<{
+  seq?: P7BigIntFilter | bigint | number;
+  type?: P7StringFilter | string;
+  at?: P7BigIntFilter | bigint | number;
+}>;
+
+interface P7EventDelegate {
+  createMany(args: {
+    data: P7EventCreateManyInput[];
+    skipDuplicates?: boolean;
+  }): Promise<P7BatchPayload>;
+  findMany(args?: {
+    where?: P7EventWhereInput;
+    orderBy?: { seq?: P7SortOrder } | { seq?: P7SortOrder }[];
+    take?: number;
+    skip?: number;
+  }): Promise<P7EventPayload[]>;
+  findFirst(args?: {
+    where?: P7EventWhereInput;
+    orderBy?: { seq?: P7SortOrder } | { seq?: P7SortOrder }[];
+  }): Promise<P7EventPayload | null>;
+  deleteMany(args?: { where?: P7EventWhereInput }): Promise<P7BatchPayload>;
+}
+
+// ---------------------------------------------------------------------------
 // The generated client, and the assertions
 // ---------------------------------------------------------------------------
 
@@ -545,6 +630,8 @@ interface P7GeneratedClient {
   alfizRequest: P7RequestDelegate;
   alfizCatalog: P7CatalogDelegate;
   alfizAudit: P7AuditDelegate;
+  alfizEpoch: P7EpochDelegate;
+  alfizEvent: P7EventDelegate;
   // The client carries far more; extra members never break structural matching.
   $connect(): Promise<void>;
   $disconnect(): Promise<void>;
@@ -575,6 +662,16 @@ type _MembershipDelegateOk = Assert<
 type _RequestDelegateOk = Assert<IsAssignable<P7RequestDelegate, AlfizPrismaDelegates["alfizRequest"]>>;
 type _CatalogDelegateOk = Assert<IsAssignable<P7CatalogDelegate, AlfizPrismaDelegates["alfizCatalog"]>>;
 type _AuditDelegateOk = Assert<IsAssignable<P7AuditDelegate, AlfizPrismaDelegates["alfizAudit"]>>;
+type _EpochDelegateOk = Assert<
+  IsAssignable<P7EpochDelegate, NonNullable<AlfizPrismaDelegates["alfizEpoch"]>>
+>;
+type _EventDelegateOk = Assert<
+  IsAssignable<P7EventDelegate, NonNullable<AlfizPrismaDelegates["alfizEvent"]>>
+>;
+/** A client generated WITHOUT the log models must keep satisfying the bundle. */
+type _PreLogClientStillOk = Assert<
+  IsAssignable<Omit<P7GeneratedClient, "alfizEpoch" | "alfizEvent">, AlfizPrismaDelegates>
+>;
 type _ClientSatisfiesDelegates = Assert<
   IsAssignable<P7GeneratedClient, AlfizPrismaDelegates>
 >;

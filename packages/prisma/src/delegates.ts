@@ -143,7 +143,8 @@ export interface AlfizRoleCreateData {
 export interface AlfizRoleDelegate {
   create(args: { data: AlfizRoleCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRoleRecord | null>;
-  findMany(): Promise<AlfizRoleRecord[]>;
+  /** The batch read behind `getRoles`: `WHERE id IN (...)` when filtered. */
+  findMany(args?: { where?: { id?: StringWhere } }): Promise<AlfizRoleRecord[]>;
   deleteMany(args: { where: { id: string } }): Promise<unknown>;
 }
 
@@ -344,6 +345,63 @@ export interface AlfizAuditDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizEpoch + AlfizEvent (the persisted invalidation log)
+// ---------------------------------------------------------------------------
+
+export interface AlfizEpochRecord {
+  id: number;
+  seq: bigint;
+  prunedThrough: bigint;
+}
+
+export interface AlfizEpochDelegate {
+  upsert(args: {
+    where: { id: number };
+    create: { id: number; seq: bigint; prunedThrough: bigint };
+    update: Record<string, never>;
+  }): Promise<unknown>;
+  /** Atomic head advance: increment and read back in one statement. */
+  update(args: {
+    where: { id: number };
+    data:
+      | { seq: { increment: bigint } }
+      | { prunedThrough: bigint };
+  }): Promise<AlfizEpochRecord>;
+  findUnique(args: { where: { id: number } }): Promise<AlfizEpochRecord | null>;
+}
+
+export interface AlfizEventRecord {
+  seq: bigint;
+  type: string;
+  payload: unknown;
+  at: bigint;
+}
+
+export interface AlfizEventCreateData {
+  seq: bigint;
+  type: string;
+  payload: InputJsonValue;
+  at: bigint;
+}
+
+export interface AlfizEventDelegate {
+  createMany(args: { data: AlfizEventCreateData[] }): Promise<unknown>;
+  findMany(args: {
+    where: { seq: { gt: bigint } };
+    orderBy: { seq: "asc" };
+    take?: number;
+  }): Promise<AlfizEventRecord[]>;
+  /** Newest event older than a cutoff — sizing a prune without a scan. */
+  findFirst(args: {
+    where: { at: { lt: bigint } };
+    orderBy: { seq: "desc" };
+  }): Promise<AlfizEventRecord | null>;
+  deleteMany(args: { where: { seq: { lte: bigint } } }): Promise<{
+    count: number;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
 // The full delegate bundle
 // ---------------------------------------------------------------------------
 
@@ -363,4 +421,12 @@ export interface AlfizPrismaDelegates {
   alfizRequest: AlfizRequestDelegate;
   alfizCatalog: AlfizCatalogDelegate;
   alfizAudit: AlfizAuditDelegate;
+  /**
+   * OPTIONAL — present when the schema includes the AlfizEpoch/AlfizEvent
+   * models (the persisted invalidation log). A client generated without
+   * them still satisfies this interface; the driver then simply omits the
+   * event methods, and `events.persist` on the Application refuses loudly.
+   */
+  alfizEpoch?: AlfizEpochDelegate;
+  alfizEvent?: AlfizEventDelegate;
 }

@@ -33,6 +33,15 @@
  * must be reported via `AlfizApplication.notifyScopeMoved` (or an equivalent
  * provider event) for immediate effect — the TTL is the backstop, not the
  * mechanism.
+ *
+ * With `revalidateAfterMs` set against a provider exposing `epoch` (the
+ * persisted event log), the bounds tighten: the operative staleness bound
+ * becomes the revalidation window — one constant-cost head read per window
+ * validates both caches for every principal, renewing TTLs while writes are
+ * quiet and replaying only the missed events when they are not. The TTLs
+ * then bound staleness only when the epoch is unreachable (fail-closed to
+ * the database: unvalidated entries lapse and refetch). An optional
+ * `cacheStore` (L2) extends the same freshness rules to cold processes.
  */
 
 import type { CheckContext, CheckExplanation } from "./access.js";
@@ -44,6 +53,7 @@ import {
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
+import type { CacheStore } from "./cache.js";
 import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
@@ -51,6 +61,7 @@ import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
 import type {
   AlfizProvider,
+  InvalidationEvent,
   PrincipalRef,
   SubjectAccessData,
 } from "./provider.js";
@@ -75,19 +86,72 @@ export interface AlfizClientOptions {
    * bounds staleness when a move was never reported. Default 60s.
    */
   objectCacheTtlMs?: number;
-  /** Maximum cached principals before oldest entries are evicted. Default 10 000. */
+  /** Maximum cached principals before least-recently-used entries are evicted. Default 10 000. */
   maxSubjectCacheEntries?: number;
+  /** Maximum cached object chains before least-recently-used entries are evicted. Default 10 000. */
+  maxObjectCacheEntries?: number;
+  /**
+   * Epoch revalidation window (ms): how long a validation of the provider's
+   * event log (`provider.epoch`) vouches for the caches. Within the window,
+   * hits are pure memory. Past it, the next check performs ONE tiny
+   * `epoch.head()` read — shared by every concurrent check, its cost
+   * independent of organization size. An unchanged head proves nothing
+   * changed anywhere, and entry TTLs are RENEWED; a changed head replays
+   * only the missed events through the same busting logic the live stream
+   * feeds. Effective cross-process staleness becomes ~this window instead
+   * of the blind TTL; the TTL remains the fallback bound whenever the
+   * epoch is unreadable (fail-closed: unvalidated entries expire and
+   * refetch, stale data is never served past its window on error).
+   *
+   * Requires a provider exposing `epoch` (the Application's
+   * `events.persist`); silently inert otherwise. 5 000 is a good default
+   * for most deployments. Off (undefined) by default — TTL-only caching,
+   * exactly the pre-epoch behavior.
+   */
+  revalidateAfterMs?: number;
+  /**
+   * Optional shared cache tier (L2) between the in-process maps and the
+   * provider — see {@link CacheStore}. Read order is L1 → L2 → provider;
+   * the win is COLD processes (serverless invocations, fresh deploys)
+   * finding a warm closure instead of paying the full fan-out.
+   *
+   * An L2 entry is served only when provably fresh: with epoch
+   * revalidation on, only when it was written under exactly the current
+   * event-log head (any intervening write anywhere discards it — strict,
+   * and still a hit whenever writes are quiet, which is the common case);
+   * without an epoch, only within the same TTL that bounds L1. Every L2
+   * failure — errors, timeouts, unparseable or version-mismatched
+   * envelopes — is a miss, never an answer. Writes are fire-and-forget.
+   *
+   * The store holds closure data inside the server trust boundary: point
+   * it only at authenticated, private cache infrastructure.
+   */
+  cacheStore?: CacheStore;
+  /** Key prefix for L2 entries. Default "alfiz:v1:". */
+  cacheKeyPrefix?: string;
+  /**
+   * Storage TTL (ms) for L2 entries. With epoch revalidation this only
+   * bounds storage growth — freshness comes from the sequence check — so
+   * it defaults to 10 minutes; without an epoch it IS the freshness bound
+   * and defaults to the corresponding L1 TTL.
+   */
+  cacheStoreTtlMs?: number;
+  /** Observes swallowed L2 errors (metrics/logging). Failures are misses either way. */
+  onCacheStoreError?: (error: unknown) => void;
   clock?: () => number;
 }
 
 interface SubjectCacheEntry {
   data: SubjectAccessData;
   expiresAt: number;
+  /** The validation generation this entry was fetched under — see `validationGen`. */
+  gen: number;
 }
 
 interface ObjectCacheEntry {
   chain: ScopeId[];
   expiresAt: number;
+  gen: number;
 }
 
 const principalKey = (p: PrincipalRef): string =>
@@ -156,20 +220,61 @@ export class AlfizClient<
   private readonly subjectTtl: number;
   private readonly objectTtl: number;
   private readonly maxSubjects: number;
+  private readonly maxObjects: number;
   private readonly now: () => number;
   private readonly subjectCache = new Map<string, SubjectCacheEntry>();
   private readonly objectCache = new Map<ScopeId, ObjectCacheEntry>();
   /**
-   * Bust-during-fetch protection: every invalidation bumps the generation
-   * for the affected key; a fetch only stores its result if no bust landed
-   * while it was in flight.
+   * Secondary indexes over the caches, so invalidation events bust in
+   * O(affected entries) instead of scanning every entry: subject id →
+   * cache keys whose closure contains it; role id → cache keys whose data
+   * references it; scope → cached scopes whose chain passes through it.
+   * Maintained exclusively by the store/drop pairs below — eviction and
+   * busting share them, so the indexes can never drift from the caches.
    */
-  private readonly subjectGen = new Map<string, number>();
-  private readonly objectGen = new Map<ScopeId, number>();
+  private readonly closureIndex = new Map<string, Set<string>>();
+  private readonly roleIndex = new Map<string, Set<string>>();
+  private readonly chainIndex = new Map<ScopeId, Set<ScopeId>>();
+  /**
+   * Bust-during-fetch protection: every in-flight fetch registers a
+   * cancellation record; a bust marks the key's records cancelled, and a
+   * fetch stores its result only if its own record survived. Records remove
+   * themselves on settle, so memory is bounded by in-flight fetches — not,
+   * as with the generation counters this replaces, by every key ever busted.
+   */
+  private readonly subjectFetchStates = new Map<
+    string,
+    Set<{ cancelled: boolean }>
+  >();
+  private readonly objectFetchStates = new Map<
+    ScopeId,
+    Set<{ cancelled: boolean }>
+  >();
   private readonly subjectInFlight = new Map<
     string,
     Promise<SubjectAccessData>
   >();
+  private readonly objectInFlight = new Map<ScopeId, Promise<ScopeId[]>>();
+  /**
+   * Epoch revalidation state. `knownSeq` is the newest event sequence this
+   * client has accounted for (null before first contact); `validationGen`
+   * increments whenever a replay (or gap bust) lands, and every cache entry
+   * records the generation its fetch STARTED under. A validation renews
+   * only entries fetched entirely within the current generation: an entry
+   * whose fetch overlapped a replay may have read pre-event state the
+   * replay could not bust (it was not yet cached, so no index covered it),
+   * so it keeps its original TTL — bounded staleness, exactly the
+   * pre-epoch contract — instead of being renewed indefinitely.
+   */
+  private readonly revalidateAfter: number | undefined;
+  private knownSeq: number | null = null;
+  private lastValidatedAt = 0;
+  private validationGen = 0;
+  private revalidating: Promise<void> | null = null;
+  private readonly cacheStore: CacheStore | undefined;
+  private readonly cachePrefix: string;
+  private readonly cacheStoreTtl: number;
+  private readonly onCacheStoreError: ((error: unknown) => void) | undefined;
   private readonly unsubscribe: () => void;
   private readonly grantApplies: (
     key: PermissionKey,
@@ -182,6 +287,19 @@ export class AlfizClient<
     this.subjectTtl = options.subjectCacheTtlMs ?? 30_000;
     this.objectTtl = options.objectCacheTtlMs ?? 60_000;
     this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
+    this.maxObjects = options.maxObjectCacheEntries ?? 10_000;
+    this.revalidateAfter = options.revalidateAfterMs;
+    this.cacheStore = options.cacheStore;
+    this.cachePrefix = options.cacheKeyPrefix ?? "alfiz:v1:";
+    this.cacheStoreTtl =
+      options.cacheStoreTtlMs ??
+      (options.revalidateAfterMs !== undefined
+        ? 600_000
+        : Math.max(
+            options.subjectCacheTtlMs ?? 30_000,
+            options.objectCacheTtlMs ?? 60_000,
+          ));
+    this.onCacheStoreError = options.onCacheStoreError;
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
@@ -195,93 +313,389 @@ export class AlfizClient<
       this.check(principal, key, scope, true);
     this.can = can;
 
-    this.unsubscribe = this.provider.onInvalidate((event) => {
-      switch (event.type) {
-        case "user":
-          this.bustSubject(`u:${event.userId}`);
-          break;
-        case "subject":
-          for (const [cacheKey, entry] of this.subjectCache) {
-            if (entry.data.closure.includes(event.subject)) {
-              this.bustSubject(cacheKey);
-            }
-          }
-          break;
-        case "scope":
-          // Object chains bust immediately on move: the moved scope's own
-          // chain, and every cached chain passing through it.
-          this.bustObject(event.scope);
-          for (const [cached, entry] of this.objectCache) {
-            if (entry.chain.includes(event.scope)) this.bustObject(cached);
-          }
-          break;
-        case "role":
-          // Role definitions ride inside subject data; bust conservatively.
-          for (const [cacheKey, entry] of this.subjectCache) {
-            if (entry.data.roles.some((r) => r.id === event.roleId)) {
-              this.bustSubject(cacheKey);
-            }
-          }
-          break;
-        case "catalog":
-        case "all":
-          for (const cacheKey of [...this.subjectCache.keys()]) {
-            this.bustSubject(cacheKey);
-          }
-          for (const scope of [...this.objectCache.keys()]) {
-            this.bustObject(scope);
-          }
-          break;
-      }
-    });
+    this.unsubscribe = this.provider.onInvalidate((event) =>
+      this.applyInvalidation(event),
+    );
+  }
+
+  /**
+   * The single event → cache-entry mapping. The live provider stream feeds
+   * it directly; anything replaying persisted events (cross-process
+   * revalidation) must produce identical busts, so both run through here.
+   */
+  private applyInvalidation(event: InvalidationEvent): void {
+    switch (event.type) {
+      case "user":
+        this.bustSubject(`u:${event.userId}`);
+        break;
+      case "subject":
+        for (const cacheKey of [
+          ...(this.closureIndex.get(event.subject) ?? []),
+        ]) {
+          this.bustSubject(cacheKey);
+        }
+        break;
+      case "scope":
+        // Object chains bust immediately on move: the moved scope's own
+        // chain, and every cached chain passing through it.
+        this.bustObject(event.scope);
+        for (const cached of [...(this.chainIndex.get(event.scope) ?? [])]) {
+          this.bustObject(cached);
+        }
+        break;
+      case "role":
+        // Role definitions ride inside subject data; bust conservatively.
+        for (const cacheKey of [...(this.roleIndex.get(event.roleId) ?? [])]) {
+          this.bustSubject(cacheKey);
+        }
+        break;
+      case "catalog":
+      case "all":
+        for (const cacheKey of [...this.subjectCache.keys()]) {
+          this.bustSubject(cacheKey);
+        }
+        for (const scope of [...this.objectCache.keys()]) {
+          this.bustObject(scope);
+        }
+        break;
+    }
+  }
+
+  // -- cache maintenance ----------------------------------------------------
+  // All cache and index mutation goes through these four: store on fetch,
+  // drop on eviction, bust (drop + cancel in-flight) on invalidation.
+
+  private storeSubject(cacheKey: string, entry: SubjectCacheEntry): void {
+    this.dropSubject(cacheKey);
+    this.subjectCache.set(cacheKey, entry);
+    for (const subject of entry.data.closure) {
+      let keys = this.closureIndex.get(subject);
+      if (keys === undefined) this.closureIndex.set(subject, (keys = new Set()));
+      keys.add(cacheKey);
+    }
+    for (const role of entry.data.roles) {
+      let keys = this.roleIndex.get(role.id);
+      if (keys === undefined) this.roleIndex.set(role.id, (keys = new Set()));
+      keys.add(cacheKey);
+    }
+    // Bounded cache: evict least-recently-used (hits refresh recency, so
+    // Map insertion order IS recency order).
+    while (this.subjectCache.size > this.maxSubjects) {
+      const oldest = this.subjectCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropSubject(oldest);
+    }
+  }
+
+  private dropSubject(cacheKey: string): void {
+    const entry = this.subjectCache.get(cacheKey);
+    if (entry === undefined) return;
+    this.subjectCache.delete(cacheKey);
+    for (const subject of entry.data.closure) {
+      const keys = this.closureIndex.get(subject);
+      if (keys === undefined) continue;
+      keys.delete(cacheKey);
+      if (keys.size === 0) this.closureIndex.delete(subject);
+    }
+    for (const role of entry.data.roles) {
+      const keys = this.roleIndex.get(role.id);
+      if (keys === undefined) continue;
+      keys.delete(cacheKey);
+      if (keys.size === 0) this.roleIndex.delete(role.id);
+    }
+  }
+
+  private storeObject(scope: ScopeId, entry: ObjectCacheEntry): void {
+    this.dropObject(scope);
+    this.objectCache.set(scope, entry);
+    for (const ancestor of entry.chain) {
+      let scopes = this.chainIndex.get(ancestor);
+      if (scopes === undefined) this.chainIndex.set(ancestor, (scopes = new Set()));
+      scopes.add(scope);
+    }
+    while (this.objectCache.size > this.maxObjects) {
+      const oldest = this.objectCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.dropObject(oldest);
+    }
+  }
+
+  private dropObject(scope: ScopeId): void {
+    const entry = this.objectCache.get(scope);
+    if (entry === undefined) return;
+    this.objectCache.delete(scope);
+    for (const ancestor of entry.chain) {
+      const scopes = this.chainIndex.get(ancestor);
+      if (scopes === undefined) continue;
+      scopes.delete(scope);
+      if (scopes.size === 0) this.chainIndex.delete(ancestor);
+    }
   }
 
   private bustSubject(cacheKey: string): void {
-    this.subjectCache.delete(cacheKey);
-    this.subjectGen.set(cacheKey, (this.subjectGen.get(cacheKey) ?? 0) + 1);
+    this.dropSubject(cacheKey);
+    for (const state of this.subjectFetchStates.get(cacheKey) ?? []) {
+      state.cancelled = true;
+    }
   }
 
   private bustObject(scope: ScopeId): void {
-    this.objectCache.delete(scope);
-    this.objectGen.set(scope, (this.objectGen.get(scope) ?? 0) + 1);
+    this.dropObject(scope);
+    for (const state of this.objectFetchStates.get(scope) ?? []) {
+      state.cancelled = true;
+    }
   }
 
   /** Detach from the provider's invalidation stream and drop caches. */
   close(): void {
     this.unsubscribe();
-    this.subjectCache.clear();
-    this.objectCache.clear();
-    this.subjectGen.clear();
-    this.objectGen.clear();
+    for (const cacheKey of [...this.subjectCache.keys()]) {
+      this.bustSubject(cacheKey);
+    }
+    for (const scope of [...this.objectCache.keys()]) {
+      this.bustObject(scope);
+    }
+    for (const states of this.subjectFetchStates.values()) {
+      for (const state of states) state.cancelled = true;
+    }
+    for (const states of this.objectFetchStates.values()) {
+      for (const state of states) state.cancelled = true;
+    }
+  }
+
+  // -- epoch revalidation ----------------------------------------------------
+
+  /**
+   * The freshness gate on every cached read. `undefined` when there is
+   * nothing to await — feature off, or within the revalidation window — so
+   * the hot path stays a synchronous clock comparison. Past the window it
+   * hands back ONE shared revalidation, coalesced across every concurrent
+   * check, validating BOTH caches for every principal at once. See
+   * {@link AlfizClientOptions.revalidateAfterMs} for the contract.
+   */
+  private maybeValidate(): Promise<void> | undefined {
+    const epoch = this.provider.epoch;
+    if (this.revalidateAfter === undefined || epoch === undefined) {
+      return undefined;
+    }
+    if (
+      this.knownSeq !== null &&
+      this.now() - this.lastValidatedAt <= this.revalidateAfter
+    ) {
+      return undefined;
+    }
+    if (this.revalidating) return this.revalidating;
+    const run = this.revalidate(epoch).finally(() => {
+      this.revalidating = null;
+    });
+    this.revalidating = run;
+    return run;
+  }
+
+  private async revalidate(epoch: NonNullable<AlfizProvider["epoch"]>): Promise<void> {
+    try {
+      const head = await epoch.head();
+      if (this.knownSeq === null) {
+        // First contact happens before anything can be cached (this gate
+        // precedes every cached read), so there is nothing to catch up on.
+        this.knownSeq = head;
+      } else if (head < this.knownSeq) {
+        // A head behind our cursor means the log was reset or restored:
+        // there is no sequence to catch up along. Full bust, start over.
+        this.applyInvalidation({ type: "all" });
+        this.knownSeq = head;
+        this.validationGen++;
+      } else if (head !== this.knownSeq) {
+        let cursor = this.knownSeq;
+        let caughtUp = false;
+        while (!caughtUp) {
+          const result = await epoch.since(cursor);
+          if ("gap" in result) {
+            // The cursor predates retention: selective catch-up is no
+            // longer possible, so everything cached is suspect.
+            this.applyInvalidation({ type: "all" });
+            cursor = await epoch.head();
+            break;
+          }
+          for (const event of result.events) this.applyInvalidation(event);
+          caughtUp = result.upTo <= cursor || result.events.length === 0;
+          cursor = Math.max(cursor, result.upTo);
+          if (cursor >= head) caughtUp = true;
+        }
+        this.knownSeq = cursor;
+        this.validationGen++;
+      }
+      // Validation-renewable TTLs: entries fetched entirely within the
+      // current generation are proven exact as of this instant. Entries
+      // from older generations keep their original expiry (see the field
+      // comment on `validationGen`).
+      const validatedAt = this.now();
+      this.lastValidatedAt = validatedAt;
+      for (const entry of this.subjectCache.values()) {
+        if (entry.gen === this.validationGen) {
+          entry.expiresAt = validatedAt + this.subjectTtl;
+        }
+      }
+      for (const entry of this.objectCache.values()) {
+        if (entry.gen === this.validationGen) {
+          entry.expiresAt = validatedAt + this.objectTtl;
+        }
+      }
+    } catch {
+      // Fail closed to the DATABASE, not to the cache: an unreadable epoch
+      // renews nothing, so entries lapse on their original TTL and the
+      // next miss pays a full provider fetch. Retry next window.
+      this.lastValidatedAt = this.now();
+    }
+  }
+
+  // -- the shared cache tier (L2) --------------------------------------------
+  // Envelopes are versioned JSON; `seq` is the event-log head the writer
+  // had validated when the fetch began (null when it could not vouch for
+  // one), `freshUntil` the wall-clock bound for epoch-less deployments.
+  // Every failure or mismatch on the read side is a miss — the L2 can make
+  // checks cheaper, never wronger.
+
+  private l2Fresh(envelope: {
+    v?: number;
+    seq?: number | null;
+    freshUntil?: number;
+  }): boolean {
+    if (envelope.v !== 1) return false;
+    if (this.revalidateAfter !== undefined && this.provider.epoch !== undefined) {
+      // Strict rule: written under exactly the current head, else discard.
+      // Still a hit whenever writes are quiet — the common case. (A finer
+      // rule could replay events between envelope.seq and knownSeq against
+      // just this entry; start strict, it is trivially correct.)
+      return (
+        typeof envelope.seq === "number" && envelope.seq === this.knownSeq
+      );
+    }
+    return (
+      typeof envelope.freshUntil === "number" &&
+      envelope.freshUntil > this.now()
+    );
+  }
+
+  private writeL2(key: string, envelope: Record<string, unknown>): void {
+    const store = this.cacheStore;
+    if (store === undefined) return;
+    void store
+      .set(key, JSON.stringify(envelope), this.cacheStoreTtl)
+      .catch((error) => this.onCacheStoreError?.(error));
+  }
+
+  private async subjectFromL2(
+    cacheKey: string,
+  ): Promise<SubjectAccessData | null> {
+    const store = this.cacheStore;
+    if (store === undefined) return null;
+    try {
+      const raw = await store.get(`${this.cachePrefix}sub:${cacheKey}`);
+      if (raw === null) return null;
+      const envelope = JSON.parse(raw) as {
+        v?: number;
+        seq?: number | null;
+        freshUntil?: number;
+        data?: SubjectAccessData;
+      };
+      if (!this.l2Fresh(envelope) || envelope.data === undefined) return null;
+      this.storeSubject(cacheKey, {
+        data: envelope.data,
+        expiresAt: this.now() + this.subjectTtl,
+        gen: this.validationGen,
+      });
+      return envelope.data;
+    } catch (error) {
+      this.onCacheStoreError?.(error);
+      return null;
+    }
+  }
+
+  private async objectFromL2(scope: ScopeId): Promise<ScopeId[] | null> {
+    const store = this.cacheStore;
+    if (store === undefined) return null;
+    try {
+      const raw = await store.get(`${this.cachePrefix}obj:${scope}`);
+      if (raw === null) return null;
+      const envelope = JSON.parse(raw) as {
+        v?: number;
+        seq?: number | null;
+        freshUntil?: number;
+        chain?: ScopeId[];
+      };
+      if (!this.l2Fresh(envelope) || envelope.chain === undefined) return null;
+      this.storeObject(scope, {
+        chain: envelope.chain,
+        expiresAt: this.now() + this.objectTtl,
+        gen: this.validationGen,
+      });
+      return envelope.chain;
+    } catch (error) {
+      this.onCacheStoreError?.(error);
+      return null;
+    }
   }
 
   // -- data supply ----------------------------------------------------------
+
+  /** Registers a cancellation record for an in-flight fetch on `key`. */
+  private static trackFetch<K>(
+    states: Map<K, Set<{ cancelled: boolean }>>,
+    key: K,
+  ): { state: { cancelled: boolean }; done: () => void } {
+    const state = { cancelled: false };
+    let set = states.get(key);
+    if (set === undefined) states.set(key, (set = new Set()));
+    set.add(state);
+    return {
+      state,
+      done: () => {
+        set.delete(state);
+        if (set.size === 0 && states.get(key) === set) states.delete(key);
+      },
+    };
+  }
 
   private async subjectData(
     principal: PrincipalRef,
     fresh: boolean,
   ): Promise<SubjectAccessData> {
     const key = principalKey(principal);
-    const now = this.now();
     if (!fresh) {
+      const gate = this.maybeValidate();
+      if (gate) await gate;
       const cached = this.subjectCache.get(key);
-      if (cached && cached.expiresAt > now) return cached.data;
+      if (cached && cached.expiresAt > this.now()) {
+        // Refresh recency: Map insertion order doubles as the LRU order.
+        this.subjectCache.delete(key);
+        this.subjectCache.set(key, cached);
+        return cached.data;
+      }
       const inFlight = this.subjectInFlight.get(key);
       if (inFlight) return inFlight;
+      if (this.cacheStore) {
+        const fromL2 = await this.subjectFromL2(key);
+        if (fromL2) return fromL2;
+      }
     }
-    const generation = this.subjectGen.get(key) ?? 0;
+    const gen = this.validationGen;
+    const { state, done } = AlfizClient.trackFetch(this.subjectFetchStates, key);
     const fetching = this.provider.getSubjectAccess(principal).then((data) => {
-      if ((this.subjectGen.get(key) ?? 0) === generation) {
-        this.subjectCache.set(key, {
+      if (!state.cancelled) {
+        this.storeSubject(key, {
           data,
           expiresAt: this.now() + this.subjectTtl,
+          gen,
         });
-        // Bounded cache: evict oldest entries (Map preserves insertion order).
-        while (this.subjectCache.size > this.maxSubjects) {
-          const oldest = this.subjectCache.keys().next().value;
-          if (oldest === undefined) break;
-          this.subjectCache.delete(oldest);
-        }
+        this.writeL2(`${this.cachePrefix}sub:${key}`, {
+          v: 1,
+          // Vouch for a head only if no replay intervened since this fetch
+          // began — the same generation guard that gates TTL renewal.
+          seq: this.validationGen === gen ? this.knownSeq : null,
+          freshUntil: this.now() + this.subjectTtl,
+          data,
+        });
       }
       return data;
     });
@@ -289,6 +703,7 @@ export class AlfizClient<
     try {
       return await fetching;
     } finally {
+      done();
       this.subjectInFlight.delete(key);
     }
   }
@@ -298,20 +713,49 @@ export class AlfizClient<
     fresh: boolean,
   ): Promise<ScopeId[]> {
     if (scope === undefined || scope === GLOBAL_SCOPE) return [GLOBAL_SCOPE];
-    const now = this.now();
     if (!fresh) {
+      const gate = this.maybeValidate();
+      if (gate) await gate;
       const cached = this.objectCache.get(scope);
-      if (cached && cached.expiresAt > now) return cached.chain;
+      if (cached && cached.expiresAt > this.now()) {
+        this.objectCache.delete(scope);
+        this.objectCache.set(scope, cached);
+        return cached.chain;
+      }
+      const inFlight = this.objectInFlight.get(scope);
+      if (inFlight) return inFlight;
+      if (this.cacheStore) {
+        const fromL2 = await this.objectFromL2(scope);
+        if (fromL2) return fromL2;
+      }
     }
-    const generation = this.objectGen.get(scope) ?? 0;
-    const chain = await objectClosureOf(scope, this.provider.resolveAncestors);
-    if ((this.objectGen.get(scope) ?? 0) === generation) {
-      this.objectCache.set(scope, {
-        chain,
-        expiresAt: this.now() + this.objectTtl,
-      });
+    const gen = this.validationGen;
+    const { state, done } = AlfizClient.trackFetch(this.objectFetchStates, scope);
+    const resolving = objectClosureOf(scope, this.provider.resolveAncestors).then(
+      (chain) => {
+        if (!state.cancelled) {
+          this.storeObject(scope, {
+            chain,
+            expiresAt: this.now() + this.objectTtl,
+            gen,
+          });
+          this.writeL2(`${this.cachePrefix}obj:${scope}`, {
+            v: 1,
+            seq: this.validationGen === gen ? this.knownSeq : null,
+            freshUntil: this.now() + this.objectTtl,
+            chain,
+          });
+        }
+        return chain;
+      },
+    );
+    if (!fresh) this.objectInFlight.set(scope, resolving);
+    try {
+      return await resolving;
+    } finally {
+      done();
+      this.objectInFlight.delete(scope);
     }
-    return chain;
   }
 
   // -- checks ---------------------------------------------------------------

@@ -32,6 +32,19 @@ data a provider supplies — no storage, no I/O.
   an undeclared key or pattern raises `UnknownPermissionError` (a
   programming error: map it to 500, never 403) instead of being evaluated,
   which is what keeps a misspelled gate from passing for wildcard holders.
+  Both caches are LRU-bounded; `subject`/`role`/`scope` events bust in
+  O(affected entries) via secondary indexes, and in-flight fetches
+  coalesce and honor busts that land mid-flight.
+- **Cache tiers** (`cache.ts` + client options) — `revalidateAfterMs`
+  turns on epoch revalidation against a provider that persists its
+  invalidation events (`provider.epoch`): one constant-cost head read per
+  window validates both caches for every principal, renews TTLs while
+  writes are quiet, and replays only the missed events when they are not.
+  `cacheStore` plugs in a shared L2 (`CacheStore` — three string-valued
+  methods, zero dependencies) so cold processes find warm closures;
+  `respCacheStore(client)` adapts any RESP-family client (node-redis or
+  ioredis call shape — Redis, Valkey, KeyDB, Dragonfly, ElastiCache,
+  Upstash) structurally, no dependency added.
 - **Snapshot** (`snapshot.ts`) — `client.snapshot(principal)`: one provider
   round-trip, then SYNCHRONOUS `can`/`canAny`/`require*`/`holds`/`heldKeys`
   over one consistent instant — the pattern for server-rendered frameworks,

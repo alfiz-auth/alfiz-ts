@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — caching that survives more than one process
+
+The staleness bound stops being "a TTL per process" and becomes "one
+revalidation window, any number of processes" — opt-in, with defaults
+byte-identical to 0.2.2 (except two strict improvements: the object-chain
+cache is now bounded, and both client caches evict LRU).
+
+### The event log (cross-process invalidation)
+
+- `events: { persist: true }` on the Application appends every
+  invalidation event to a sequenced log (`AlfizEpoch` + `AlfizEvent`,
+  additive Prisma fragment) before the write returns, exposed as
+  `provider.epoch { head, since }`. Retention defaults to 7d / 100k rows.
+- `revalidateAfterMs` on the client: past the window, ONE constant-cost
+  head read (coalesced across concurrent checks) validates both caches
+  for every principal — unchanged head renews TTLs, changed head replays
+  only the missed events, gaps bust everything. Generation-guarded
+  renewal keeps fetch/replay races TTL-bounded. Fail-closed: an
+  unreachable epoch degrades to exactly the old TTL contract.
+- `ingestEvents` + `startEventPoller` — push-like invalidation for
+  long-lived nodes, optional sugar over the same log.
+
+### The shared cache tier (serverless cold starts)
+
+- `CacheStore` (three string-valued methods, zero dependencies) as an L2:
+  read order L1 → L2 → provider; entries served only under exactly the
+  current log head (or within the TTL, epoch-less); every error is a
+  miss. `respCacheStore` adapts node-redis/ioredis call shapes
+  structurally — first-party support for the whole RESP family.
+
+### The miss path, fixed
+
+- `getSubjectAccess` no longer scans the entire group table per miss (the
+  topology map is cached with `groupTopologyTtlMs`, busted synchronously
+  by group writes), fetches each referenced role once — batched via the
+  optional `StorageDriver.getRoles` — instead of twice serially, and
+  overlaps independent queries.
+
+### Client cache hygiene
+
+- Object-chain cache bounded (`maxObjectCacheEntries`, 10k); LRU
+  eviction on both caches; O(affected) event busting via secondary
+  indexes; in-flight coalescing for chain resolution; bust-during-fetch
+  state now self-pruning instead of growing per busted key.
+- `notifyScopeMoved` returns a promise (resolves when the move event is
+  durable). All other new surface is optional; custom drivers compile
+  unchanged.
+
+## 0.2.2 — typed end to end, errors that carry their fix
 ## Unreleased — one name per question, on every surface
 
 The check surface is the same set of questions it was; what changed is that
