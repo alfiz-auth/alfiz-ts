@@ -303,7 +303,12 @@ export class AlfizSnapshot<
     }
   }
 
-  /** Throwing form of `canAny` — project-root visibility. */
+  /**
+   * Throwing form of `canAny`, and exactly as narrow: the page-top
+   * visibility guard on a page that still gates its own read with
+   * `require`. Never an action gate — the verifier errors on it in server
+   * actions and route handlers.
+   */
   requireAny(pattern: P): void {
     this.assertPattern(pattern);
     if (!this.canAny(pattern)) {

@@ -39,13 +39,13 @@ fail the build.
 
 An action or surface is NOT done until all four hold:
 
-1. **Page**: `requirePermission(<read key>)` at the top; project roots also
+1. **Page**: `require(<read key>)` at the top; project roots also
    guard visibility with `requireAny("<project>.*")`, but still gate their
    own read.
 2. **Navigation**: the nav item's `permission` field in the catalog — a
    concrete key, an any-of array of keys, or a pattern.
 3. **Server action / route handler**: `gateAction(<key>)` /
-   `requirePermission(<key>)` before any work. Bundled actions touching
+   `require(<key>)` before any work. Bundled actions touching
    several surfaces gate EACH field path on its own permission.
 4. **Conditional UI**: `can(<key>)` around every button and panel.
 
@@ -53,19 +53,31 @@ All four accept scoped forms taking a scope instance id (`docs.doc:123`).
 
 ## Check shapes — which to use where
 
+One name per question, on every surface: the client, the snapshot, the
+session, and the session snapshot all spell each check shape identically.
+If you know the question, you know the method name.
+
 - `can(subject, key, scope?)` — the ONLY shape usable as a gate. Accepts an
   any-of array of keys where a surface is legitimately reachable under
-  multiple permissions.
+  multiple permissions. NO SCOPE MEANS THE GLOBAL SCOPE — "may they do this
+  everywhere?", the strictest check, NOT "may they do this anywhere?"; the
+  anywhere question is `holds`.
+- `require(subject, key, scope?)` — the throwing form of `can`, for page
+  tops, actions, and route handlers.
 - `canAny(subject, pattern)` — visibility affordance ONLY: whether to show a
   nav entry, a project root, a settings icon. NEVER a gate. The verifier
   errors on `canAny`/`requireAny` in a server action or route handler.
-- `require*` — the throwing forms of both.
+- `requireAny(subject, pattern)` — the throwing form of `canAny`, and
+  exactly as narrow: it exists for ONE pattern — the page-top visibility
+  guard (`requireAny("<project>.*")` → your 404/redirect) on a page that
+  still gates its own read with `require`. Never an action gate.
 - `can.fresh(...)` — bypasses all caches. REQUIRED pairing for destructive
   actions (`delete` leaves) and time-bound elevations.
-- `holdsAnywhere(subject, key)` — "does this key exist for them at ANY
-  scope": the right question for unscoped conditional UI under scoped
-  grants (the button exists; the action still gates at its concrete scope).
-  Never a gate.
+- `holds(subject, key)` — "does this key exist for them at ANY scope": the
+  right question for unscoped conditional UI under scoped grants (the
+  button exists; the action still gates at its concrete scope). Never a
+  gate — the verifier errors on `holds` in a server action or route
+  handler. `heldKeys` is its many-key form (the whole held set at once).
 
 Every check is verified against the catalog before it is evaluated. A key
 or pattern the catalog does not declare raises `UnknownPermissionError` —
@@ -145,6 +157,12 @@ snap.heldKeys / snap.holds(key)                     // "held anywhere" probes
 - Audit attribution always uses the actor, never the previewed subject.
 - Starting a preview requires `alfiz_internal.access.view_as`; stopping one
   is never gated.
+- Render paths under view-as follow the SAME one-snapshot-per-request rule:
+  `const snap = await session.snapshot()`, then synchronous `can` /
+  `canAny` / `require*` / `holds` / `heldKeys` — every answer is the
+  actor ∩ preview intersection. `snapshot({ scopes })` and
+  `snap.resolve(rowScopes)` pre-resolve hierarchical targets for both
+  identities at once.
 
 ## Service-to-service
 

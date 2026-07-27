@@ -164,7 +164,7 @@ describe("AccessDeniedError attribution", () => {
   it("names the principal and points at explain()", async () => {
     const client = createAlfizClient({ catalog, provider: providerWith([]) });
     const err = await client
-      .requirePermission({ userId: "u1" }, "docs.files.read")
+      .require({ userId: "u1" }, "docs.files.read")
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(AccessDeniedError);
     expect((err as AccessDeniedError).principal).toEqual({ userId: "u1" });
