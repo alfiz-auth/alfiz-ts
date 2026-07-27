@@ -14,6 +14,7 @@ import type {
   AuditEvent,
   CatalogDocument,
   GrantRow,
+  InvalidationEvent,
   RevokeRow,
   RoleRecord,
   ScopeId,
@@ -118,6 +119,42 @@ export interface StorageDriver {
   // -- audit ----------------------------------------------------------------
   appendAudit(event: AuditEvent): Promise<void>;
   listAudit(filter?: AuditFilter): Promise<AuditEvent[]>;
+
+  // -- invalidation events (OPTIONAL — the persisted-event log) -------------
+  // Implementing all four enables `events.persist` on the Application: the
+  // same invalidation events the in-process stream carries, durable with a
+  // monotonic sequence, so OTHER processes can revalidate their caches with
+  // one tiny read (`headSeq`) instead of trusting a TTL. Sequence numbers
+  // are contiguous and assigned by the driver under `runExclusive`.
+
+  /**
+   * Appends `events` (in order) at the head of the log, atomically advancing
+   * the sequence. Returns the sequence of the last appended event.
+   */
+  appendEvents?(
+    events: readonly InvalidationEvent[],
+    at: number,
+  ): Promise<{ upTo: number }>;
+  /** The sequence of the newest persisted event; 0 when the log is empty. */
+  headSeq?(): Promise<number>;
+  /**
+   * Events with sequence greater than `seq`, oldest first, at most `limit`.
+   * `{ gap: true }` when `seq` predates retention (pruned away) — the
+   * caller must fall back to a full bust.
+   */
+  eventsSince?(
+    seq: number,
+    limit: number,
+  ): Promise<{ upTo: number; events: InvalidationEvent[] } | { gap: true }>;
+  /**
+   * Deletes events older than `cutoff.at` (epoch ms) and/or beyond the
+   * newest `cutoff.keepRows`, recording the pruned-through sequence so
+   * `eventsSince` can report gaps. Returns the number deleted.
+   */
+  pruneEvents?(cutoff: {
+    at?: number | undefined;
+    keepRows?: number | undefined;
+  }): Promise<number>;
 
   /**
    * Serialize graph writes: two concurrent edge insertions can each be

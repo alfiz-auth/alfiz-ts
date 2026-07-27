@@ -1,14 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { driverContractCases } from "../../application/test/driver-suite.js";
+import {
+  driverContractCases,
+  eventLogContractCases,
+} from "../../application/test/driver-suite.js";
 import { prismaDriver } from "../src/index.js";
 import { mockDelegates } from "./mock-delegates.js";
 
 describe("prismaDriver passes the storage contract", () => {
-  for (const testCase of driverContractCases) {
+  for (const testCase of [...driverContractCases, ...eventLogContractCases]) {
     it(testCase.name, async () => {
       await testCase.run(prismaDriver(mockDelegates()));
     });
   }
+});
+
+describe("prismaDriver without the event models", () => {
+  it("omits the event methods when alfizEpoch/alfizEvent are absent", () => {
+    const db = mockDelegates() as Partial<
+      ReturnType<typeof mockDelegates>
+    > & { alfizEpoch?: unknown; alfizEvent?: unknown };
+    delete db.alfizEpoch;
+    delete db.alfizEvent;
+    const driver = prismaDriver(db as never);
+    expect(driver.appendEvents).toBeUndefined();
+    expect(driver.headSeq).toBeUndefined();
+    expect(driver.eventsSince).toBeUndefined();
+    expect(driver.pruneEvents).toBeUndefined();
+  });
 });
 
 describe("prismaDriver mapping specifics", () => {

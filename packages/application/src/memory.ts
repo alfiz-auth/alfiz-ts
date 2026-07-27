@@ -9,6 +9,7 @@ import type {
   AuditEvent,
   CatalogDocument,
   GrantRow,
+  InvalidationEvent,
   RevokeRow,
   RoleRecord,
   UserGroup,
@@ -44,6 +45,10 @@ export function memoryDriver(): StorageDriver {
   const audit: AuditEvent[] = [];
   let catalog: { version: number; document: CatalogDocument } | null = null;
   const locks = new Map<string, Promise<unknown>>();
+  const events: Array<{ seq: number; event: InvalidationEvent; at: number }> =
+    [];
+  let eventSeq = 0;
+  let prunedThrough = 0;
 
   return {
     async insertGrant(row) {
@@ -177,6 +182,42 @@ export function memoryDriver(): StorageDriver {
       }
       const limit = filter?.limit ?? rows.length;
       return rows.slice(-limit).map(clone);
+    },
+
+    async appendEvents(toAppend, at) {
+      for (const event of toAppend) {
+        events.push({ seq: ++eventSeq, event: clone(event), at });
+      }
+      return { upTo: eventSeq };
+    },
+    async headSeq() {
+      return eventSeq;
+    },
+    async eventsSince(seq, limit) {
+      if (seq < prunedThrough) return { gap: true };
+      const matched = events.filter((e) => e.seq > seq).slice(0, limit);
+      return {
+        upTo: matched.length > 0 ? matched[matched.length - 1]!.seq : seq,
+        events: matched.map((e) => clone(e.event)),
+      };
+    },
+    async pruneEvents(cutoff) {
+      let pruneUpTo = 0;
+      if (cutoff.at !== undefined) {
+        for (const e of events) {
+          if (e.at < cutoff.at && e.seq > pruneUpTo) pruneUpTo = e.seq;
+        }
+      }
+      if (cutoff.keepRows !== undefined) {
+        pruneUpTo = Math.max(pruneUpTo, eventSeq - cutoff.keepRows);
+      }
+      if (pruneUpTo <= prunedThrough) return 0;
+      const before = events.length;
+      let index = 0;
+      while (index < events.length && events[index]!.seq <= pruneUpTo) index++;
+      events.splice(0, index);
+      prunedThrough = pruneUpTo;
+      return before - events.length;
     },
 
     async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {

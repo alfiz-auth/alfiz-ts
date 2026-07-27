@@ -17,6 +17,7 @@ import type {
   AuditEvent,
   CatalogDocument,
   CheckContext,
+  EpochSource,
   GrantInput,
   GrantQuery,
   GrantRow,
@@ -89,6 +90,32 @@ export interface ApplicationOptions {
    * 30s; `0` disables the cache and restores the per-miss scan.
    */
   groupTopologyTtlMs?: number | undefined;
+  /**
+   * Persist invalidation events to storage with a monotonic sequence,
+   * exposing them as `provider.epoch` — the cross-process cache-freshness
+   * signal. In-process listeners get every event either way; persistence is
+   * what lets OTHER processes (other nodes, serverless invocations)
+   * revalidate their caches with one tiny read instead of waiting out a
+   * TTL. Requires a driver implementing the optional event methods
+   * (`appendEvents`/`headSeq`/`eventsSince`/`pruneEvents`); construction
+   * throws when they are missing, because silently degrading a freshness
+   * guarantee is worse than failing loudly. Default off.
+   */
+  events?:
+    | {
+        persist: true;
+        /**
+         * Event retention: entries older than `maxAgeMs` (default 7 days)
+         * or beyond the newest `maxRows` (default 100 000) are pruned
+         * opportunistically. A client whose cursor predates retention gets
+         * a gap and does a full bust — retention only needs to cover the
+         * longest interval between one client's revalidations.
+         */
+        retention?:
+          | { maxAgeMs?: number | undefined; maxRows?: number | undefined }
+          | undefined;
+      }
+    | undefined;
   clock?: (() => number) | undefined;
   ids?: (() => string) | undefined;
 }
@@ -156,6 +183,8 @@ export class AlfizApplication<
 {
   readonly catalog: AnyCatalog;
   readonly resolveAncestors: AncestryResolver;
+  /** Present when `events.persist` is on — see {@link EpochSource}. */
+  readonly epoch: EpochSource | undefined;
 
   private readonly storage: StorageDriver;
   private readonly orgRoot: boolean;
@@ -171,6 +200,16 @@ export class AlfizApplication<
     null;
   /** Bust-during-fetch protection for the topology cache. */
   private groupTopologyGen = 0;
+  private readonly persistEvents: boolean;
+  private readonly eventRetention: { maxAgeMs: number; maxRows: number };
+  /**
+   * Events emitted by the write in progress, awaiting persistence. Writes
+   * flush (append + clear) before returning, so "the write returned"
+   * implies "other processes can learn about it" — matching the audit
+   * log's position in the write path.
+   */
+  private readonly pendingEvents: InvalidationEvent[] = [];
+  private appendsSincePrune = 0;
 
   constructor(options: ApplicationOptions) {
     this.catalog = options.catalog;
@@ -180,6 +219,34 @@ export class AlfizApplication<
     this.newId = options.ids ?? randomUUID;
     this.resolveAncestors = options.ancestry ?? (() => []);
     this.groupTopologyTtl = options.groupTopologyTtlMs ?? 30_000;
+    this.persistEvents = options.events?.persist ?? false;
+    this.eventRetention = {
+      maxAgeMs: options.events?.retention?.maxAgeMs ?? 7 * 24 * 3600_000,
+      maxRows: options.events?.retention?.maxRows ?? 100_000,
+    };
+    if (this.persistEvents) {
+      const { storage } = this;
+      if (
+        !storage.appendEvents ||
+        !storage.headSeq ||
+        !storage.eventsSince ||
+        !storage.pruneEvents
+      ) {
+        // Fail loudly: silently running without persistence would let every
+        // OTHER process serve stale access it believes it can revalidate.
+        throw new ProviderWriteRejectedError(
+          "events.persist requires a storage driver implementing appendEvents, headSeq, eventsSince, and pruneEvents",
+          "unsupported",
+        );
+      }
+      this.epoch = {
+        head: () => storage.headSeq!.call(storage),
+        since: (seq, limit) =>
+          storage.eventsSince!.call(storage, seq, limit ?? 500),
+      };
+    } else {
+      this.epoch = undefined;
+    }
   }
 
   // -- events ---------------------------------------------------------------
@@ -200,7 +267,58 @@ export class AlfizApplication<
       this.groupTopology = null;
       this.groupTopologyGen++;
     }
+    if (this.persistEvents) this.pendingEvents.push(event);
     for (const listener of this.listeners) listener(event);
+  }
+
+  /**
+   * Persist events buffered by the write in progress. Called at the end of
+   * every emitting public write — after the rows, like the audit entry, and
+   * awaited for the same reason: a durable row whose invalidation was lost
+   * would stay live in every other process's cache until an unrelated event
+   * busts it. On append failure the batch is restored for the next flush to
+   * retry, and the error surfaces to the caller.
+   */
+  private async flushEvents(): Promise<void> {
+    if (!this.persistEvents || this.pendingEvents.length === 0) return;
+    const batch = this.pendingEvents.splice(0);
+    try {
+      await this.storage.appendEvents!(batch, this.now());
+    } catch (error) {
+      this.pendingEvents.unshift(...batch);
+      throw error;
+    }
+    // Opportunistic retention pruning, off the write path's critical
+    // guarantees: a failed prune costs disk, not correctness.
+    if (++this.appendsSincePrune >= 32) {
+      this.appendsSincePrune = 0;
+      void this.storage
+        .pruneEvents!({
+          at: this.now() - this.eventRetention.maxAgeMs,
+          keepRows: this.eventRetention.maxRows,
+        })
+        .catch(() => undefined);
+    }
+  }
+
+  /**
+   * Re-emit events read from ANOTHER process's writes (via `epoch.since`,
+   * typically by the event poller) into this Application's local listener
+   * stream, so attached clients and the topology cache bust as if the write
+   * were local. Ingested events are never re-persisted — they are already
+   * in the log.
+   */
+  ingestEvents(events: readonly InvalidationEvent[]): void {
+    for (const event of events) {
+      if (
+        event.type === "all" ||
+        (event.type === "subject" && event.subject.startsWith("group:"))
+      ) {
+        this.groupTopology = null;
+        this.groupTopologyGen++;
+      }
+      for (const listener of this.listeners) listener(event);
+    }
   }
 
   private emitSubject(subject: SubjectId): void {
@@ -217,10 +335,13 @@ export class AlfizApplication<
    * invalidation event that busts cached ancestor chains immediately —
    * "moving a sensitive document into a restricted folder must take effect
    * at once". Without it, staleness is bounded only by the client's
-   * object-chain TTL.
+   * object-chain TTL. With event persistence on, the returned promise
+   * resolves once the event is durable (other processes can see it);
+   * fire-and-forget callers keep the local-bust behavior either way.
    */
-  notifyScopeMoved(scope: LooseScopeId<S>): void {
+  async notifyScopeMoved(scope: LooseScopeId<S>): Promise<void> {
     this.emit({ type: "scope", scope });
+    await this.flushEvents();
   }
 
   private async audit(
@@ -575,6 +696,7 @@ export class AlfizApplication<
       expiresAt: row.expiresAt,
     });
     this.emitSubject(row.subject);
+    await this.flushEvents();
     return row;
   }
 
@@ -607,6 +729,7 @@ export class AlfizApplication<
     for (const subject of new Set(rows.map((r) => r.subject))) {
       this.emitSubject(subject);
     }
+    await this.flushEvents();
     return rows;
   }
 
@@ -633,6 +756,7 @@ export class AlfizApplication<
       subject: row.subject,
     });
     this.emitSubject(row.subject);
+    await this.flushEvents();
   }
 
   async listGrants(filter?: GrantQuery): Promise<GrantRow[]> {
@@ -687,6 +811,7 @@ export class AlfizApplication<
       scope: row.scope,
     });
     this.emit({ type: "user", userId: row.userId });
+    await this.flushEvents();
     return row;
   }
 
@@ -711,6 +836,7 @@ export class AlfizApplication<
       userId: row.userId,
     });
     this.emit({ type: "user", userId: row.userId });
+    await this.flushEvents();
   }
 
   async listRevokes(filter?: {
@@ -818,6 +944,7 @@ export class AlfizApplication<
       ...(cancelledRequests > 0 ? { cancelledRequests } : {}),
     });
     for (const member of sweep) this.emitSubject(member);
+    await this.flushEvents();
     return { deletedGrants: grants.length, deletedRevokes: revokes.length };
   }
 
@@ -886,6 +1013,7 @@ export class AlfizApplication<
     for (const userId of new Set(revokes.map((r) => r.userId))) {
       this.emit({ type: "user", userId });
     }
+    await this.flushEvents();
     return { deletedGrants: grants.length, deletedRevokes: revokes.length };
   }
 
@@ -1089,6 +1217,7 @@ export class AlfizApplication<
       expiresAt: row.expiresAt,
     });
     this.emitSubject(row.subject);
+    await this.flushEvents();
     return row;
   }
 
@@ -1268,6 +1397,7 @@ export class AlfizApplication<
       version,
     });
     this.emit({ type: "catalog" });
+    await this.flushEvents();
     return { version };
   }
 
@@ -1330,6 +1460,7 @@ export class AlfizApplication<
     await this.storage.upsertRole(role);
     await this.audit(provenance, "role.create", role.id, { name: role.name });
     this.emit({ type: "role", roleId: role.id });
+    await this.flushEvents();
     return role;
   }
 
@@ -1362,6 +1493,7 @@ export class AlfizApplication<
     await this.storage.upsertRole(updated);
     await this.audit(provenance, "role.update", roleId, { name: updated.name });
     this.emit({ type: "role", roleId });
+    await this.flushEvents();
     return updated;
   }
 
@@ -1389,6 +1521,7 @@ export class AlfizApplication<
     await this.storage.deleteRole(roleId);
     await this.audit(provenance, "role.delete", roleId);
     this.emit({ type: "role", roleId });
+    await this.flushEvents();
   }
 
   async listGroups(): Promise<UserGroup[]> {
@@ -1435,6 +1568,7 @@ export class AlfizApplication<
         name: group.name,
       });
       this.emitSubject(`group:${group.id}`);
+      await this.flushEvents();
       return group;
     });
   }
@@ -1505,6 +1639,7 @@ export class AlfizApplication<
       await this.storage.upsertGroup(updated);
       await this.audit(provenance, "group.set_parents", groupId, { parents });
       this.emitSubject(`group:${groupId}`);
+      await this.flushEvents();
       return updated;
     });
   }
@@ -1552,6 +1687,7 @@ export class AlfizApplication<
       });
       this.emitSubject(subject);
       for (const userId of members) this.emit({ type: "user", userId });
+      await this.flushEvents();
     });
   }
 
@@ -1580,6 +1716,7 @@ export class AlfizApplication<
     await this.storage.upsertUser({ ...user, groupIds: [...new Set(groupIds)] });
     await this.audit(provenance, "user.set_groups", userId, { groupIds });
     this.emit({ type: "user", userId });
+    await this.flushEvents();
   }
 
   async getGroupMembers(groupId: string): Promise<string[]> {
@@ -1612,6 +1749,7 @@ export class AlfizApplication<
     await this.storage.upsertUser({ ...user, active });
     await this.audit(provenance, "user.set_active", userId, { active });
     this.emit({ type: "user", userId });
+    await this.flushEvents();
   }
 
   async setReportingEdge(
@@ -1684,6 +1822,7 @@ export class AlfizApplication<
         this.emit({ type: "subject", subject: `directs:${m}` });
         this.emit({ type: "subject", subject: `orgof:${m}` });
       }
+      await this.flushEvents();
     });
   }
 
@@ -1769,6 +1908,7 @@ export class AlfizApplication<
         copiedGrants: copies.length,
       });
       this.emitSubject(parentSubject);
+      await this.flushEvents();
     });
   }
 
@@ -1938,6 +2078,7 @@ export class AlfizApplication<
       warnings: warnings.length,
     });
     this.emit({ type: "all" });
+    await this.flushEvents();
     return { warnings, virtualParents };
   }
 }

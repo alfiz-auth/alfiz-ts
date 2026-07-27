@@ -24,6 +24,7 @@ import type {
   AuditEvent,
   CatalogDocument,
   GrantRow,
+  InvalidationEvent,
   Provenance,
   RequestDecision,
   RevokeRow,
@@ -41,6 +42,8 @@ import type {
 import type {
   AlfizAuditCreateData,
   AlfizAuditRecord,
+  AlfizEpochDelegate,
+  AlfizEventDelegate,
   AlfizGrantCreateData,
   AlfizGrantRecord,
   AlfizGrantWhere,
@@ -245,6 +248,17 @@ export function prismaDriver(
 ): StorageDriver {
   const externalLock = options?.lock;
   const locks = new Map<string, Promise<unknown>>();
+
+  const exclusive = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
+    if (externalLock !== undefined) return externalLock(key, fn);
+    const previous = locks.get(key) ?? Promise.resolve();
+    const next = previous.then(fn, fn);
+    locks.set(
+      key,
+      next.catch(() => undefined),
+    );
+    return next;
+  };
 
   /**
    * The grant where-clause, shared by list and count so the two can never
@@ -553,16 +567,110 @@ export function prismaDriver(
       return rows.map(auditFromDb);
     },
 
+    // -- invalidation events --------------------------------------------------
+    // Included only when the schema carries the AlfizEpoch/AlfizEvent models
+    // (both delegates present), so clients generated from the pre-log
+    // fragment keep working and `events.persist` fails loudly instead of
+    // silently. Sequence allocation is an atomic increment on the singleton
+    // epoch row, serialized under the events lock — which, like graph
+    // writes, must be a DATABASE advisory lock in multi-node deployments.
+    ...(db.alfizEpoch !== undefined && db.alfizEvent !== undefined
+      ? eventMethods(db.alfizEpoch, db.alfizEvent, exclusive)
+      : {}),
+
     // -- serialization --------------------------------------------------------
     async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
-      if (externalLock !== undefined) return externalLock(key, fn);
-      const previous = locks.get(key) ?? Promise.resolve();
-      const next = previous.then(fn, fn);
-      locks.set(
-        key,
-        next.catch(() => undefined),
-      );
-      return next;
+      return exclusive(key, fn);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The persisted invalidation log
+// ---------------------------------------------------------------------------
+
+const EVENTS_LOCK = "alfiz:events";
+
+function eventMethods(
+  epoch: AlfizEpochDelegate,
+  event: AlfizEventDelegate,
+  exclusive: <T>(key: string, fn: () => Promise<T>) => Promise<T>,
+): Pick<
+  Required<StorageDriver>,
+  "appendEvents" | "headSeq" | "eventsSince" | "pruneEvents"
+> {
+  const ensureHead = async (): Promise<void> => {
+    await epoch.upsert({
+      where: { id: 1 },
+      create: { id: 1, seq: 0n, prunedThrough: 0n },
+      update: {},
+    });
+  };
+
+  return {
+    async appendEvents(events, at) {
+      return exclusive(EVENTS_LOCK, async () => {
+        await ensureHead();
+        const advanced = await epoch.update({
+          where: { id: 1 },
+          data: { seq: { increment: BigInt(events.length) } },
+        });
+        const base = advanced.seq - BigInt(events.length);
+        await event.createMany({
+          data: events.map((e, index) => ({
+            seq: base + BigInt(index + 1),
+            type: e.type,
+            payload: toJson(e),
+            at: toBig(at),
+          })),
+        });
+        return { upTo: Number(advanced.seq) };
+      });
+    },
+    async headSeq() {
+      const row = await epoch.findUnique({ where: { id: 1 } });
+      return row === null ? 0 : Number(row.seq);
+    },
+    async eventsSince(seq, limit) {
+      const head = await epoch.findUnique({ where: { id: 1 } });
+      if (head === null) return { upTo: seq, events: [] };
+      if (BigInt(seq) < head.prunedThrough) return { gap: true };
+      const rows = await event.findMany({
+        where: { seq: { gt: BigInt(seq) } },
+        orderBy: { seq: "asc" },
+        take: limit,
+      });
+      return {
+        upTo: rows.length > 0 ? Number(rows[rows.length - 1]!.seq) : seq,
+        events: rows.map((row) => fromJson<InvalidationEvent>(row.payload)),
+      };
+    },
+    async pruneEvents(cutoff) {
+      return exclusive(EVENTS_LOCK, async () => {
+        const head = await epoch.findUnique({ where: { id: 1 } });
+        if (head === null) return 0;
+        let pruneUpTo = head.prunedThrough;
+        if (cutoff.at !== undefined) {
+          const newest = await event.findFirst({
+            where: { at: { lt: toBig(cutoff.at) } },
+            orderBy: { seq: "desc" },
+          });
+          if (newest !== null && newest.seq > pruneUpTo) pruneUpTo = newest.seq;
+        }
+        if (cutoff.keepRows !== undefined) {
+          const bySize = head.seq - BigInt(cutoff.keepRows);
+          if (bySize > pruneUpTo) pruneUpTo = bySize;
+        }
+        if (pruneUpTo <= head.prunedThrough) return 0;
+        const { count } = await event.deleteMany({
+          where: { seq: { lte: pruneUpTo } },
+        });
+        await epoch.update({
+          where: { id: 1 },
+          data: { prunedThrough: pruneUpTo },
+        });
+        return count;
+      });
     },
   };
 }

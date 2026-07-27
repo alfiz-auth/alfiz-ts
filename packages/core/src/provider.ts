@@ -91,6 +91,34 @@ export type InvalidationEvent =
 export type InvalidationListener = (event: InvalidationEvent) => void;
 export type Unsubscribe = () => void;
 
+/**
+ * The persisted-event freshness signal: a monotonic sequence over the same
+ * invalidation events the live stream carries, durable in the provider's
+ * store. `onInvalidate` only reaches listeners in the writing process; the
+ * epoch reaches every process that can reach the database — it is the
+ * cross-process (and serverless) invalidation transport.
+ *
+ * `head()` is a single tiny read whose cost is independent of organization
+ * size: unchanged head means NOTHING changed anywhere, so every cached
+ * closure is still exact. A client that saw sequence `n` catches up with
+ * `since(n)` and replays the returned events through the same busting logic
+ * the live stream feeds — identical semantics, different arrival path.
+ */
+export interface EpochSource {
+  /** The sequence number of the most recently persisted event (0 when none). */
+  head(): Promise<number>;
+  /**
+   * Events after `seq`, oldest first, at most `limit` (provider-chosen
+   * default). `{ gap: true }` when `seq` predates the provider's event
+   * retention — the caller can no longer catch up selectively and must
+   * treat everything it holds as suspect (bust all, resume from `head()`).
+   */
+  since(
+    seq: number,
+    limit?: number,
+  ): Promise<{ upTo: number; events: InvalidationEvent[] } | { gap: true }>;
+}
+
 // ---------------------------------------------------------------------------
 // Row operations
 // ---------------------------------------------------------------------------
@@ -239,6 +267,14 @@ export interface AlfizProvider {
 
   // -- Invalidation ---------------------------------------------------------
   onInvalidate(listener: InvalidationListener): Unsubscribe;
+  /**
+   * Present when the provider persists its invalidation events (the
+   * Application's `events.persist` option; always present on the managed
+   * Service). Capability discovery, same as everything else: a client that
+   * finds it can revalidate caches across processes; one that doesn't falls
+   * back to TTL-bounded staleness.
+   */
+  epoch?: EpochSource | undefined;
 
   // -- Row operations -------------------------------------------------------
   createGrant(input: GrantInput): Promise<GrantRow>;

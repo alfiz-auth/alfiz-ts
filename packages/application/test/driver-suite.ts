@@ -281,3 +281,98 @@ export const driverContractCases: DriverCase[] = [
     },
   },
 ];
+
+/**
+ * The event-log contract: for drivers implementing the OPTIONAL persisted
+ * invalidation log (`appendEvents`/`headSeq`/`eventsSince`/`pruneEvents`).
+ * Register these only for drivers that carry the log — the base contract
+ * above never requires it.
+ */
+export const eventLogContractCases: DriverCase[] = [
+  {
+    name: "events: contiguous sequences from 1, headSeq tracks the newest",
+    async run(driver) {
+      assert.equal(await driver.headSeq!(), 0);
+      const first = await driver.appendEvents!(
+        [{ type: "user", userId: "u1" }],
+        1_000,
+      );
+      assert.equal(first.upTo, 1);
+      const second = await driver.appendEvents!(
+        [
+          { type: "subject", subject: "group:eng" },
+          { type: "role", roleId: "r1" },
+        ],
+        2_000,
+      );
+      assert.equal(second.upTo, 3);
+      assert.equal(await driver.headSeq!(), 3);
+    },
+  },
+  {
+    name: "events: eventsSince replays oldest-first past the cursor, honors limit",
+    async run(driver) {
+      await driver.appendEvents!(
+        [
+          { type: "user", userId: "u1" },
+          { type: "user", userId: "u2" },
+          { type: "user", userId: "u3" },
+        ],
+        1_000,
+      );
+      const all = await driver.eventsSince!(0, 100);
+      assert.ok(!("gap" in all));
+      assert.equal(all.upTo, 3);
+      assert.deepEqual(
+        all.events.map((e) => (e.type === "user" ? e.userId : "?")),
+        ["u1", "u2", "u3"],
+      );
+      const tail = await driver.eventsSince!(1, 100);
+      assert.ok(!("gap" in tail));
+      assert.deepEqual(
+        tail.events.map((e) => (e.type === "user" ? e.userId : "?")),
+        ["u2", "u3"],
+      );
+      // Limit bounds a page; upTo names the cursor for the next loop.
+      const page = await driver.eventsSince!(0, 2);
+      assert.ok(!("gap" in page));
+      assert.equal(page.events.length, 2);
+      assert.equal(page.upTo, 2);
+      const caughtUp = await driver.eventsSince!(3, 100);
+      assert.ok(!("gap" in caughtUp));
+      assert.equal(caughtUp.events.length, 0);
+      assert.equal(caughtUp.upTo, 3);
+    },
+  },
+  {
+    name: "events: pruning reports gaps to stale cursors, newer cursors still catch up",
+    async run(driver) {
+      for (let i = 1; i <= 6; i++) {
+        await driver.appendEvents!([{ type: "user", userId: `u${i}` }], i * 1_000);
+      }
+      // Prune by age: events at < 4000 (u1..u3) go.
+      const pruned = await driver.pruneEvents!({ at: 4_000 });
+      assert.equal(pruned, 3);
+      const stale = await driver.eventsSince!(2, 100);
+      assert.ok("gap" in stale && stale.gap);
+      const exact = await driver.eventsSince!(3, 100);
+      assert.ok(!("gap" in exact));
+      assert.deepEqual(
+        exact.events.map((e) => (e.type === "user" ? e.userId : "?")),
+        ["u4", "u5", "u6"],
+      );
+      // Prune by size: keep the newest 1 row (u5 goes too).
+      const bySize = await driver.pruneEvents!({ keepRows: 1 });
+      assert.equal(bySize, 2);
+      assert.equal(await driver.headSeq!(), 6);
+      const afterSize = await driver.eventsSince!(5, 100);
+      assert.ok(!("gap" in afterSize));
+      assert.deepEqual(
+        afterSize.events.map((e) => (e.type === "user" ? e.userId : "?")),
+        ["u6"],
+      );
+      // A no-op prune deletes nothing.
+      assert.equal(await driver.pruneEvents!({ at: 1_000 }), 0);
+    },
+  },
+];

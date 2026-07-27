@@ -20,6 +20,8 @@ import type {
   AlfizCatalogRecord,
   AlfizGrantRecord,
   AlfizGrantWhere,
+  AlfizEpochRecord,
+  AlfizEventRecord,
   AlfizGroupParentRecord,
   AlfizGroupRecord,
   AlfizMembershipRecord,
@@ -49,6 +51,8 @@ export function mockDelegates(): AlfizPrismaDelegates {
   const memberships: AlfizMembershipRecord[] = [];
   const requests = new Map<string, AlfizRequestRecord>();
   const catalogs = new Map<number, AlfizCatalogRecord>();
+  const epochs = new Map<number, AlfizEpochRecord>();
+  const events: AlfizEventRecord[] = [];
   const audits: AlfizAuditRecord[] = [];
 
   const matchingGrants = (where?: AlfizGrantWhere): AlfizGrantRecord[] =>
@@ -348,6 +352,58 @@ export function mockDelegates(): AlfizPrismaDelegates {
           rows = take < 0 ? rows.slice(take) : rows.slice(0, take);
         }
         return rows.map(clone);
+      },
+    },
+
+    alfizEpoch: {
+      async upsert({ where, create }) {
+        if (!epochs.has(where.id)) epochs.set(where.id, clone({ ...create }));
+        return clone(epochs.get(where.id)!);
+      },
+      async update({ where, data }) {
+        const row = epochs.get(where.id);
+        if (row === undefined) {
+          throw new Error("AlfizEpoch: record to update not found");
+        }
+        if ("seq" in data) row.seq += data.seq.increment;
+        else row.prunedThrough = data.prunedThrough;
+        return clone(row);
+      },
+      async findUnique({ where }) {
+        const row = epochs.get(where.id);
+        return row === undefined ? null : clone(row);
+      },
+    },
+
+    alfizEvent: {
+      async createMany({ data }) {
+        for (const row of data) {
+          if (events.some((e) => e.seq === row.seq)) {
+            throw duplicate("AlfizEvent", String(row.seq));
+          }
+          events.push(clone({ ...row }));
+        }
+        return { count: data.length };
+      },
+      async findMany(args) {
+        return events
+          .filter((e) => e.seq > args.where.seq.gt)
+          .sort((a, b) => (a.seq < b.seq ? -1 : 1))
+          .slice(0, args.take)
+          .map(clone);
+      },
+      async findFirst(args) {
+        const matched = events
+          .filter((e) => e.at < args.where.at.lt)
+          .sort((a, b) => (a.seq < b.seq ? 1 : -1));
+        return matched.length > 0 ? clone(matched[0]!) : null;
+      },
+      async deleteMany({ where }) {
+        const before = events.length;
+        for (let i = events.length - 1; i >= 0; i--) {
+          if (events[i]!.seq <= where.seq.lte) events.splice(i, 1);
+        }
+        return { count: before - events.length };
       },
     },
   };
