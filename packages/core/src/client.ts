@@ -73,17 +73,39 @@ export interface AlfizClientOptions {
   maxSubjectCacheEntries?: number;
   /** Maximum cached object chains before least-recently-used entries are evicted. Default 10 000. */
   maxObjectCacheEntries?: number;
+  /**
+   * Epoch revalidation window (ms): how long a validation of the provider's
+   * event log (`provider.epoch`) vouches for the caches. Within the window,
+   * hits are pure memory. Past it, the next check performs ONE tiny
+   * `epoch.head()` read — shared by every concurrent check, its cost
+   * independent of organization size. An unchanged head proves nothing
+   * changed anywhere, and entry TTLs are RENEWED; a changed head replays
+   * only the missed events through the same busting logic the live stream
+   * feeds. Effective cross-process staleness becomes ~this window instead
+   * of the blind TTL; the TTL remains the fallback bound whenever the
+   * epoch is unreadable (fail-closed: unvalidated entries expire and
+   * refetch, stale data is never served past its window on error).
+   *
+   * Requires a provider exposing `epoch` (the Application's
+   * `events.persist`); silently inert otherwise. 5 000 is a good default
+   * for most deployments. Off (undefined) by default — TTL-only caching,
+   * exactly the pre-epoch behavior.
+   */
+  revalidateAfterMs?: number;
   clock?: () => number;
 }
 
 interface SubjectCacheEntry {
   data: SubjectAccessData;
   expiresAt: number;
+  /** The validation generation this entry was fetched under — see `validationGen`. */
+  gen: number;
 }
 
 interface ObjectCacheEntry {
   chain: ScopeId[];
   expiresAt: number;
+  gen: number;
 }
 
 const principalKey = (p: PrincipalRef): string =>
@@ -181,6 +203,22 @@ export class AlfizClient<
     Promise<SubjectAccessData>
   >();
   private readonly objectInFlight = new Map<ScopeId, Promise<ScopeId[]>>();
+  /**
+   * Epoch revalidation state. `knownSeq` is the newest event sequence this
+   * client has accounted for (null before first contact); `validationGen`
+   * increments whenever a replay (or gap bust) lands, and every cache entry
+   * records the generation its fetch STARTED under. A validation renews
+   * only entries fetched entirely within the current generation: an entry
+   * whose fetch overlapped a replay may have read pre-event state the
+   * replay could not bust (it was not yet cached, so no index covered it),
+   * so it keeps its original TTL — bounded staleness, exactly the
+   * pre-epoch contract — instead of being renewed indefinitely.
+   */
+  private readonly revalidateAfter: number | undefined;
+  private knownSeq: number | null = null;
+  private lastValidatedAt = 0;
+  private validationGen = 0;
+  private revalidating: Promise<void> | null = null;
   private readonly unsubscribe: () => void;
   private readonly grantApplies: (
     key: PermissionKey,
@@ -194,6 +232,7 @@ export class AlfizClient<
     this.objectTtl = options.objectCacheTtlMs ?? 60_000;
     this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
     this.maxObjects = options.maxObjectCacheEntries ?? 10_000;
+    this.revalidateAfter = options.revalidateAfterMs;
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
@@ -357,6 +396,92 @@ export class AlfizClient<
     }
   }
 
+  // -- epoch revalidation ----------------------------------------------------
+
+  /**
+   * The freshness gate on every cached read. `undefined` when there is
+   * nothing to await — feature off, or within the revalidation window — so
+   * the hot path stays a synchronous clock comparison. Past the window it
+   * hands back ONE shared revalidation, coalesced across every concurrent
+   * check, validating BOTH caches for every principal at once. See
+   * {@link AlfizClientOptions.revalidateAfterMs} for the contract.
+   */
+  private maybeValidate(): Promise<void> | undefined {
+    const epoch = this.provider.epoch;
+    if (this.revalidateAfter === undefined || epoch === undefined) {
+      return undefined;
+    }
+    if (
+      this.knownSeq !== null &&
+      this.now() - this.lastValidatedAt <= this.revalidateAfter
+    ) {
+      return undefined;
+    }
+    if (this.revalidating) return this.revalidating;
+    const run = this.revalidate(epoch).finally(() => {
+      this.revalidating = null;
+    });
+    this.revalidating = run;
+    return run;
+  }
+
+  private async revalidate(epoch: NonNullable<AlfizProvider["epoch"]>): Promise<void> {
+    try {
+      const head = await epoch.head();
+      if (this.knownSeq === null) {
+        // First contact happens before anything can be cached (this gate
+        // precedes every cached read), so there is nothing to catch up on.
+        this.knownSeq = head;
+      } else if (head < this.knownSeq) {
+        // A head behind our cursor means the log was reset or restored:
+        // there is no sequence to catch up along. Full bust, start over.
+        this.applyInvalidation({ type: "all" });
+        this.knownSeq = head;
+        this.validationGen++;
+      } else if (head !== this.knownSeq) {
+        let cursor = this.knownSeq;
+        let caughtUp = false;
+        while (!caughtUp) {
+          const result = await epoch.since(cursor);
+          if ("gap" in result) {
+            // The cursor predates retention: selective catch-up is no
+            // longer possible, so everything cached is suspect.
+            this.applyInvalidation({ type: "all" });
+            cursor = await epoch.head();
+            break;
+          }
+          for (const event of result.events) this.applyInvalidation(event);
+          caughtUp = result.upTo <= cursor || result.events.length === 0;
+          cursor = Math.max(cursor, result.upTo);
+          if (cursor >= head) caughtUp = true;
+        }
+        this.knownSeq = cursor;
+        this.validationGen++;
+      }
+      // Validation-renewable TTLs: entries fetched entirely within the
+      // current generation are proven exact as of this instant. Entries
+      // from older generations keep their original expiry (see the field
+      // comment on `validationGen`).
+      const validatedAt = this.now();
+      this.lastValidatedAt = validatedAt;
+      for (const entry of this.subjectCache.values()) {
+        if (entry.gen === this.validationGen) {
+          entry.expiresAt = validatedAt + this.subjectTtl;
+        }
+      }
+      for (const entry of this.objectCache.values()) {
+        if (entry.gen === this.validationGen) {
+          entry.expiresAt = validatedAt + this.objectTtl;
+        }
+      }
+    } catch {
+      // Fail closed to the DATABASE, not to the cache: an unreadable epoch
+      // renews nothing, so entries lapse on their original TTL and the
+      // next miss pays a full provider fetch. Retry next window.
+      this.lastValidatedAt = this.now();
+    }
+  }
+
   // -- data supply ----------------------------------------------------------
 
   /** Registers a cancellation record for an in-flight fetch on `key`. */
@@ -382,10 +507,11 @@ export class AlfizClient<
     fresh: boolean,
   ): Promise<SubjectAccessData> {
     const key = principalKey(principal);
-    const now = this.now();
     if (!fresh) {
+      const gate = this.maybeValidate();
+      if (gate) await gate;
       const cached = this.subjectCache.get(key);
-      if (cached && cached.expiresAt > now) {
+      if (cached && cached.expiresAt > this.now()) {
         // Refresh recency: Map insertion order doubles as the LRU order.
         this.subjectCache.delete(key);
         this.subjectCache.set(key, cached);
@@ -394,10 +520,15 @@ export class AlfizClient<
       const inFlight = this.subjectInFlight.get(key);
       if (inFlight) return inFlight;
     }
+    const gen = this.validationGen;
     const { state, done } = AlfizClient.trackFetch(this.subjectFetchStates, key);
     const fetching = this.provider.getSubjectAccess(principal).then((data) => {
       if (!state.cancelled) {
-        this.storeSubject(key, { data, expiresAt: this.now() + this.subjectTtl });
+        this.storeSubject(key, {
+          data,
+          expiresAt: this.now() + this.subjectTtl,
+          gen,
+        });
       }
       return data;
     });
@@ -415,10 +546,11 @@ export class AlfizClient<
     fresh: boolean,
   ): Promise<ScopeId[]> {
     if (scope === undefined || scope === GLOBAL_SCOPE) return [GLOBAL_SCOPE];
-    const now = this.now();
     if (!fresh) {
+      const gate = this.maybeValidate();
+      if (gate) await gate;
       const cached = this.objectCache.get(scope);
-      if (cached && cached.expiresAt > now) {
+      if (cached && cached.expiresAt > this.now()) {
         this.objectCache.delete(scope);
         this.objectCache.set(scope, cached);
         return cached.chain;
@@ -426,11 +558,16 @@ export class AlfizClient<
       const inFlight = this.objectInFlight.get(scope);
       if (inFlight) return inFlight;
     }
+    const gen = this.validationGen;
     const { state, done } = AlfizClient.trackFetch(this.objectFetchStates, scope);
     const resolving = objectClosureOf(scope, this.provider.resolveAncestors).then(
       (chain) => {
         if (!state.cancelled) {
-          this.storeObject(scope, { chain, expiresAt: this.now() + this.objectTtl });
+          this.storeObject(scope, {
+            chain,
+            expiresAt: this.now() + this.objectTtl,
+            gen,
+          });
         }
         return chain;
       },
