@@ -128,8 +128,11 @@ export function mockDelegates(): AlfizPrismaDelegates {
         const row = roles.get(where.id);
         return row === undefined ? null : clone(row);
       },
-      async findMany() {
-        return [...roles.values()].map(clone);
+      async findMany(args) {
+        let rows = [...roles.values()];
+        const id = args?.where?.id;
+        if (id !== undefined) rows = rows.filter((r) => matchString(r.id, id));
+        return rows.map(clone);
       },
       async deleteMany({ where }) {
         const existed = roles.delete(where.id);

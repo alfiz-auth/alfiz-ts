@@ -143,7 +143,8 @@ export interface AlfizRoleCreateData {
 export interface AlfizRoleDelegate {
   create(args: { data: AlfizRoleCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRoleRecord | null>;
-  findMany(): Promise<AlfizRoleRecord[]>;
+  /** The batch read behind `getRoles`: `WHERE id IN (...)` when filtered. */
+  findMany(args?: { where?: { id?: StringWhere } }): Promise<AlfizRoleRecord[]>;
   deleteMany(args: { where: { id: string } }): Promise<unknown>;
 }
 

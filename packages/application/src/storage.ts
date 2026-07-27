@@ -80,6 +80,14 @@ export interface StorageDriver {
   // -- roles ----------------------------------------------------------------
   upsertRole(role: RoleRecord): Promise<void>;
   getRole(id: string): Promise<RoleRecord | null>;
+  /**
+   * OPTIONAL batch read: the roles matching `ids`, in any order, absent ids
+   * simply missing from the result. Closure supply resolves every role a
+   * grant set references; a driver that implements this turns that into one
+   * `WHERE id IN (...)` query instead of a read per id. Omit it and the
+   * Application falls back to parallel `getRole` calls.
+   */
+  getRoles?(ids: readonly string[]): Promise<RoleRecord[]>;
   listRoles(): Promise<RoleRecord[]>;
   deleteRole(id: string): Promise<void>;
 

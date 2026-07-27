@@ -93,6 +93,12 @@ export function memoryDriver(): StorageDriver {
       const role = roles.get(id);
       return role ? clone(role) : null;
     },
+    async getRoles(ids) {
+      return ids.flatMap((id) => {
+        const role = roles.get(id);
+        return role ? [clone(role)] : [];
+      });
+    },
     async listRoles() {
       return [...roles.values()].map(clone);
     },

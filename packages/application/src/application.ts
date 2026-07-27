@@ -78,6 +78,17 @@ export interface ApplicationOptions {
    * are rejected.
    */
   orgRoot?: boolean | undefined;
+  /**
+   * TTL (ms) for the group-parent topology map used to build subject
+   * closures. Without it, every closure supply re-reads EVERY group in the
+   * organization just to walk parent edges — the single most expensive part
+   * of a cache miss. Local group writes bust it synchronously, so the TTL
+   * only bounds staleness for group writes made by ANOTHER process against
+   * the same database (worst case it adds to the client's subject TTL);
+   * event-log replay (`ingestEvents`, the poller) busts it too. Default
+   * 30s; `0` disables the cache and restores the per-miss scan.
+   */
+  groupTopologyTtlMs?: number | undefined;
   clock?: (() => number) | undefined;
   ids?: (() => string) | undefined;
 }
@@ -151,6 +162,15 @@ export class AlfizApplication<
   private readonly now: () => number;
   private readonly newId: () => string;
   private readonly listeners = new Set<InvalidationListener>();
+  private readonly groupTopologyTtl: number;
+  private groupTopology: {
+    parents: Map<string, readonly string[]>;
+    expiresAt: number;
+  } | null = null;
+  private groupTopologyFetch: Promise<Map<string, readonly string[]>> | null =
+    null;
+  /** Bust-during-fetch protection for the topology cache. */
+  private groupTopologyGen = 0;
 
   constructor(options: ApplicationOptions) {
     this.catalog = options.catalog;
@@ -159,6 +179,7 @@ export class AlfizApplication<
     this.now = options.clock ?? Date.now;
     this.newId = options.ids ?? randomUUID;
     this.resolveAncestors = options.ancestry ?? (() => []);
+    this.groupTopologyTtl = options.groupTopologyTtlMs ?? 30_000;
   }
 
   // -- events ---------------------------------------------------------------
@@ -169,6 +190,16 @@ export class AlfizApplication<
   }
 
   private emit(event: InvalidationEvent): void {
+    // Every write that can change group parentage emits a `group:` subject
+    // event (or `all`), so busting here keeps the topology cache honest at
+    // every emission site — including replayed events from other processes.
+    if (
+      event.type === "all" ||
+      (event.type === "subject" && event.subject.startsWith("group:"))
+    ) {
+      this.groupTopology = null;
+      this.groupTopologyGen++;
+    }
     for (const listener of this.listeners) listener(event);
   }
 
@@ -271,10 +302,23 @@ export class AlfizApplication<
 
   // -- closure supply -------------------------------------------------------
 
+  /**
+   * The reporting chain, walked from an already-loaded starting edge so the
+   * caller's `getUser` read is not repeated. Chains are short in practice;
+   * each level is one indexed read.
+   */
   private async managerChain(userId: string): Promise<string[]> {
+    const user = await this.storage.getUser(userId);
+    return this.managerChainFrom(userId, user?.managerUserId ?? null);
+  }
+
+  private async managerChainFrom(
+    userId: string,
+    firstManager: string | null,
+  ): Promise<string[]> {
     const chain: string[] = [];
     const seen = new Set<string>([userId]);
-    let current = (await this.storage.getUser(userId))?.managerUserId ?? null;
+    let current = firstManager;
     while (current !== null && !seen.has(current)) {
       chain.push(current);
       seen.add(current);
@@ -283,23 +327,62 @@ export class AlfizApplication<
     return chain;
   }
 
+  /**
+   * The group-parent topology, cached application-side: closure math needs
+   * every parent edge, and re-reading the whole group table per subject miss
+   * is the dominant cost of `getSubjectAccess`. Local group writes bust this
+   * synchronously (see `emit`); the TTL bounds cross-process staleness.
+   */
+  private async groupParentMap(): Promise<Map<string, readonly string[]>> {
+    if (this.groupTopologyTtl <= 0) {
+      const groups = await this.storage.listGroups();
+      return new Map(groups.map((g) => [g.id, g.parents]));
+    }
+    const cached = this.groupTopology;
+    if (cached && cached.expiresAt > this.now()) return cached.parents;
+    if (this.groupTopologyFetch) return this.groupTopologyFetch;
+    const generation = this.groupTopologyGen;
+    const fetching = this.storage.listGroups().then((groups) => {
+      const parents = new Map<string, readonly string[]>(
+        groups.map((g) => [g.id, g.parents]),
+      );
+      if (this.groupTopologyGen === generation) {
+        this.groupTopology = {
+          parents,
+          expiresAt: this.now() + this.groupTopologyTtl,
+        };
+      }
+      return parents;
+    });
+    this.groupTopologyFetch = fetching;
+    try {
+      return await fetching;
+    } finally {
+      this.groupTopologyFetch = null;
+    }
+  }
+
   async getSubjectAccess(principal: PrincipalRef): Promise<SubjectAccessData> {
     if ("serviceId" in principal) {
       const closure = [...computeServiceClosure(principal.serviceId)];
       const grants = await this.storage.listGrants({ subjects: closure });
+      const { roles, unresolvedRoleIds } = await this.resolveRoles(grants);
       return {
         userId: null,
         closure,
         grants,
         revokes: [],
-        roles: await this.rolesFor(grants),
+        roles,
         managerChain: [],
-        unresolvedRoleIds: await this.unresolvedRolesFor(grants),
+        unresolvedRoleIds,
         active: true,
       };
     }
 
-    const stored = await this.storage.getUser(principal.userId);
+    const [stored, groupParents] = await Promise.all([
+      this.storage.getUser(principal.userId),
+      this.groupParentMap(),
+    ]);
     // A principal the identity provider authenticated but Alfiz never
     // provisioned is still a member of `everyone` — public access is an
     // ordinary grant row, and it must reach them. Deny-by-default still
@@ -312,11 +395,10 @@ export class AlfizApplication<
       orgIds: [],
       managerUserId: null,
     };
-    const groups = await this.storage.listGroups();
-    const groupParents = new Map<string, readonly string[]>(
-      groups.map((g) => [g.id, g.parents]),
+    const managerChain = await this.managerChainFrom(
+      user.userId,
+      user.managerUserId,
     );
-    const managerChain = await this.managerChain(user.userId);
     const closure = [
       ...computeSubjectClosure({
         userId: user.userId,
@@ -326,39 +408,50 @@ export class AlfizApplication<
         managerChain,
       }),
     ];
-    const grants = await this.storage.listGrants({ subjects: closure });
-    const revokes = await this.storage.listRevokes({ userId: user.userId });
+    const [grants, revokes] = await Promise.all([
+      this.storage.listGrants({ subjects: closure }),
+      this.storage.listRevokes({ userId: user.userId }),
+    ]);
+    const { roles, unresolvedRoleIds } = await this.resolveRoles(grants);
     return {
       userId: user.userId,
       closure,
       grants,
       revokes,
-      roles: await this.rolesFor(grants),
+      roles,
       managerChain,
-      unresolvedRoleIds: await this.unresolvedRolesFor(grants),
+      unresolvedRoleIds,
       active: user.active,
     };
   }
 
-  private async rolesFor(grants: readonly GrantRow[]): Promise<RoleRecord[]> {
+  /**
+   * One pass over the distinct role ids a grant set references — batched
+   * through `StorageDriver.getRoles` when the driver provides it, parallel
+   * per-id reads otherwise. Found and missing ids come from the same reads,
+   * so the two can never disagree (the previous shape fetched every role
+   * twice, serially, once per question).
+   */
+  private async resolveRoles(grants: readonly GrantRow[]): Promise<{
+    roles: RoleRecord[];
+    unresolvedRoleIds: string[];
+  }> {
     const ids = [...new Set(grants.flatMap((g) => (g.roleId ? [g.roleId] : [])))];
+    if (ids.length === 0) return { roles: [], unresolvedRoleIds: [] };
+    const found = this.storage.getRoles
+      ? await this.storage.getRoles(ids)
+      : (await Promise.all(ids.map((id) => this.storage.getRole(id)))).filter(
+          (role): role is RoleRecord => role !== null,
+        );
+    const byId = new Map(found.map((role) => [role.id, role]));
     const roles: RoleRecord[] = [];
+    const unresolvedRoleIds: string[] = [];
     for (const id of ids) {
-      const role = await this.storage.getRole(id);
+      const role = byId.get(id);
       if (role) roles.push(role);
+      else unresolvedRoleIds.push(id);
     }
-    return roles;
-  }
-
-  private async unresolvedRolesFor(
-    grants: readonly GrantRow[],
-  ): Promise<string[]> {
-    const ids = [...new Set(grants.flatMap((g) => (g.roleId ? [g.roleId] : [])))];
-    const missing: string[] = [];
-    for (const id of ids) {
-      if ((await this.storage.getRole(id)) === null) missing.push(id);
-    }
-    return missing;
+    return { roles, unresolvedRoleIds };
   }
 
   private async contextFor(principal: PrincipalRef): Promise<{

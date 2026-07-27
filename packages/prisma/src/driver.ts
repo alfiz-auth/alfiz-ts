@@ -346,6 +346,13 @@ export function prismaDriver(
       const row = await db.alfizRole.findUnique({ where: { id } });
       return row === null ? null : roleFromDb(row);
     },
+    async getRoles(ids) {
+      if (ids.length === 0) return [];
+      const rows = await db.alfizRole.findMany({
+        where: { id: { in: [...ids] } },
+      });
+      return rows.map(roleFromDb);
+    },
     async listRoles() {
       return (await db.alfizRole.findMany()).map(roleFromDb);
     },
