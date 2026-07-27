@@ -11,21 +11,13 @@ import type {
 } from "../src/provider.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
+  namespaces: ["docs"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: { scopes: ["docs.folder", "docs.doc"] },
-            read_listing: { scopes: ["docs.folder"], impliedOnAncestors: true },
-            update_file: { scopes: ["docs.folder", "docs.doc"] },
-            delete: { scopes: ["docs.folder"] },
-          },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.read_listing": { scopes: ["docs.folder"], impliedOnAncestors: true },
+    "docs.files.update_file": { scopes: ["docs.folder", "docs.doc"] },
+    "docs.files.delete": { scopes: ["docs.folder"] },
   },
   scopeTypes: {
     // Folders nest in folders: a self-referencing parent, not `null` —

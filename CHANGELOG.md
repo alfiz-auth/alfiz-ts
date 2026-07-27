@@ -82,14 +82,16 @@ made unreachable: a key that is also a group path (`docs.files` declared
 alongside `docs.files.read`) would be both a folder and a leaf, and is
 rejected.
 
-### Compatibility
+### Breaking: the nested shape is gone
 
-The nested `projects` shape is **deprecated, not removed** — it still builds
-the identical catalog (asserted by a document-equality test), as do
-`namespace`, `additionalNamespaces`, and `allowArbitraryDepth`. Every key,
-pattern, stored grant row, and published document is unchanged, so upgrading
-is a source edit with no data migration. `docs/MIGRATING.md` has the
-conversion.
+Alfiz is pre-1.0 and this ships no compatibility shim. `projects`,
+`namespace`, `additionalNamespaces`, and `allowArbitraryDepth` are **removed**
+— `namespaces` and `permissions` are now required, and everything else about
+`CatalogInput` is optional.
+
+Every key, pattern, stored grant row, and published document is unchanged, so
+this is a source edit with no data migration. `docs/MIGRATING.md` has the
+conversion, which is mechanical: flatten each leaf to its full key.
 
 `CatalogDocument` gains an optional `conventions` field at the same
 `formatVersion: 1`; documents written before 0.4.0 read back at the default
@@ -101,8 +103,7 @@ Deriving keys from absolute strings is materially cheaper than walking two
 sibling records per level: `CatalogKeys` is now a union of the entries' own
 key sets, and group wildcards come from a prefix-splitting template type. The
 anti-widening suite (`derived-types.test-d.ts`) covers the new surface,
-including the compile error for an out-of-block key and the legacy shape's
-unions.
+including the compile error for an out-of-block key.
 
 ## 0.3.0 — the relay seam, and caching that survives more than one process
 

@@ -59,8 +59,9 @@ Three catalog conveniences worth using from day one:
 <details>
 <summary>Upgrading a 0.3.x catalog</summary>
 
-The nested `projects` → `groups` → `permissions` shape still builds and is
-deprecated, not removed. To convert, flatten each leaf to its full key:
+The nested `projects` → `groups` → `permissions` shape is **removed** (Alfiz
+is pre-1.0; there is no compatibility shim). To convert, flatten each leaf to
+its full key:
 
 ```ts
 // 0.3.x
@@ -81,7 +82,8 @@ permissions: [
 `namespace` + `additionalNamespaces` become `namespaces` (first is
 primary), and `allowArbitraryDepth: true` becomes
 `conventions: { depth: "any" }`. Every key, pattern, grant row, and
-published document is unchanged — this is a source-level change only.
+published document is unchanged — this is a source-level change only, with
+no data migration.
 
 One behavior change to know about: a key at the wrong depth used to throw
 from `defineCatalog`. It is now a lint error reported by `lintCatalog` and
@@ -171,14 +173,11 @@ that scope type; a global grant confers everything the patterns match.
 Worked example, using this tab:
 
 ```ts
-courses: {
-  scopes: ["lms.course"],              // inherited default for the tab
-  permissions: {
-    read: true,                        // scopes: ["lms.course"] (inherited)
-    publish_course: true,              //           "
-    manage_catalog: { scopes: [] },    // global-only: no scoped grant confers it
-  },
-},
+group("lms.courses", { scopes: ["lms.course"] }, {   // inherited default for the tab
+  "lms.courses.read": true,                          // scopes: ["lms.course"] (inherited)
+  "lms.courses.publish_course": true,                //           "
+  "lms.courses.manage_catalog": { scopes: [] },      // global-only: no scoped grant confers it
+})
 ```
 
 One role, two grant sites:

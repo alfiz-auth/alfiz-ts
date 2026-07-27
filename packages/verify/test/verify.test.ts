@@ -4,20 +4,12 @@ import { verifyProject } from "../src/verify.js";
 import type { VerifyIssue } from "../src/verify.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
+  namespaces: ["docs"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: {
-          permissions: {
-            read: true,
-            update_file: true,
-            delete: true,
-          },
-        },
-      },
-    },
+  permissions: {
+    "docs.files.read": true,
+    "docs.files.update_file": true,
+    "docs.files.delete": true,
   },
   navigation: [{ label: "Files", href: "/files", permission: "docs.files.read" }],
 });
@@ -400,9 +392,9 @@ describe("group-path near-miss", () => {
 describe("catalog rule + report totals", () => {
   it("catalog lint issues ride along and totals add up", () => {
     const floorless = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { do_thing: true } } } } },
+      permissions: { "a.t.do_thing": true },
     });
     const report = verifyProject({ catalog: floorless, files: [] });
     expect(byRule(report.issues, "catalog").some((i) => /floor/.test(i.message))).toBe(true);

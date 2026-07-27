@@ -112,18 +112,6 @@ describe("derived unions stay EXACT literal unions (the anti-widening guard)", (
       "lms.enrollments.read": true,
     });
   });
-
-  it("the legacy nested shape still derives its exact union", () => {
-    const legacy = defineCatalog({
-      namespace: "a",
-      includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true, do_thing: true } } } } },
-    });
-    expectTypeOf<KeyOf<typeof legacy>>().toEqualTypeOf<"a.t.read" | "a.t.do_thing">();
-    expectTypeOf<PatternOf<typeof legacy>>().toEqualTypeOf<
-      "*" | "a.t.read" | "a.t.do_thing" | "a.*" | "a.t.*"
-    >();
-  });
 });
 
 describe("gates reject typos at compile time; scope parameters hint", () => {

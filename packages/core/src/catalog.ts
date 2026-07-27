@@ -264,43 +264,20 @@ export interface NavItemInput {
   children?: readonly NavItemInput[];
 }
 
-/**
- * The legacy nested input shape (`projects` → `groups` → `permissions`),
- * accepted and deprecated as of 0.4.0. See `docs/MIGRATING.md`.
- *
- * @deprecated Declare permissions by their full dotted key instead.
- */
-export interface LegacyGroupInput extends GroupInput {
-  permissions?: Record<string, LeafInput>;
-  groups?: Record<string, LegacyGroupInput>;
-}
-
 export interface CatalogInput {
   /**
    * The namespaces this application owns — its key prefixes. The first is the
    * primary. Required even standalone, where it is locally redundant:
    * catalogs are federation-shaped from the first commit.
    */
-  namespaces?: readonly string[];
-  /**
-   * The application's primary namespace.
-   *
-   * @deprecated Use `namespaces: ["yourapp"]`.
-   */
-  namespace?: string;
-  /**
-   * Additional namespaces this application owns (multi-project portals).
-   *
-   * @deprecated Fold into `namespaces`.
-   */
-  additionalNamespaces?: readonly string[];
+  namespaces: readonly string[];
   /**
    * The permissions, keyed by their full dotted key: one flat map, one
    * `group()` block, or an array mixing both. Groups are inferred from the
    * keys — declaring blocks is an organizing convenience, never a
    * requirement.
    */
-  permissions?: PermissionsInput;
+  permissions: PermissionsInput;
   /**
    * Metadata for group paths you did not declare a `group()` block for —
    * typically the project level (`{ lms: { label: "Learning" } }`). Purely
@@ -317,17 +294,6 @@ export interface CatalogInput {
    * default; set false for catalogs that render no Alfiz admin surface.
    */
   includeAlfizInternal?: boolean;
-  /**
-   * Top-level groups — projects — in the legacy nested shape.
-   *
-   * @deprecated Use `permissions` with full dotted keys.
-   */
-  projects?: Record<string, LegacyGroupInput>;
-  /**
-   * @deprecated Use `conventions: { depth: "any" }`. Depth is a convention
-   * enforced by the linter, not a boot-time error.
-   */
-  allowArbitraryDepth?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,36 +320,12 @@ type PermissionsKeys<P> = P extends readonly unknown[]
   ? EntryKeys<P[number]>
   : EntryKeys<P>;
 
-/** Legacy: keys under one nested group. */
-type KeysUnder<G, Prefix extends string> =
-  | (G extends { permissions?: infer P }
-      ? P extends Record<string, unknown>
-        ? `${Prefix}.${StringKeys<P>}`
-        : never
-      : never)
-  | (G extends { groups?: infer S }
-      ? S extends Record<string, unknown>
-        ? string extends StringKeys<S>
-          ? `${Prefix}.${string}` // broad (non-literal) input: stop recursing
-          : {
-              [K in StringKeys<S>]: KeysUnder<S[K], `${Prefix}.${K}`>;
-            }[StringKeys<S>]
-        : never
-      : never);
-
-type LegacyKeys<C extends CatalogInput> = C["projects"] extends infer PR
-  ? PR extends Record<string, unknown>
-    ? { [P in StringKeys<PR>]: KeysUnder<PR[P], P> }[StringKeys<PR>]
-    : never
-  : never;
-
 type InternalIncluded<C extends CatalogInput> =
   C["includeAlfizInternal"] extends false ? never : AlfizInternalKey;
 
 /** Every concrete permission key of catalog input `C`. */
 export type CatalogKeys<C extends CatalogInput> =
   | PermissionsKeys<C["permissions"]>
-  | LegacyKeys<C>
   | InternalIncluded<C>;
 
 /**
@@ -824,11 +766,9 @@ export function defineCatalog<const C extends CatalogInput>(
     errors.push({ severity: "error", path, message });
 
   // --- Namespaces -----------------------------------------------------------
-  const namespaceList = [
-    ...(input.namespaces ?? []),
-    ...(input.namespace !== undefined ? [input.namespace] : []),
-    ...(input.additionalNamespaces ?? []),
-  ];
+  // Type-required, but defended anyway: catalogs also arrive from JS and
+  // from config loaders the compiler never saw.
+  const namespaceList = input.namespaces ?? [];
   if (namespaceList.length === 0) {
     err(
       "(catalog)",
@@ -886,9 +826,7 @@ export function defineCatalog<const C extends CatalogInput>(
     input.permissions,
   )
     ? [...(input.permissions as readonly (LeafMap | PermissionBlock)[])]
-    : input.permissions !== undefined
-      ? [input.permissions as LeafMap | PermissionBlock]
-      : [];
+    : [input.permissions as LeafMap | PermissionBlock];
   if (input.includeAlfizInternal !== false) {
     entries.push(...ALFIZ_INTERNAL_BLOCKS);
     for (const [path, meta] of Object.entries(ALFIZ_INTERNAL_GROUPS)) {
@@ -905,43 +843,6 @@ export function defineCatalog<const C extends CatalogInput>(
     } else {
       addLeafMap(entry, null);
     }
-  }
-
-  // --- Legacy nested shape --------------------------------------------------
-  const walkLegacy = (path: string, node: LegacyGroupInput) => {
-    addGroup(path, {
-      ...(node.label !== undefined ? { label: node.label } : {}),
-      ...(node.description !== undefined ? { description: node.description } : {}),
-      ...(node.scopes !== undefined ? { scopes: node.scopes } : {}),
-    });
-    for (const [name, leafInput] of Object.entries(node.permissions ?? {})) {
-      if (!isValidSegment(name)) {
-        err(`${path}.${name}`, "invalid permission segment");
-        continue;
-      }
-      addLeaf(`${path}.${name}`, leafInput);
-    }
-    for (const [name, sub] of Object.entries(node.groups ?? {})) {
-      if (!isValidSegment(name)) {
-        err(`${path}.${name}`, "invalid group segment");
-        continue;
-      }
-      walkLegacy(`${path}.${name}`, sub);
-    }
-  };
-  for (const [projectName, project] of Object.entries(input.projects ?? {})) {
-    if (!isValidSegment(projectName)) {
-      err(projectName, "invalid project segment");
-      continue;
-    }
-    if (projectName === ALFIZ_INTERNAL_NAMESPACE) {
-      err(
-        ALFIZ_INTERNAL_NAMESPACE,
-        `${ALFIZ_INTERNAL_NAMESPACE} is reserved and added automatically`,
-      );
-      continue;
-    }
-    walkLegacy(projectName, project);
   }
 
   // --- Structural validation of keys ---------------------------------------
@@ -1092,9 +993,7 @@ export function defineCatalog<const C extends CatalogInput>(
   }
 
   // --- Conventions ----------------------------------------------------------
-  const depth =
-    input.conventions?.depth ??
-    (input.allowArbitraryDepth === true ? "any" : DEFAULT_KEY_DEPTH);
+  const depth = input.conventions?.depth ?? DEFAULT_KEY_DEPTH;
   if (depth !== "any" && (!Number.isInteger(depth) || depth < 2)) {
     err(
       "(conventions)",

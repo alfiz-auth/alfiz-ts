@@ -20,14 +20,10 @@ import type {
 } from "../src/provider.js";
 
 const catalog = defineCatalog({
-  namespace: "docs",
+  namespaces: ["docs"],
   includeAlfizInternal: false,
-  projects: {
-    docs: {
-      groups: {
-        files: { permissions: { read: { scopes: ["docs.folder", "docs.doc"] } } },
-      },
-    },
+  permissions: {
+    "docs.files.read": { scopes: ["docs.folder", "docs.doc"] },
   },
   scopeTypes: {
     "docs.folder": { parent: "docs.folder" },

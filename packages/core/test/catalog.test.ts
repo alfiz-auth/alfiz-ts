@@ -3,7 +3,6 @@ import type { KeyOf, PatternOf } from "../src/catalog.js";
 import type { AlfizClient, ClientOf } from "../src/client.js";
 import type { SnapshotOf } from "../src/snapshot.js";
 import {
-  CatalogError,
   catalogFromDocument,
   defineCatalog,
   group,
@@ -243,8 +242,13 @@ describe("defineCatalog", () => {
   });
 
   it("requires at least one namespace", () => {
+    // Omitting the field entirely is a compile error; an empty list is the
+    // type-valid way to get here, and from JS so is omitting it.
     expect(() =>
-      defineCatalog({ permissions: { "a.b.c": true } }),
+      defineCatalog({ namespaces: [], permissions: { "a.b.c": true } }),
+    ).toThrow(/declare at least one namespace/);
+    expect(() =>
+      defineCatalog({ permissions: { "a.b.c": true } } as never),
     ).toThrow(/declare at least one namespace/);
   });
 
@@ -342,28 +346,20 @@ describe("defineCatalog", () => {
       lintCatalog(anyDepth).filter((i) => i.message.includes("levels deep")),
     ).toEqual([]);
 
-    // The deprecated boolean still maps onto the convention.
-    const legacy = defineCatalog({
-      namespace: "zoom",
-      allowArbitraryDepth: true,
-      includeAlfizInternal: false,
-      projects: { zoom: { permissions: { host: true } } },
-    });
-    expect(legacy.conventions).toEqual({ depth: "any" });
-    expect(legacy.hasKey("zoom.host")).toBe(true);
+    expect(anyDepth.conventions).toEqual({ depth: "any" });
   });
 
   it("rejects undeclared scope types on leaves and parents", () => {
     expect(() =>
       defineCatalog({
-        namespace: "a",
-        projects: { a: { groups: { t: { permissions: { read: { scopes: ["a.ghost"] } } } } } },
+        namespaces: ["a"],
+        permissions: { "a.t.read": { scopes: ["a.ghost"] }, },
       }),
     ).toThrow(/undeclared scope type/);
     expect(() =>
       defineCatalog({
-        namespace: "a",
-        projects: { a: { groups: { t: { permissions: { read: true } } } } },
+        namespaces: ["a"],
+        permissions: { "a.t.read": true },
         scopeTypes: { "a.thing": { parent: "a.ghost" } },
       }),
     ).toThrow(/not declared/);
@@ -454,9 +450,9 @@ describe("lintCatalog", () => {
 
   it("errors on tabs without a read permission (the floor)", () => {
     const catalog = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { do_thing: true } } } } },
+      permissions: { "a.t.do_thing": true },
     });
     const errors = lintCatalog(catalog).filter((i) => i.severity === "error");
     expect(errors.some((e) => e.path === "a.t" && /floor/.test(e.message))).toBe(true);
@@ -464,9 +460,9 @@ describe("lintCatalog", () => {
 
   it("warns on non-verb_noun action names", () => {
     const catalog = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true, frobnicate: true } } } } },
+      permissions: { "a.t.read": true, "a.t.frobnicate": true },
     });
     const warnings = lintCatalog(catalog).filter((i) => i.severity === "warning");
     expect(warnings.some((w) => w.path === "a.t.frobnicate")).toBe(true);
@@ -474,9 +470,9 @@ describe("lintCatalog", () => {
 
   it("errors on nav referencing nothing", () => {
     const catalog = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true } } } } },
+      permissions: { "a.t.read": true },
       navigation: [{ label: "Ghost", permission: "a.ghost.read" }],
     });
     const errors = lintCatalog(catalog).filter((i) => i.severity === "error");
@@ -485,9 +481,9 @@ describe("lintCatalog", () => {
 
   it("errors on requestable scope types without stages", () => {
     const catalog = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { t: { permissions: { read: true } } } } },
+      permissions: { "a.t.read": true },
       scopeTypes: {
         "a.thing": { requestable: { policy: { stages: [] } } },
       },
@@ -497,66 +493,34 @@ describe("lintCatalog", () => {
   });
 });
 
-describe("the legacy nested shape (deprecated in 0.4.0)", () => {
-  it("builds the same catalog as the flat-key shape", () => {
-    const legacy = defineCatalog({
-      namespace: "docs",
-      additionalNamespaces: ["billing"],
-      includeAlfizInternal: false,
-      projects: {
-        docs: {
-          description: "Documents",
-          groups: {
-            files: {
-              label: "Files",
-              scopes: ["docs.folder"],
-              permissions: { read: true, delete: true },
-            },
-          },
-        },
-        billing: {
-          groups: { invoices: { permissions: { read: true, issue_invoice: true } } },
-        },
-      },
-      scopeTypes: { "docs.folder": { parent: null } },
-    });
-    const flat = defineCatalog({
-      namespaces: ["docs", "billing"],
-      includeAlfizInternal: false,
-      groups: { docs: { description: "Documents" } },
-      permissions: [
-        group("docs.files", { label: "Files", scopes: ["docs.folder"] }, {
-          "docs.files.read": true,
-          "docs.files.delete": true,
-        }),
-        {
-          "billing.invoices.read": true,
-          "billing.invoices.issue_invoice": true,
-        },
-      ],
-      scopeTypes: { "docs.folder": { parent: null } },
-    });
-    expect(legacy.toDocument()).toEqual(flat.toDocument());
-  });
-
-  it("still rejects projects outside the declared namespaces", () => {
-    expect(() =>
-      defineCatalog({
-        namespace: "docs",
-        projects: { rogue: { groups: { t: { permissions: { read: true } } } } },
-      }),
-    ).toThrow(CatalogError);
-  });
-
-  it("keeps an empty declared group visible so the linter can report it", () => {
+describe("groups are inferred from keys", () => {
+  it("a `groups` entry naming a path with no keys is reported as empty", () => {
+    // Groups come from the keys, so the only way to conjure one with nothing
+    // under it is to name it in the metadata map — which is a typo, and lints.
     const catalog = defineCatalog({
-      namespace: "a",
+      namespaces: ["a"],
       includeAlfizInternal: false,
-      projects: { a: { groups: { hollow: {}, t: { permissions: { read: true } } } } },
+      groups: { "a.hollow": { label: "Hollow" } },
+      permissions: { "a.t.read": true },
     });
     expect(catalog.hasGroup("a.hollow")).toBe(true);
     expect(lintCatalog(catalog)).toContainEqual(
-      expect.objectContaining({ path: "a.hollow", message: expect.stringContaining("empty group") }),
+      expect.objectContaining({
+        path: "a.hollow",
+        message: expect.stringContaining("empty group"),
+      }),
     );
+  });
+
+  it("every dotted prefix of a key becomes a group, at any depth", () => {
+    const catalog = defineCatalog({
+      namespaces: ["a"],
+      includeAlfizInternal: false,
+      conventions: { depth: "any" },
+      permissions: { "a.b.c.d.read": true },
+    });
+    expect([...catalog.groups.keys()]).toEqual(["a", "a.b", "a.b.c", "a.b.c.d"]);
+    expect(catalog.groups.get("a.b")!.groups).toEqual(["a.b.c"]);
+    expect(catalog.groups.get("a.b.c.d")!.permissions).toEqual(["a.b.c.d.read"]);
   });
 });
