@@ -73,4 +73,38 @@ What lives here:
   auto-condensed into virtual parents, cyclic reporting edges are skipped
   with warnings, never silently combined.
 
+## Relay
+
+The Application side of the Alfiz Cloud relay: `createRelayHandler` serves
+the provider contract over one bearer-authenticated POST endpoint, so a
+linked Application is reachable by the hosted dashboard while remaining
+the org root and the sole writer. Every relayed operation lands in the
+same provider methods local code calls — org-root gating, validation,
+graph integrity, and audit apply to relayed writes exactly as to local
+ones. Mount it at an internal route:
+
+```ts
+import { createRelayHandler } from "@alfiz-auth/application";
+import { app, storage } from "@/lib/alfiz";
+
+export const POST = createRelayHandler({
+  application: app,
+  storage,
+  secret: process.env.ALFIZ_RELAY_SECRET!,
+  applicationId: "docs",
+});
+```
+
+The secret is minted at the Alfiz Cloud link step; keep it in an
+environment variable. The `storage` option enables the org-snapshot ops
+(promotion, demotion, read-model sync); `onAuthorityChanged` is called
+after an authority-transfer snapshot applies, so the host can reconstruct
+its Application with the new `orgRoot` flag — a constructor commitment the
+library cannot flip at runtime. Typed errors survive the wire
+(`ProviderWriteRejectedError` codes, `GraphCycleError` paths), and
+`createRelayProvider(target)` is the calling side: an `AlfizProvider` over
+fetch that exposes the linked Application's epoch. Runtime checks never
+traverse the relay — every `can()` runs in-process, and nothing in the
+protocol is on any request path.
+
 Every driver must pass the contract suite in `test/driver-suite.ts`.

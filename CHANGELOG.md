@@ -1,11 +1,29 @@
 # Changelog
 
-## Unreleased — caching that survives more than one process
+## 0.3.0 — the relay seam, and caching that survives more than one process
 
 The staleness bound stops being "a TTL per process" and becomes "one
 revalidation window, any number of processes" — opt-in, with defaults
 byte-identical to 0.2.2 (except two strict improvements: the object-chain
 cache is now bounded, and both client caches evict LRU).
+
+### The relay seam (Alfiz Cloud)
+
+- **Relay** — `@alfiz-auth/application` ships the Application side of the
+  Alfiz Cloud relay protocol (`relay.ts`): `createRelayHandler` mounts one
+  bearer-authenticated POST endpoint (timing-safe secret check) whose ops
+  mirror the provider contract one-to-one, plus the epoch reads, the
+  org-snapshot ops that promotion/demotion/sync ride on, and a health
+  probe. Every relayed write lands in the same provider methods local code
+  calls, so org-root gating, validation, graph integrity, and audit apply
+  unchanged; typed errors survive the wire (`ProviderWriteRejectedError`
+  codes, `GraphCycleError` paths re-thrown intact). `createRelayProvider`
+  is the calling side: an `AlfizProvider` over fetch exposing the linked
+  Application's epoch, with `ping` / `exportOrgSnapshot` /
+  `applyOrgSnapshot` extras and `RelayTransportError` for transport
+  failures. `onAuthorityChanged` tells the host to reconstruct its
+  Application when an authority transfer flips the `orgRoot` flag. Runtime
+  checks never traverse the relay; nothing here is on any request path.
 
 ### The event log (cross-process invalidation)
 

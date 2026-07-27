@@ -11,7 +11,7 @@ owns everything in between: **who may do what, where, and why**.
 | --- | --- | --- |
 | **Client** | `@alfiz-auth/core` | The evaluator: grammar, catalog, closures, check shapes, caches, graph integrity, request evaluation, headless tree logic, and the provider contract. Every capability is a pure function over provider-supplied data. No storage, no I/O. |
 | **Application** | `@alfiz-auth/application` (+ `@alfiz-auth/prisma`) | The local provider: the same contract implemented against **your** database through a storage seam. Standalone, it is the **org root** — the complete system for one organization, with the full feature set and no external dependency. |
-| **Service** | (future) | A managed provider speaking the *same contract*: hosted administration by relay, and federation (catalog registry, cross-application composition, the centralized org root). Nothing in this repo depends on it, by design. |
+| **Alfiz Cloud** | `alfiz.dev` | The managed provider speaking the *same contract*: the hosted Dashboard (administration by relay) and Federation (catalog registry, cross-application composition, the centralized org root). Nothing in this repo depends on it, by design. |
 
 Runtime checks never leave your application in any topology: every `can()`
 runs in-process against your catalog, your rows, and your resolver.
