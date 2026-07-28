@@ -1,5 +1,5 @@
 /**
- * @alfiz-auth/core — the Alfiz Client.
+ * @alfiz/core — the Alfiz Client.
  *
  * Every capability here is a pure function over data a provider supplies:
  * the grammar and pattern matcher, catalog machinery and derived types,

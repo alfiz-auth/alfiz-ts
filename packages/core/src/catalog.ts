@@ -42,7 +42,7 @@
  * violations, a key that is also a group path) — a broken catalog should fail
  * at boot. CONVENTIONS — the blessed key depth, the naming floor, style, nav
  * wiring — are reported by `lintCatalog` and enforced at build time by
- * @alfiz-auth/verify, never thrown at boot.
+ * @alfiz/verify, never thrown at boot.
  */
 
 import { formatAlternatives } from "./errors.js";
@@ -1223,7 +1223,7 @@ export function catalogFromDocument<
 
 // ---------------------------------------------------------------------------
 // Catalog lint — the naming floor and wiring conventions, enforced at build
-// time by @alfiz-auth/verify rather than at boot.
+// time by @alfiz/verify rather than at boot.
 // ---------------------------------------------------------------------------
 
 const VERB_NOUN_RE = /^[a-z]+(_[a-z0-9]+)+$/;

@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { MetricsBatch, StorageDriver } from "@alfiz-auth/core";
+import type { MetricsBatch, StorageDriver } from "@alfiz/core";
 import {
   ProviderWriteRejectedError,
   createAlfizClient,
   createMetricsAggregator,
   createProviderMetricsSink,
   revocationSafeguard,
-} from "@alfiz-auth/core";
-import { createApplication, memoryDriver } from "@alfiz-auth/application";
+} from "@alfiz/core";
+import { createApplication, memoryDriver } from "@alfiz/application";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 const DAY = 86_400_000;
@@ -366,7 +366,7 @@ describe("view-as", () => {
       provider: app,
       metrics: { observer: sink.observer },
     });
-    const { AlfizSession } = await import("@alfiz-auth/application");
+    const { AlfizSession } = await import("@alfiz/application");
     const session = new AlfizSession(client, {
       actorUserId: "admin1",
       viewAs: { kind: "user", userId: "u1" },

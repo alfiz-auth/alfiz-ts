@@ -1,5 +1,5 @@
 import { describe, it } from "vitest";
-import { memoryDriver } from "@alfiz-auth/application";
+import { memoryDriver } from "@alfiz/application";
 import {
   driverContractCases,
   eventLogContractCases,

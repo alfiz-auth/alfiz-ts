@@ -5,8 +5,8 @@
  * about is exactly the set the local listeners were told about.
  */
 import { describe, expect, it } from "vitest";
-import type { InvalidationEvent } from "@alfiz-auth/core";
-import { createApplication, memoryDriver } from "@alfiz-auth/application";
+import type { InvalidationEvent } from "@alfiz/core";
+import { createApplication, memoryDriver } from "@alfiz/application";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 function makePersistingApp() {

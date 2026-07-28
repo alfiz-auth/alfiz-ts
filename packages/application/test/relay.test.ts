@@ -6,20 +6,20 @@
  * no HTTP server involved.
  */
 import { describe, expect, it } from "vitest";
-import type { AlfizProvider } from "@alfiz-auth/core";
-import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz-auth/core";
+import type { AlfizProvider } from "@alfiz/core";
+import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz/core";
 import type {
   ApplicationOptions,
   RelayHandlerOptions,
   RelayOp,
   RelayResponse,
-} from "@alfiz-auth/application";
+} from "@alfiz/application";
 import {
   RELAY_PROTOCOL_VERSION,
   RelayTransportError,
   createRelayHandler,
   createRelayProvider,
-} from "@alfiz-auth/application";
+} from "@alfiz/application";
 import { admin, makeApp } from "./fixtures.js";
 
 const SECRET = "relay-secret-from-the-link-step";

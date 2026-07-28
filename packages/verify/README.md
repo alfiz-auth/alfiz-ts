@@ -1,4 +1,4 @@
-# @alfiz-auth/verify
+# @alfiz/verify
 
 Static verification: the four-point wiring checklist enforced by tooling,
 not discipline. Typed keys catch typos the compiler can see; this catches
@@ -6,7 +6,7 @@ the rest:
 
 - **unknown-pattern** — a string at a `can`/`require*`/`gateAction` call
   site that is not a catalog key or known group wildcard. (The same rule
-  runs at runtime in `@alfiz-auth/core` for the string paths static
+  runs at runtime in `@alfiz/core` for the string paths static
   analysis cannot see; this is the build-time half.)
 - **visibility-as-gate** — `canAny`/`requireAny` inside a `"use server"`
   file or route handler. Visibility affordances are never gates.
@@ -54,7 +54,7 @@ reads as ungated and the noise buries the real findings:
 Programmatic (recommended — no JSON step):
 
 ```ts
-import { DEFAULT_GATE_NAMES, verifyProject } from "@alfiz-auth/verify";
+import { DEFAULT_GATE_NAMES, verifyProject } from "@alfiz/verify";
 import { catalog } from "./src/alfiz.js";
 
 const report = verifyProject({

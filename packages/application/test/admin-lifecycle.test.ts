@@ -7,7 +7,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import type { InvalidationEvent } from "@alfiz-auth/core";
+import type { InvalidationEvent } from "@alfiz/core";
 import { admin, makeApp } from "./fixtures.js";
 
 const collectEvents = (app: { onInvalidate: (l: (e: InvalidationEvent) => void) => () => void }) => {

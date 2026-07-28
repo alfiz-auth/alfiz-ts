@@ -6,7 +6,7 @@
 // yours. All models are prefixed `Alfiz` to avoid colliding with the host
 // application's models.
 //
-// Semantics live in the Application layer (@alfiz-auth/application), not here:
+// Semantics live in the Application layer (@alfiz/application), not here:
 //   - Every id is an opaque string ASSIGNED BY THE APPLICATION. No
 //     autoincrement, no cuid() — the driver stores rows verbatim.
 //   - No relations or cascades are declared. Referential integrity between

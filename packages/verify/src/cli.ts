@@ -40,7 +40,7 @@
 
 import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { catalogFromDocument } from "@alfiz-auth/core";
+import { catalogFromDocument } from "@alfiz/core";
 import { generateCatalogTypes } from "./codegen.js";
 import {
   DEFAULT_GATE_NAMES,

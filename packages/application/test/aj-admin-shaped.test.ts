@@ -8,8 +8,8 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createAlfizClient, defineCatalog, group, parentPointerResolver, planListing } from "@alfiz-auth/core";
-import { createApplication, createSession, memoryDriver } from "@alfiz-auth/application";
+import { createAlfizClient, defineCatalog, group, parentPointerResolver, planListing } from "@alfiz/core";
+import { createApplication, createSession, memoryDriver } from "@alfiz/application";
 
 const catalog = defineCatalog({
   namespaces: ["mathaniyy", "diploma", "admin", "groups", "payments"],

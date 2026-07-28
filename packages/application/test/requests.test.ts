@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createAlfizClient } from "@alfiz-auth/core";
+import { createAlfizClient } from "@alfiz/core";
 import { admin, makeApp, testCatalog } from "./fixtures.js";
 
 const seedUsers = async (app: ReturnType<typeof makeApp>["app"]) => {

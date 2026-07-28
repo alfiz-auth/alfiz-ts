@@ -10,7 +10,7 @@
 
 import { readFileSync } from "node:fs";
 import ts from "typescript";
-import type { AnyCatalog } from "@alfiz-auth/core";
+import type { AnyCatalog } from "@alfiz/core";
 import {
   ALFIZ_INTERNAL_NAMESPACE,
   formatAlternatives,
@@ -18,7 +18,7 @@ import {
   lintCatalog,
   namespaceOf,
   unknownPermissionContext,
-} from "@alfiz-auth/core";
+} from "@alfiz/core";
 
 export type VerifySeverity = "error" | "warning";
 

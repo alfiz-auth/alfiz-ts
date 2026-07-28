@@ -6,8 +6,8 @@
  * and independent queries overlap.
  */
 import { describe, expect, it } from "vitest";
-import type { StorageDriver } from "@alfiz-auth/application";
-import { createApplication, memoryDriver } from "@alfiz-auth/application";
+import type { StorageDriver } from "@alfiz/application";
+import { createApplication, memoryDriver } from "@alfiz/application";
 import { admin, testAncestry, testCatalog } from "./fixtures.js";
 
 /** Wraps a driver, counting calls per method. */

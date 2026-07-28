@@ -2,7 +2,7 @@
  * The local service-principal shim: shared backend key(s) in environment
  * variables, validated server-side with a timing-safe comparison and a
  * rotation list — so a standalone deployment is never forced onto a managed
- * service merely to expose an API. Pair with @alfiz-auth/verify's client-reach
+ * service merely to expose an API. Pair with @alfiz/verify's client-reach
  * guard, which fails the build if a key module becomes client-reachable.
  *
  * A verified key yields a `service:<id>` machine subject; grant to it like
@@ -10,7 +10,7 @@
  */
 
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { PrincipalRef } from "@alfiz-auth/core";
+import type { PrincipalRef } from "@alfiz/core";
 
 export interface ServiceKeyConfig {
   /** Becomes the machine subject `service:<serviceId>`. */

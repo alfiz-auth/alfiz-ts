@@ -270,7 +270,7 @@ cache is now bounded, and both client caches evict LRU).
 
 ### The relay seam (Alfiz Cloud)
 
-- **Relay** — `@alfiz-auth/application` ships the Application side of the
+- **Relay** — `@alfiz/application` ships the Application side of the
   Alfiz Cloud relay protocol (`relay.ts`): `createRelayHandler` mounts one
   bearer-authenticated POST endpoint (timing-safe secret check) whose ops
   mirror the provider contract one-to-one, plus the epoch reads, the
@@ -549,7 +549,7 @@ Shaped by the first real migration (a Next.js LMS with a 97-key catalog,
 ~400 call sites, and a hand-rolled scoping layer). The theme: the semantics
 were right; the surface around adopting them needed to grow.
 
-### The request-scoped snapshot (`@alfiz-auth/core`)
+### The request-scoped snapshot (`@alfiz/core`)
 
 - `client.snapshot(principal, { scopes?, fresh? })` → `AlfizSnapshot`: one
   provider round-trip, then **synchronous** `can` / `canAny` / `require` /
@@ -578,7 +578,7 @@ were right; the surface around adopting them needed to grow.
   equivalents — so generic wrappers over many keys stop needing
   `as never`. Gates stay strictly typed.
 
-### Referential cleanup and the missing write APIs (`@alfiz-auth/application`)
+### Referential cleanup and the missing write APIs (`@alfiz/application`)
 
 - **`deleteSubject(subject, provenance)`** — grants key on subject strings,
   so deleting a principal in the host's tables silently stranded its rows,
@@ -606,7 +606,7 @@ were right; the surface around adopting them needed to grow.
 - Storage seam (breaking for driver implementors): `deleteUser(userId)`
   added; `listRevokes` filter gains `scope`.
 
-### The generated-client promise, pinned (`@alfiz-auth/prisma`)
+### The generated-client promise, pinned (`@alfiz/prisma`)
 
 - Create-data Json fields narrowed from `JsonValue` to
   `InputJsonValue = Exclude<JsonValue, null>` — Prisma rejects bare `null`
@@ -623,7 +623,7 @@ were right; the surface around adopting them needed to grow.
 - Driver: `deleteUser`, revoke `scope` filtering; schema fragment adds an
   `AlfizRevoke.scope` index.
 
-### A verifier that can describe a real project (`@alfiz-auth/verify`)
+### A verifier that can describe a real project (`@alfiz/verify`)
 
 - CLI config gains `gateNames`, `visibilityNames`, `serverFilePatterns` —
   a project's own guard wrappers are the encouraged pattern, and without
@@ -638,7 +638,7 @@ were right; the surface around adopting them needed to grow.
 - The group-path near-miss gets a real message: `requireAny("admin")` now
   says *did you mean `"admin.*"`?* instead of "not in the catalog".
 
-### Catalog ergonomics (`@alfiz-auth/core`)
+### Catalog ergonomics (`@alfiz/core`)
 
 - Group-level `scopes` — declared once on a tab, inherited by every leaf
   under it (nearest declaration wins; a leaf's own `scopes`, including

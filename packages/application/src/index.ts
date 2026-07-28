@@ -1,5 +1,5 @@
 /**
- * @alfiz-auth/application — the local provider.
+ * @alfiz/application — the local provider.
  *
  * One database (through the storage seam) is the sole hard requirement.
  * Standalone, this is the org root and the complete system for one

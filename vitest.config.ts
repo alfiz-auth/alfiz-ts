@@ -7,8 +7,8 @@ const pkg = (name: string) =>
 export default defineConfig({
   resolve: {
     alias: {
-      "@alfiz-auth/core": pkg("core"),
-      "@alfiz-auth/application": pkg("application"),
+      "@alfiz/core": pkg("core"),
+      "@alfiz/application": pkg("application"),
     },
   },
   test: {

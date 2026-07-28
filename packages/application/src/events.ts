@@ -12,7 +12,7 @@
  * duplicate bust of an already-busted entry, harmless.
  */
 
-import type { InvalidationEvent } from "@alfiz-auth/core";
+import type { InvalidationEvent } from "@alfiz/core";
 
 /** What the poller needs: the Application's log view and its local re-emit. */
 export interface EventPollerSource {

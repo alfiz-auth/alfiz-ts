@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { catalogFromDocument, defineCatalog } from "@alfiz-auth/core";
+import { catalogFromDocument, defineCatalog } from "@alfiz/core";
 import { verifyProject } from "../src/verify.js";
 import type { VerifyIssue } from "../src/verify.js";
 

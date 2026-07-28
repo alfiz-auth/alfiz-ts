@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defineCatalog } from "@alfiz-auth/core";
+import { defineCatalog } from "@alfiz/core";
 import { generateCatalogTypes } from "../src/codegen.js";
 
 const catalog = defineCatalog({

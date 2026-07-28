@@ -42,8 +42,8 @@ import type {
   ScopeId,
   UsageQuery,
   UserGroup,
-} from "@alfiz-auth/core";
-import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz-auth/core";
+} from "@alfiz/core";
+import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz/core";
 import type { AlfizApplication } from "./application.js";
 import type { StorageDriver } from "./storage.js";
 

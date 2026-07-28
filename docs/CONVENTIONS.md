@@ -1,7 +1,7 @@
 # Alfiz conventions — machine-legible
 
 This document is written to be loaded into an AI agent's context when working
-on a codebase that uses Alfiz. Everything here is checked by `@alfiz-auth/verify`;
+on a codebase that uses Alfiz. Everything here is checked by `@alfiz/verify`;
 follow the conventions and the verifier will confirm, skip a step and it will
 fail the build.
 
@@ -31,7 +31,7 @@ fail the build.
 ## The catalog
 
 - One catalog module per application, built with `defineCatalog` from
-  `@alfiz-auth/core`. It is the single source of truth: types, verification, and
+  `@alfiz/core`. It is the single source of truth: types, verification, and
   admin UI all derive from it. Never infer permissions from call sites; never
   configure them in a dashboard.
 - Permissions are declared by their FULL DOTTED KEY, so a key at a call site

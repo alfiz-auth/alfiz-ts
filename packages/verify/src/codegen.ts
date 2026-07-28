@@ -16,7 +16,7 @@
  * included, without pulling in any Alfiz runtime.
  */
 
-import type { CatalogDocument } from "@alfiz-auth/core";
+import type { CatalogDocument } from "@alfiz/core";
 
 export interface CodegenOptions {
   /**

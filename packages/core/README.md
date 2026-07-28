@@ -1,4 +1,4 @@
-# @alfiz-auth/core
+# @alfiz/core
 
 The Alfiz **Client**: the evaluator. Everything here is a pure function over
 data a provider supplies — no storage, no I/O.

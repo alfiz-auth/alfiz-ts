@@ -7,9 +7,9 @@
  * per scenario, pinned with an instrumented driver.
  */
 import { describe, expect, it } from "vitest";
-import { createAlfizClient } from "@alfiz-auth/core";
-import type { StorageDriver } from "@alfiz-auth/application";
-import { createApplication, memoryDriver } from "@alfiz-auth/application";
+import { createAlfizClient } from "@alfiz/core";
+import type { StorageDriver } from "@alfiz/application";
+import { createApplication, memoryDriver } from "@alfiz/application";
 import { admin, testAncestry, testCatalog } from "./fixtures.js";
 
 function instrument(driver: StorageDriver): {

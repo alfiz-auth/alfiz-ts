@@ -4,12 +4,12 @@
  * closest in-process approximation of two nodes on one database.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { InvalidationEvent } from "@alfiz-auth/core";
+import type { InvalidationEvent } from "@alfiz/core";
 import {
   createApplication,
   memoryDriver,
   startEventPoller,
-} from "@alfiz-auth/application";
+} from "@alfiz/application";
 import { admin, testCatalog } from "./fixtures.js";
 
 describe("startEventPoller", () => {

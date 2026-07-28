@@ -31,7 +31,7 @@ import type {
   RevokeRow,
   RoleRecord,
   UserGroup,
-} from "@alfiz-auth/core";
+} from "@alfiz/core";
 import type {
   AuditFilter,
   GrantFilter,
@@ -39,7 +39,7 @@ import type {
   RevokeFilter,
   StorageDriver,
   StoredUser,
-} from "@alfiz-auth/application";
+} from "@alfiz/application";
 import type {
   AlfizAuditCreateData,
   AlfizAuditRecord,

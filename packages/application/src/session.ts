@@ -31,7 +31,7 @@ import type {
   ScopeOf,
   SnapshotOptions,
   SubjectAccessData,
-} from "@alfiz-auth/core";
+} from "@alfiz/core";
 import {
   AccessDeniedError,
   GLOBAL_SCOPE,
@@ -40,7 +40,7 @@ import {
   keyHeldAnywhere,
   objectClosureOf,
   toCheckContext,
-} from "@alfiz-auth/core";
+} from "@alfiz/core";
 
 export type ViewAsState =
   /** Preview as a role: the subject's access becomes the role's patterns. */
