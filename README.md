@@ -238,10 +238,12 @@ broader one loses nothing when revoked, and a warning that cries wolf gets
 clicked through. And when a grant shows no recent use, Alfiz says exactly
 that and no more: absence of use is not evidence that revoking is safe.
 
-Metrics stay where they are produced. Alfiz Cloud never receives them, they
-are not a billing dimension, and nothing about the feature puts anything new
-on your request path. Counts are sampled and lossy by design; they are
-numbers, not audit.
+Metrics stay where they are produced: there is no uplink and no central
+metrics store. The hosted dashboard can read them back for your own
+administrators, over the same relay as every other admin surface, and keeps
+no copy. They are not a billing dimension, and nothing about the feature
+puts anything new on your request path. Counts are sampled and lossy by
+design; they are numbers, not audit.
 
 ## Packages
 
