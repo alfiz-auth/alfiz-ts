@@ -140,6 +140,27 @@ model AlfizEvent {
   @@index([at])
 }
 
+/// Rolling permission-usage counters. Each row is one counter for one
+/// bucket of time (daily by default), keyed by what it counts: a grant id,
+/// a revoke id, a role id, a permission key, or a scope type.
+///
+/// Counters ACCUMULATE — every app server reporting a window increments the
+/// same buckets, so the numbers are deployment-wide. Storage is bounded by
+/// (attributed rows × retention ÷ bucket size) and compacted by deleting
+/// buckets past retention. Nothing here is access data: dropping the whole
+/// table loses metrics and changes no decision.
+model AlfizMetric {
+  bucket    BigInt
+  dimension String
+  subject   String
+  metric    String
+  count     BigInt
+
+  @@id([bucket, dimension, subject, metric])
+  @@index([dimension, subject])
+  @@index([bucket])
+}
+
 /// Append-only audit log, ordered by `at` (epoch ms).
 model AlfizAudit {
   id     String @id

@@ -13,6 +13,12 @@
 import type { GrantRow, Provenance, RevokeRow, RoleDef } from "./access.js";
 import type { CatalogDocument } from "./catalog.js";
 import type { LoosePattern, PermissionPattern } from "./grammar.js";
+import type {
+  MetricsBatch,
+  PermissionUsage,
+  RowUsage,
+  UsageQuery,
+} from "./metrics.js";
 import type { AccessRequest, ApprovalStage } from "./requests.js";
 import type { AncestryResolver, LooseScopeId, ScopeId } from "./scopes.js";
 import type { SubjectId } from "./subjects.js";
@@ -38,6 +44,13 @@ export interface ProviderCapabilities {
   audit: boolean;
   /** Multi-parent object graphs are enabled for at least one scope type. */
   multiParent: boolean;
+  /**
+   * Permission-usage metrics are accepted (`reportMetrics`) and readable
+   * (`getGrantUsage` and friends). Off unless the deployment opted in, and
+   * components render usage and revocation warnings only when it is on —
+   * progressive disclosure, exactly like `audit`.
+   */
+  metrics: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -440,4 +453,50 @@ export interface AlfizProvider {
     target?: string | undefined;
     limit?: number | undefined;
   }): Promise<AuditEvent[]>;
+
+  // -- Metrics (OPTIONAL — gated by `capabilities().metrics`) ----------------
+  // The delivery half of the metrics pipeline and the reads the safeguards
+  // and per-action numbers are built from. Optional on the contract, so a
+  // provider that stores no metrics still satisfies it and its clients
+  // simply render nothing.
+  //
+  // Direction matters here and is deliberate: the Client hands batches to
+  // its OWN provider — the local Application — and nothing carries them
+  // further. Metrics are local data with a local reader; an application that
+  // wants them elsewhere sends them there itself, through the observer.
+
+  /**
+   * Ingest one aggregated window. Never individual checks: the client
+   * aggregates first, so what crosses this boundary is windowed counts
+   * tagged with an instance id, and many app servers' batches merge wherever
+   * they land. Called off the request path, fire-and-forget — a failed batch
+   * is a lost count, never a failed check.
+   */
+  reportMetrics?(batch: MetricsBatch): Promise<void>;
+
+  /**
+   * Per-grant usage over a window: `matched` (participated in an allow) and
+   * `soleMatch` (was the ONLY row allowing — revoking it would have denied).
+   * The revocation safeguard keys on the second; see `revocationSafeguard`.
+   */
+  getGrantUsage?(query?: UsageQuery): Promise<RowUsage[]>;
+
+  /**
+   * Per-revoke usage: how many checks each revoke suppressed. Deleting a
+   * revoke WIDENS access, so this reading points the opposite direction from
+   * the grant one.
+   */
+  getRevokeUsage?(query?: UsageQuery): Promise<RowUsage[]>;
+
+  /** Per-role usage, for role-edit and role-delete safeguards. */
+  getRoleUsage?(query?: UsageQuery): Promise<RowUsage[]>;
+
+  /**
+   * Per-permission counts, split by gate versus visibility traffic — the
+   * per-action metric. `ids` filters to specific keys; omit for the catalog.
+   */
+  getPermissionUsage?(query?: UsageQuery): Promise<PermissionUsage[]>;
+
+  /** The same rollup keyed by scope type — which parts of the hierarchy are checked. */
+  getScopeTypeUsage?(query?: UsageQuery): Promise<PermissionUsage[]>;
 }

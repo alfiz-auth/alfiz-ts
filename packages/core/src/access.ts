@@ -328,6 +328,32 @@ export function checkAny(
 }
 
 /**
+ * Every unexpired, applicable grant row conferring `key` on this subject, at
+ * any scope. The row-level form of `grantedScopesFor` — and what ancestor
+ * implication (§7.5) needs for attribution: an implied allow never passes
+ * through `explainKey`'s matched list, so the rows behind it have to come
+ * from somewhere if "which grant allowed this" is to stay answerable.
+ */
+export function grantsMatchingKey(
+  ctx: CheckContext,
+  key: PermissionKey,
+): GrantRow[] {
+  const rows: GrantRow[] = [];
+  for (const grant of ctx.rows.grants) {
+    if (!ctx.subjectClosure.has(grant.subject)) continue;
+    if (isExpired(grant, ctx.now)) continue;
+    if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
+    for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
+      if (patternMatchesKey(pattern, key)) {
+        rows.push(grant);
+        break;
+      }
+    }
+  }
+  return rows;
+}
+
+/**
  * The listing primitive: the scopes appearing in unexpired grant rows for
  * any member of the subject closure whose patterns match `key`. Push-down
  * filtering ("rows whose ancestor set intersects this") is built from this
@@ -338,17 +364,7 @@ export function grantedScopesFor(
   key: PermissionKey,
 ): Set<ScopeId> {
   const scopes = new Set<ScopeId>();
-  for (const grant of ctx.rows.grants) {
-    if (!ctx.subjectClosure.has(grant.subject)) continue;
-    if (isExpired(grant, ctx.now)) continue;
-    if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
-    for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
-      if (patternMatchesKey(pattern, key)) {
-        scopes.add(grant.scope);
-        break;
-      }
-    }
-  }
+  for (const grant of grantsMatchingKey(ctx, key)) scopes.add(grant.scope);
   return scopes;
 }
 

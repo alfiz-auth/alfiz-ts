@@ -44,16 +44,29 @@
  * `cacheStore` (L2) extends the same freshness rules to cold processes.
  */
 
-import type { CheckContext, CheckExplanation } from "./access.js";
+import type { CheckContext, CheckExplanation, GrantRow } from "./access.js";
 import {
   checkAny,
-  checkKey,
   explainKey,
   grantedScopesFor,
+  grantsMatchingKey,
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
 import type { CacheStore } from "./cache.js";
+import type {
+  CheckDecision,
+  CheckObservation,
+  CheckOptions,
+  CheckShape,
+  MetricsOptions,
+} from "./metrics.js";
+import {
+  MetricsRecorder,
+  attributionOf,
+  isGateShape,
+  revokeIdsOf,
+} from "./metrics.js";
 import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
@@ -138,6 +151,19 @@ export interface AlfizClientOptions {
   cacheStoreTtlMs?: number;
   /** Observes swallowed L2 errors (metrics/logging). Failures are misses either way. */
   onCacheStoreError?: (error: unknown) => void;
+  /**
+   * Permission metrics: a `CheckObservation` per evaluated check, delivered
+   * synchronously to an observer — an OpenTelemetry meter
+   * (`otelMetricsObserver`), a local aggregator you read directly
+   * (`createMetricsAggregator`), a provider sink that stores rolling usage
+   * for revocation safeguards (`createProviderMetricsSink`), or any function.
+   *
+   * Off by default, and cheap when on: `sampleRate` is evaluated with one
+   * `Math.random()` inside the call before anything is built, observers are
+   * invoked fire-and-forget, and a throwing observer can never fail a check.
+   * See metrics.ts.
+   */
+  metrics?: MetricsOptions | undefined;
   clock?: () => number;
 }
 
@@ -187,6 +213,7 @@ export interface CanFn<K extends string, S extends string = string> {
     principal: PrincipalRef,
     key: K | readonly K[],
     scope?: LooseScopeId<S>,
+    options?: CheckOptions,
   ): Promise<boolean>;
   /**
    * Bypasses all caches: fresh closure supply, fresh ancestry. Use for
@@ -197,6 +224,7 @@ export interface CanFn<K extends string, S extends string = string> {
     principal: PrincipalRef,
     key: K | readonly K[],
     scope?: LooseScopeId<S>,
+    options?: CheckOptions,
   ): Promise<boolean>;
 }
 
@@ -280,6 +308,8 @@ export class AlfizClient<
     key: PermissionKey,
     grantScope: ScopeId,
   ) => boolean;
+  /** `null` when metrics are off — the branch every check path tests first. */
+  private readonly recorder: MetricsRecorder | null;
 
   constructor(options: AlfizClientOptions) {
     this.catalog = options.catalog;
@@ -303,14 +333,17 @@ export class AlfizClient<
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
+    this.recorder =
+      options.metrics === undefined ? null : new MetricsRecorder(options.metrics);
 
     const can = (async (
       principal: PrincipalRef,
       key: K | readonly K[],
       scope?: LooseScopeId<S>,
-    ) => this.check(principal, key, scope, false)) as CanFn<K, S>;
-    can.fresh = async (principal, key, scope?) =>
-      this.check(principal, key, scope, true);
+      checkOptions?: CheckOptions,
+    ) => this.check(principal, key, scope, false, "can", checkOptions)) as CanFn<K, S>;
+    can.fresh = async (principal, key, scope?, checkOptions?) =>
+      this.check(principal, key, scope, true, "can", checkOptions);
     this.can = can;
 
     this.unsubscribe = this.provider.onInvalidate((event) =>
@@ -791,24 +824,116 @@ export class AlfizClient<
     });
   }
 
+  /**
+   * The metrics half of a check, kept in one place so every shape reports
+   * the same dimensions. Called ONLY after the sampling gate has already
+   * kept the check, so nothing here runs on an unsampled call.
+   */
+  private observe(input: {
+    sampleRate: number;
+    shape: CheckShape;
+    decision: CheckDecision;
+    permission: PermissionKey | PermissionPattern | null;
+    anyOf: boolean;
+    scope: ScopeId | undefined;
+    principal: PrincipalRef;
+    matchedGrants?: readonly GrantRow[] | undefined;
+    matchedRevokeIds?: readonly string[] | undefined;
+    implied?: boolean | undefined;
+    fresh?: boolean | undefined;
+    snapshot?: boolean | undefined;
+  }): void {
+    const recorder = this.recorder;
+    if (recorder === null) return;
+    const attribution = attributionOf(input.matchedGrants ?? []);
+    const observation: CheckObservation = {
+      at: this.now(),
+      shape: input.shape,
+      gate: isGateShape(input.shape),
+      decision: input.decision,
+      permission: input.permission,
+      anyOf: input.anyOf,
+      ...recorder.scopeDimension(input.scope),
+      principal: input.principal,
+      matchedGrantIds: attribution.matchedGrantIds,
+      soleMatchGrantId: attribution.soleMatchGrantId,
+      matchedRevokeIds: input.matchedRevokeIds ?? [],
+      roleIds: attribution.roleIds,
+      implied: input.implied ?? false,
+      fresh: input.fresh ?? false,
+      snapshot: input.snapshot ?? false,
+      sampleRate: input.sampleRate,
+    };
+    recorder.record(observation);
+  }
+
+  /** The sampling gate, or `null` when metrics are off / this call is not observed. */
+  private sampled(shape: CheckShape, options?: CheckOptions): number | null {
+    if (this.recorder === null) return null;
+    if (options?.observe === false) return null;
+    return this.recorder.sampled(shape);
+  }
+
   private async check(
     principal: PrincipalRef,
     key: K | readonly K[],
     scope: ScopeId | undefined,
     fresh: boolean,
+    shape: "can" | "require" = "can",
+    options?: CheckOptions,
   ): Promise<boolean> {
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
     this.assertKeys(keys);
+    // Sampled BEFORE the work, so an unsampled check never pays for
+    // attribution — and so the decision is one comparison, not a branch per
+    // matched row further down.
+    const sampleRate = this.sampled(shape, options);
     const [data, closure] = await Promise.all([
       this.subjectData(principal, fresh),
       this.objectClosure(scope, fresh),
     ]);
-    if (!data.active) return false;
+    const observe = (
+      decision: CheckDecision,
+      permission: PermissionKey | null,
+      matched?: {
+        grants?: readonly GrantRow[] | undefined;
+        revokeIds?: readonly string[] | undefined;
+        implied?: boolean | undefined;
+      },
+    ): void => {
+      if (sampleRate === null) return;
+      this.observe({
+        sampleRate,
+        shape,
+        decision,
+        permission,
+        anyOf: keys.length > 1,
+        scope,
+        principal,
+        matchedGrants: matched?.grants,
+        matchedRevokeIds: matched?.revokeIds,
+        implied: matched?.implied,
+        fresh,
+      });
+    };
+
+    if (!data.active) {
+      observe("deny", keys[0] ?? null);
+      return false;
+    }
     const ctx = this.ctxOf(data);
+    // `explainKey` is what `checkKey` already calls; taking its result rather
+    // than its boolean is what makes attribution free on the hot path.
+    let firstDenial: CheckExplanation | null = null;
     for (const k of keys) {
-      if (checkKey(ctx, k, closure)) return true;
+      const explanation = explainKey(ctx, k, closure);
+      if (explanation.allowed) {
+        observe("allow", k, { grants: explanation.matchedGrants });
+        return true;
+      }
+      firstDenial ??= explanation;
     }
     // Ancestor visibility (§7.5): a leaf marked impliedOnAncestors is implied
     // on PROPER ancestors of a granted scope — never at the global scope,
@@ -817,19 +942,35 @@ export class AlfizClient<
     if (scope !== undefined && scope !== GLOBAL_SCOPE) {
       for (const k of keys) {
         if (!this.catalog.leaf(k)?.impliedOnAncestors) continue;
-        if (await this.checkImplied(ctx, k, scope, fresh)) return true;
+        const implying = await this.checkImplied(ctx, k, scope, fresh);
+        if (implying !== null) {
+          observe("allow", k, { grants: implying, implied: true });
+          return true;
+        }
       }
     }
+    observe("deny", keys[0] ?? null, {
+      revokeIds: firstDenial ? revokeIdsOf(firstDenial.matchedRevokes) : [],
+    });
     return false;
   }
 
+  /**
+   * §7.5 ancestor implication. Returns the grant rows at the implying scope
+   * — not a boolean — because an implied allow bypasses `explainKey`'s
+   * matched list entirely, and "which grant allowed this" has to stay
+   * answerable for attribution and for `explain`.
+   */
   private async checkImplied(
     ctx: CheckContext,
     key: PermissionKey,
     target: ScopeId,
     fresh: boolean,
-  ): Promise<boolean> {
-    for (const grantScope of grantedScopesFor(ctx, key)) {
+  ): Promise<GrantRow[] | null> {
+    const rows = grantsMatchingKey(ctx, key);
+    const scopes = new Set<ScopeId>();
+    for (const row of rows) scopes.add(row.scope);
+    for (const grantScope of scopes) {
       if (grantScope === GLOBAL_SCOPE || grantScope === target) continue;
       const chain = await this.objectClosure(grantScope, fresh);
       if (!chain.includes(target)) continue;
@@ -843,9 +984,9 @@ export class AlfizClient<
             patternMatchesKey(r.pattern, key) &&
             chain.includes(r.scope),
         );
-      if (!suppressed) return true;
+      if (!suppressed) return rows.filter((row) => row.scope === grantScope);
     }
-    return false;
+    return null;
   }
 
   /**
@@ -890,6 +1031,11 @@ export class AlfizClient<
       data,
       ctx,
       chains,
+      // Snapshot checks are the render path's conditional-UI traffic — the
+      // highest-volume shape there is, and the one `sampleRate.visibility`
+      // exists for. `observe: false` suppresses the whole snapshot (view-as
+      // previews take it).
+      recorder: options?.observe === false ? null : this.recorder,
       // Bound to this snapshot's freshness, so `resolve` mid-request keeps
       // the same cache posture the snapshot was taken with.
       resolveChain: (scope) => this.objectClosure(scope, fresh),
@@ -901,10 +1047,39 @@ export class AlfizClient<
    * all, at any scope? Never a gate — the static verifier errors on `canAny`
    * in server actions and route handlers.
    */
-  async canAny(principal: PrincipalRef, pattern: P): Promise<boolean> {
+  async canAny(
+    principal: PrincipalRef,
+    pattern: P,
+    options?: CheckOptions,
+  ): Promise<boolean> {
+    return this.anyCheck(principal, pattern, "canAny", options);
+  }
+
+  private async anyCheck(
+    principal: PrincipalRef,
+    pattern: P,
+    shape: "canAny" | "requireAny",
+    options?: CheckOptions,
+  ): Promise<boolean> {
     this.assertPattern(pattern);
+    const sampleRate = this.sampled(shape, options);
+    const observe = (decision: CheckDecision): void => {
+      if (sampleRate === null) return;
+      this.observe({
+        sampleRate,
+        shape,
+        decision,
+        permission: pattern,
+        anyOf: false,
+        scope: undefined,
+        principal,
+      });
+    };
     const data = await this.subjectData(principal, false);
-    if (!data.active) return false;
+    if (!data.active) {
+      observe("deny");
+      return false;
+    }
     const ctx = this.ctxOf(data);
     // Resolve each distinct granted scope's chain so revoke suppression is
     // exact rather than the conservative approximation.
@@ -916,7 +1091,9 @@ export class AlfizClient<
     for (const s of scopes) {
       closures.set(s, await this.objectClosure(s, false));
     }
-    return checkAny(ctx, pattern, this.catalog.keys, closures);
+    const allowed = checkAny(ctx, pattern, this.catalog.keys, closures);
+    observe(allowed ? "allow" : "deny");
+    return allowed;
   }
 
   /**
@@ -927,12 +1104,24 @@ export class AlfizClient<
     principal: PrincipalRef,
     key: K | readonly K[],
     scope?: LooseScopeId<S>,
+    options?: CheckOptions,
   ): Promise<void> {
-    this.assertKeys(
-      (Array.isArray(key) ? key : [key]) as readonly PermissionKey[],
-    );
+    const keys = (Array.isArray(key) ? key : [key]) as readonly PermissionKey[];
+    this.assertKeys(keys);
     const data = await this.subjectData(principal, false);
     if (!data.active) {
+      const sampleRate = this.sampled("require", options);
+      if (sampleRate !== null) {
+        this.observe({
+          sampleRate,
+          shape: "require",
+          decision: "deny",
+          permission: keys[0] ?? null,
+          anyOf: keys.length > 1,
+          scope,
+          principal,
+        });
+      }
       throw new AccessDeniedError({
         reason: "inactive",
         permission: key as PermissionKey | readonly PermissionKey[],
@@ -940,7 +1129,10 @@ export class AlfizClient<
         principal,
       });
     }
-    if (!(await this.can(principal, key, scope))) {
+    // Evaluated as the `require` SHAPE, not by delegating to `can`: the
+    // throwing form is the same question asked at a different call site, and
+    // one call must produce one observation, not two.
+    if (!(await this.check(principal, key, scope, false, "require", options))) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: key as PermissionKey | readonly PermissionKey[],
@@ -957,9 +1149,13 @@ export class AlfizClient<
    * `require`. It is never an action gate; the static verifier errors on
    * `canAny`/`requireAny` in server actions and route handlers.
    */
-  async requireAny(principal: PrincipalRef, pattern: P): Promise<void> {
+  async requireAny(
+    principal: PrincipalRef,
+    pattern: P,
+    options?: CheckOptions,
+  ): Promise<void> {
     this.assertPattern(pattern);
-    if (!(await this.canAny(principal, pattern))) {
+    if (!(await this.anyCheck(principal, pattern, "requireAny", options))) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: pattern as PermissionKey,
@@ -982,6 +1178,12 @@ export class AlfizClient<
       active: boolean;
       /** Allowed only through §7.5 ancestor implication, not a direct match. */
       implied: boolean;
+      /**
+       * The grants at a DESCENDANT scope that produced an implied allow.
+       * Empty unless `implied` — `matchedGrants` stays strictly the rows
+       * matching at this scope, which for an implied allow is none.
+       */
+      impliedBy: GrantRow[];
     }
   > {
     this.assertKeys([key as PermissionKey]);
@@ -993,6 +1195,7 @@ export class AlfizClient<
     const explanation = explainKey(ctx, key as PermissionKey, closure);
     let allowed = explanation.allowed && data.active;
     let implied = false;
+    let impliedBy: GrantRow[] = [];
     if (
       !allowed &&
       data.active &&
@@ -1001,13 +1204,26 @@ export class AlfizClient<
       scope !== GLOBAL_SCOPE &&
       this.catalog.leaf(key as PermissionKey)?.impliedOnAncestors
     ) {
-      implied = await this.checkImplied(ctx, key as PermissionKey, scope, false);
+      const implying = await this.checkImplied(
+        ctx,
+        key as PermissionKey,
+        scope,
+        false,
+      );
+      implied = implying !== null;
       allowed = implied;
+      // Reported SEPARATELY from `matchedGrants`, which stays exactly what
+      // it says: rows matching at this scope. An implied allow has none —
+      // that is what makes it implied — but "which grant, at which
+      // descendant scope, implied this" is still the answer to "why", and
+      // it is what attribution counts.
+      impliedBy = implying ?? [];
     }
     return {
       ...explanation,
       allowed,
       implied,
+      impliedBy,
       objectClosure: closure,
       active: data.active,
     };
@@ -1045,11 +1261,40 @@ export class AlfizClient<
   async holds(
     principal: PrincipalRef,
     key: LooseKey<K>,
+    options?: CheckOptions,
   ): Promise<boolean> {
     this.assertKeys([key as PermissionKey]);
+    const sampleRate = this.sampled("holds", options);
     const data = await this.subjectData(principal, false);
-    if (!data.active) return false;
-    return keyHeldAnywhere(this.ctxOf(data), key as PermissionKey);
+    const observe = (decision: CheckDecision, grants?: GrantRow[]): void => {
+      if (sampleRate === null) return;
+      this.observe({
+        sampleRate,
+        shape: "holds",
+        decision,
+        permission: key as PermissionKey,
+        anyOf: false,
+        scope: undefined,
+        principal,
+        matchedGrants: grants,
+      });
+    };
+    if (!data.active) {
+      observe("deny");
+      return false;
+    }
+    const ctx = this.ctxOf(data);
+    const held = keyHeldAnywhere(ctx, key as PermissionKey);
+    // Attribution on an unscoped probe is still meaningful, and still only
+    // computed when sampled: "this grant is the only reason the button
+    // exists" is exactly the kind of thing a revocation warning should know.
+    observe(
+      held ? "allow" : "deny",
+      held && sampleRate !== null
+        ? grantsMatchingKey(ctx, key as PermissionKey)
+        : undefined,
+    );
+    return held;
   }
 
   /**
@@ -1063,11 +1308,30 @@ export class AlfizClient<
    * gates with `can` at a concrete scope. O(catalog); call once per request
    * and reuse — `snapshot(principal).heldKeys` does exactly that.
    */
-  async heldKeys(principal: PrincipalRef): Promise<PermissionKey[]> {
+  async heldKeys(
+    principal: PrincipalRef,
+    options?: CheckOptions,
+  ): Promise<PermissionKey[]> {
+    const sampleRate = this.sampled("heldKeys", options);
     const data = await this.subjectData(principal, false);
-    if (!data.active) return [];
-    const ctx = this.ctxOf(data);
-    return this.catalog.keys.filter((key) => keyHeldAnywhere(ctx, key));
+    const ctx = data.active ? this.ctxOf(data) : null;
+    const keys =
+      ctx === null ? [] : this.catalog.keys.filter((key) => keyHeldAnywhere(ctx, key));
+    if (sampleRate !== null) {
+      // One observation for the call, not one per key: `heldKeys` asks about
+      // the whole catalog at once, so `permission` is null and per-key
+      // attribution is deliberately not attempted.
+      this.observe({
+        sampleRate,
+        shape: "heldKeys",
+        decision: keys.length > 0 ? "allow" : "deny",
+        permission: null,
+        anyOf: false,
+        scope: undefined,
+        principal,
+      });
+    }
+    return keys;
   }
 }
 

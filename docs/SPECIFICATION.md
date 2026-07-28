@@ -24,7 +24,9 @@ Identity (users, sessions, organizations) is deliberately left to identity provi
 
 **Bounded staleness, stated honestly.** Caching operates on closures, not decisions, with a documented propagation bound and a fresh-read escape hatch for destructive actions.
 
-**The check path is unmetered because it is unmeterable.** Runtime checks execute in-process against local data and never touch the Service in any topology, so per-check pricing is impossible by construction — a guarantee, not a policy. The Service meters only the work it alone performs: relay sessions and admin seats, sync and registry operations, reconciler runs, retained audit volume (§17). Usage observed is work performed; an idle deployment accrues nothing.
+**The check path is never metered, because the Service is never in it.** Runtime checks execute in-process against local data and never touch the Service in any topology, so per-check pricing is impossible by construction — a guarantee, not a policy. The Service meters only the work it alone performs: relay sessions and admin seats, sync and registry operations, reconciler runs, retained audit volume (§17). Usage observed is work performed; an idle deployment accrues nothing.
+
+The guarantee is about the Service's *vantage*, not about observability as such. An application may of course count its own checks, and §18 specifies the machinery for doing so — a local observation stream feeding the deployment's own metrics stack and its own store. That data belongs to the deployment, never crosses the boundary, and is not a metering dimension. Stating the guarantee as "checks are unobservable" would have been the stronger sentence and the false one.
 
 **Progressive disclosure.** Machinery a deployment has not opted into is invisible. Nothing is requestable, approvable, multi-parent, or workflow-bound by default; a small application sees a small system.
 
@@ -404,6 +406,9 @@ The governing rule: **Client if it is a pure function over provided data; Applic
 | Hosted dashboard: assembly, styling, hosting, admin-seat management | Service (hosted tier) | Convenience over the headless kit; replaceable by construction |
 | Relay for data-plane-less consumers against linked Applications | Service (hosted tier) | Brokering infrastructure; forwards, never writes |
 | Hosted audit retention and export | Service (hosted tier) | Durable retention infrastructure; append-only convenience over the local log |
+| Check observation stream, sampling, aggregation | Client | Pure functions over the checks it already evaluates |
+| Revocation-safeguard math (`soleMatch`, warning copy) | Client | Pure function over supplied usage |
+| Metric storage, rolling usage buckets, retention | Application | One database satisfies it; the rows are the application's own |
 | Metering | Service | Counts only Service-side work; the check path is invisible to it |
 
 The most tempting places to blur lines are split deliberately. The service-principal seam: the Client defines machine scopes, the Application enforces them, the Service mints credentials, and the documented local shim (shared backend key in an environment variable, validated server-side, with a CI guard failing the build if the key module becomes client-reachable) ensures a standalone deployment is never forced onto the Service merely to expose an API. The org-root seam: organizational-domain capabilities are fully present standalone (a lone Application runs management-layer approvals against its own tree), and federation *moves* them rather than unlocking them — what federation genuinely adds is only what appears in the Service rows above. The hosted seam: the dashboard tier withholds no workflow — the headless kit builds the identical surface — so under linking the paid line is assembly and operation, and only under federation is it capability.
@@ -416,6 +421,60 @@ What the Service can observe — and therefore what it meters — is exactly the
 
 Meters are customer-legible through the same machinery as everything else: current counts per dimension are provider data readable over the contract, so a self-built admin page can render them exactly as the hosted dashboard does, and hard caps are configurable per dimension so a deployment can bound its spend absolutely. Crossing a cap degrades the metered convenience (the relay, retention ingest, a reconciler's cadence) and never any locally-running capability — an over-cap deployment loses hosted polish, not permissions.
 
-## 18. Non-goals
+**Permission metrics (§18) are not a metering dimension and are not visible here.** They are the deployment's own counts of its own checks, held in its own database; the Service neither receives them nor bills on them. The two features are named similarly and share nothing: metering counts work the Service performed, metrics count checks the application performed.
 
-The system does not maintain a synced external store of resource-shaped authorization data at any layer (instance-scoped grants live in the application's database; only org-root and catalog data federates). It does not support direct Client→Service attachment for resource-owning applications (the Application is always in the path; only data-plane-less consumers attach directly). It does not permit concurrent writers to organizational-domain data (the org root is singular, and moves only by audited promotion or demotion). It does not auto-merge reporting hierarchies (trees are not union-safe; conflicts require human resolution). It does not support negative grants on groups, roles, or objects (personal revokes only). It does not perform membership mirroring between groups (virtual parents sync access only). It does not offer configurable precedence or pluggable semantics (the Client's semantic opinions are fixed). It does not move access data across tenant boundaries under any circumstance — cross-business integration, if it ever occurs, shares contracts only (§5.2). It does not permit the Service to write a linked Application's data (the relay forwards; only the owner applies, under its own enforcement). It does not meter, price, or throttle anything on the application's request path — the Service cannot observe checks, by construction. And it does not perform cross-application *checks*: administration centralizes, enforcement never does. Every runtime check, in every topology, runs in-process against the application's own catalog and database.
+## 18. Permission metrics
+
+Two questions have no good answer from access data alone. *Which permissions are actually exercised, and how often?* — the per-action metric a product owner asks before deprecating a surface. And *if I revoke this grant, what breaks?* — the question an administrator asks with the delete button already under the cursor. Both are answerable at the one place that sees every check: the Client, in the application's own process.
+
+### 18.1 The observation stream is the feature
+
+Every evaluated check emits a structured `CheckObservation` to an optional client-configured observer: the shape (`can` / `require` / `canAny` / `requireAny` / `holds` / `heldKeys`), the decision, the permission, the scope, the principal, and the rows that decided it. Invocation is synchronous, guarded, and fire-and-forget — a throwing observer loses its observation and nothing else, and no observer failure, slowness, or outage can affect a decision or add latency to one.
+
+The observer is deliberately the *product*, not an implementation detail. A structured stream lets a deployment pipe permission metrics into the metrics stack it already runs — an OpenTelemetry adapter ships in the Client and is a few dozen lines against the same interface, as any StatsD, Prometheus, or log-line sink would be. This is strictly more capable than hosting the data would be (their dashboards, their alerting, their retention, joined to their application metrics), and it flows in the opposite direction from the Service.
+
+### 18.2 Sampling
+
+The stream carries a sample probability, evaluated with one random draw inside the call before any observation is constructed: an unsampled check costs a comparison and allocates nothing. Gates and visibility traffic sample separately, because they differ by orders of magnitude — a single server render fires hundreds of `canAny` and `holds` checks, while gates correspond one-to-one with user actions and are usually worth keeping in full.
+
+Sampling is a property of *observation only*: it can never change an answer. Every observation carries the rate that kept it, so counts extrapolate honestly, and both the observed and estimated figures are retained rather than one being silently substituted for the other.
+
+### 18.3 Cardinality
+
+Per-observation dimensions split into bounded and unbounded, and the unbounded ones are governed rather than stored:
+
+- **Bounded:** permission key (catalog-sized), decision, check shape (six values), grant / revoke / role row id (row-count-sized), scope type.
+- **Unbounded:** principal, scope instance.
+
+Scope instances aggregate to **scope type** by default — parseable from the `type:id` format with no lookup — with raw instance counting opt-in per scope type. Principals go in a bounded map with an overflow flag, giving exact distinct counts up to a cap and an honest "and more" beyond it, plus a bounded recent-principal set per attributed row (the safeguard UI needs "who is using this grant", not exact per-principal totals). Every counter map is capped and reports what it dropped. Counters are monotonic within a flush window and tagged with an instance id and window bounds, so many app servers' batches merge wherever they land.
+
+### 18.4 Attribution, and why the safeguard counts sole matchers
+
+The naive revocation metric overwarns. A check satisfied by two grant rows loses nothing when one is revoked, so "this grant matched 1 200 checks" against a row fully shadowed by a broader one teaches administrators to ignore the warning. The counterfactually correct signal is free at the same place: when exactly one row allowed a check, that row was the **sole matcher**, and revoking it would have flipped the decision. Both counters are kept per row:
+
+- `matched` — participated in an allow (usage in the loose sense);
+- `soleMatch` — was the only row allowing (revocation would have denied).
+
+Warnings key on `soleMatch`; `matched` contextualizes ("used often, but always alongside the Editors group grant"). The same machinery, mirrored, serves revokes: a revoke's counter says "this is actively suppressing N checks", and since *deleting a revoke widens access*, that warning points the opposite direction and is the more security-relevant of the two. Role ids ride along on matched grants, so role edits and deletions get the same treatment.
+
+Ancestor implication (§7.5) allows without producing a matched list, so the implying grants are reported explicitly rather than left unattributed — an implied allow is still somebody's grant.
+
+**The heuristic is stated honestly wherever it is rendered.** Usage lags, metrics are sampled and lossy, and absence of recent use never means safe to revoke — break-glass grants are precisely the rarely-used ones. The copy says "frequently load-bearing"; it never says "safe".
+
+### 18.5 Storage and reads
+
+An Application may optionally store what it is sent: rolling counter buckets (daily by default) keyed by grant id, revoke id, role id, permission key, or scope type, bounded by attributed rows × retention ÷ granularity and compacted by deleting buckets past retention. Delivery is a batch upsert of pre-aggregated windows, off the request path and never awaited by it; back-pressure drops batches rather than growing a queue, because the correct failure mode for a counter under load is losing counts, not adding latency. Counters accumulate, so batches from every app server sum into deployment-wide numbers.
+
+Reads are ordinary provider methods (`getGrantUsage`, `getRevokeUsage`, `getRoleUsage`, `getPermissionUsage`, `getScopeTypeUsage`), gated by a `metrics` capability flag exactly like `audit`: a deployment that has not opted in advertises `false`, stores nothing, and renders nothing. Per-permission counts keep gate and visibility traffic separate and never sum them — forty thousand renders and twelve actions are different numbers.
+
+Attribution follows the actor, never the preview: a view-as session records the administrator's own check and explicitly does not attribute the previewed person's grants, on the same rule that governs audit.
+
+### 18.6 What is deliberately not built
+
+Metrics are **local**. The Client hands batches to its own Application and nothing carries them further; under linking, the relay lets a dashboard *read* what the Application stored, in the same direction as every other relayed read. There is no uplink, no central metrics store, and no cross-application metrics dashboard — that would make checks observable to the Service and would require amending §1 and §17, which this specification does not do.
+
+Beyond the permission-shaped readings above, Alfiz does not become an observability vendor: no query language, no alerting, no long-horizon analytical retention, no general-purpose custom counters. The observer interface is the extension point, and it is a better one than any of those would be.
+
+## 19. Non-goals
+
+The system does not maintain a synced external store of resource-shaped authorization data at any layer (instance-scoped grants live in the application's database; only org-root and catalog data federates). It does not support direct Client→Service attachment for resource-owning applications (the Application is always in the path; only data-plane-less consumers attach directly). It does not permit concurrent writers to organizational-domain data (the org root is singular, and moves only by audited promotion or demotion). It does not auto-merge reporting hierarchies (trees are not union-safe; conflicts require human resolution). It does not support negative grants on groups, roles, or objects (personal revokes only). It does not perform membership mirroring between groups (virtual parents sync access only). It does not offer configurable precedence or pluggable semantics (the Client's semantic opinions are fixed). It does not move access data across tenant boundaries under any circumstance — cross-business integration, if it ever occurs, shares contracts only (§5.2). It does not permit the Service to write a linked Application's data (the relay forwards; only the owner applies, under its own enforcement). It does not meter, price, or throttle anything on the application's request path — the Service cannot observe checks, by construction, and permission metrics (§18) do not change that: they stay in the deployment that produced them. It does not host permission metrics centrally, aggregate them across applications, or offer a query language, alerting, or analytical retention over them — the observation stream exists so that the metrics stack a deployment already operates can do all of that better. And it does not perform cross-application *checks*: administration centralizes, enforcement never does. Every runtime check, in every topology, runs in-process against the application's own catalog and database.

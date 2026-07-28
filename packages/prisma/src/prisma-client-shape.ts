@@ -615,6 +615,69 @@ interface P7EventDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizMetric (rolling permission-usage buckets)
+// ---------------------------------------------------------------------------
+
+interface P7MetricPayload {
+  bucket: bigint;
+  dimension: string;
+  subject: string;
+  metric: string;
+  count: bigint;
+}
+
+interface P7MetricCreateInput {
+  bucket: bigint | number;
+  dimension: string;
+  subject: string;
+  metric: string;
+  count: bigint | number;
+}
+
+interface P7MetricUpdateInput {
+  bucket?: bigint | number | P7BigIntFieldUpdateOperationsInput;
+  dimension?: string;
+  subject?: string;
+  metric?: string;
+  count?: bigint | number | P7BigIntFieldUpdateOperationsInput;
+}
+
+/** The compound-`@@id` where-unique input Prisma generates for this model. */
+type P7MetricWhereUniqueInput = P7AtLeast<
+  {
+    bucket_dimension_subject_metric: {
+      bucket: bigint | number;
+      dimension: string;
+      subject: string;
+      metric: string;
+    };
+  },
+  "bucket_dimension_subject_metric"
+>;
+
+type P7MetricWhereInput = P7Where<{
+  bucket?: P7BigIntFilter | bigint | number;
+  dimension?: P7StringFilter | string;
+  subject?: P7StringFilter | string;
+  metric?: P7StringFilter | string;
+}>;
+
+interface P7MetricDelegate {
+  upsert(args: {
+    where: P7MetricWhereUniqueInput;
+    create: P7MetricCreateInput;
+    update: P7MetricUpdateInput;
+    select?: unknown;
+  }): Promise<P7MetricPayload>;
+  findMany(args?: {
+    where?: P7MetricWhereInput;
+    take?: number;
+    skip?: number;
+  }): Promise<P7MetricPayload[]>;
+  deleteMany(args?: { where?: P7MetricWhereInput }): Promise<P7BatchPayload>;
+}
+
+// ---------------------------------------------------------------------------
 // The generated client, and the assertions
 // ---------------------------------------------------------------------------
 
@@ -632,6 +695,7 @@ interface P7GeneratedClient {
   alfizAudit: P7AuditDelegate;
   alfizEpoch: P7EpochDelegate;
   alfizEvent: P7EventDelegate;
+  alfizMetric: P7MetricDelegate;
   // The client carries far more; extra members never break structural matching.
   $connect(): Promise<void>;
   $disconnect(): Promise<void>;
@@ -668,9 +732,15 @@ type _EpochDelegateOk = Assert<
 type _EventDelegateOk = Assert<
   IsAssignable<P7EventDelegate, NonNullable<AlfizPrismaDelegates["alfizEvent"]>>
 >;
-/** A client generated WITHOUT the log models must keep satisfying the bundle. */
+type _MetricDelegateOk = Assert<
+  IsAssignable<P7MetricDelegate, NonNullable<AlfizPrismaDelegates["alfizMetric"]>>
+>;
+/** A client generated WITHOUT the optional models must keep satisfying the bundle. */
 type _PreLogClientStillOk = Assert<
-  IsAssignable<Omit<P7GeneratedClient, "alfizEpoch" | "alfizEvent">, AlfizPrismaDelegates>
+  IsAssignable<
+    Omit<P7GeneratedClient, "alfizEpoch" | "alfizEvent" | "alfizMetric">,
+    AlfizPrismaDelegates
+  >
 >;
 type _ClientSatisfiesDelegates = Assert<
   IsAssignable<P7GeneratedClient, AlfizPrismaDelegates>

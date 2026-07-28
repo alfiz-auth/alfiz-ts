@@ -24,6 +24,7 @@ import type {
   AlfizEventRecord,
   AlfizGroupParentRecord,
   AlfizGroupRecord,
+  AlfizMetricRecord,
   AlfizMembershipRecord,
   AlfizPrismaDelegates,
   AlfizRequestRecord,
@@ -54,6 +55,7 @@ export function mockDelegates(): AlfizPrismaDelegates {
   const epochs = new Map<number, AlfizEpochRecord>();
   const events: AlfizEventRecord[] = [];
   const audits: AlfizAuditRecord[] = [];
+  const metrics = new Map<string, AlfizMetricRecord>();
 
   const matchingGrants = (where?: AlfizGrantWhere): AlfizGrantRecord[] =>
     [...grants.values()].filter((r) => {
@@ -404,6 +406,49 @@ export function mockDelegates(): AlfizPrismaDelegates {
           if (events[i]!.seq <= where.seq.lte) events.splice(i, 1);
         }
         return { count: before - events.length };
+      },
+    },
+
+    alfizMetric: {
+      async upsert({ where, create, update }) {
+        const id = where.bucket_dimension_subject_metric;
+        const key = `${id.bucket}|${id.dimension}|${id.subject}|${id.metric}`;
+        const row = metrics.get(key);
+        if (row === undefined) {
+          metrics.set(key, clone({ ...create }));
+        } else {
+          row.count += update.count.increment;
+        }
+        return clone(metrics.get(key)!);
+      },
+      async findMany({ where }) {
+        return [...metrics.values()]
+          .filter((row) => {
+            if (where.dimension !== undefined && row.dimension !== where.dimension) {
+              return false;
+            }
+            if (where.subject !== undefined && !where.subject.in.includes(row.subject)) {
+              return false;
+            }
+            if (where.bucket?.gte !== undefined && row.bucket < where.bucket.gte) {
+              return false;
+            }
+            if (where.bucket?.lt !== undefined && row.bucket >= where.bucket.lt) {
+              return false;
+            }
+            return true;
+          })
+          .map(clone);
+      },
+      async deleteMany({ where }) {
+        let count = 0;
+        for (const [key, row] of metrics) {
+          if (row.bucket < where.bucket.lt) {
+            metrics.delete(key);
+            count++;
+          }
+        }
+        return { count };
       },
     },
   };

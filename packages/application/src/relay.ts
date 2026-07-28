@@ -34,9 +34,13 @@ import type {
   GrantRow,
   InvalidationEvent,
   InvalidationListener,
+  MetricsBatch,
+  PermissionUsage,
   RevokeRow,
   RoleRecord,
+  RowUsage,
   ScopeId,
+  UsageQuery,
   UserGroup,
 } from "@alfiz-auth/core";
 import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz-auth/core";
@@ -84,6 +88,15 @@ export const RELAY_OPS = [
   "getReportingEdges",
   "dissolveVirtualParent",
   "listAuditEvents",
+  // Metrics ride the relay in the SAME direction as everything else: the
+  // dashboard reads usage out of the Application that stored it, and the
+  // relay forwards. No metrics data is retained at the other end.
+  "reportMetrics",
+  "getGrantUsage",
+  "getRevokeUsage",
+  "getRoleUsage",
+  "getPermissionUsage",
+  "getScopeTypeUsage",
   "epoch.head",
   "epoch.since",
   "org.exportSnapshot",
@@ -741,6 +754,30 @@ export class RelayProvider implements AlfizProvider {
     ...args: Parameters<AlfizProvider["listAuditEvents"]>
   ): ReturnType<AlfizProvider["listAuditEvents"]> {
     return this.call("listAuditEvents", args);
+  }
+
+  // -- metrics ---------------------------------------------------------------
+  // Present unconditionally on the transport; the far side answers
+  // `unsupported` when the Application stores no metrics, which is what
+  // `capabilities().metrics` tells a caller in advance.
+
+  reportMetrics(batch: MetricsBatch): Promise<void> {
+    return this.call("reportMetrics", [batch]);
+  }
+  getGrantUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.call("getGrantUsage", [query]);
+  }
+  getRevokeUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.call("getRevokeUsage", [query]);
+  }
+  getRoleUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.call("getRoleUsage", [query]);
+  }
+  getPermissionUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+    return this.call("getPermissionUsage", [query]);
+  }
+  getScopeTypeUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+    return this.call("getScopeTypeUsage", [query]);
   }
 }
 

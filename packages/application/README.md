@@ -49,6 +49,20 @@ What lives here:
   into local listeners; `startEventPoller(app)` (from `events.ts`) tails
   the log on an interval for push-like invalidation on long-lived nodes —
   optional sugar, correctness never depends on it.
+- **Metrics** (`metrics: {}`) — rolling permission-usage buckets (daily by
+  default) keyed by grant, revoke, role, permission, and scope type, fed by
+  `reportMetrics` and read back with `getGrantUsage` / `getRevokeUsage` /
+  `getRoleUsage` / `getPermissionUsage` / `getScopeTypeUsage`. Off by
+  default and advertised through `capabilities().metrics`, so a deployment
+  that has not opted in stores and renders nothing. Requires a driver
+  implementing the optional metric methods (memory and Prisma do;
+  construction fails loudly otherwise). Retention defaults to 90 days,
+  compacted opportunistically. Writes are pre-aggregated batches delivered
+  off the request path and never awaited by it: `createProviderMetricsSink`
+  (core) is the wiring, and it drops batches under back-pressure rather
+  than queueing — losing counts is the right failure mode for a counter,
+  adding latency is not. Per-grant `soleMatch` is what
+  `revocationSafeguard` (core) keys on.
 - **Closure-supply performance** — the group-parent topology is cached
   per Application (`groupTopologyTtlMs`, default 30s, `0` disables),
   busted synchronously by local group writes and by ingested events, so a

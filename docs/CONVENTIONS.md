@@ -248,6 +248,37 @@ delete path:
   `prismaMatPathWhere`). Scoped listing requires the resource table to carry
   a materialized path column or a closure table.
 
+## Metrics (optional)
+
+- Off unless configured. `metrics: { observer }` on `createAlfizClient` emits
+  one `CheckObservation` per evaluated check. The observer is called
+  SYNCHRONOUSLY on the check path: do cheap work (increment, buffer) and
+  nothing else. Throwing is contained — it costs the observation, never the
+  decision — but a slow observer is your latency, so never do I/O in one.
+- Pipe to whatever you already run. `otelMetricsObserver({ meter })` is the
+  shipped OpenTelemetry adapter; an array of observers fans out.
+  `createMetricsAggregator()` folds the stream into fixed memory with a live
+  `snapshot()` if you want to serve the numbers yourself.
+- **Sample high-traffic paths.** `sampleRate: { gate: 1, visibility: 0.02 }`
+  — gates map to user actions and are worth keeping whole; `canAny`,
+  `holds`, and `heldKeys` fire hundreds of times per render. The draw is one
+  `Math.random()` inside the call, before anything is allocated. Counts
+  carry their rate, so `estimated` is the extrapolation and `observed` is
+  what was seen. Sampling NEVER changes an answer.
+- Keep cardinality bounded. Scope instances aggregate to scope TYPE unless
+  you opt a type in (`scopeInstances: ["docs.folder"]`); do not opt in a
+  per-document type. Principals are PII-adjacent — off by default in the
+  OTel adapter, and leave them off unless you know your backend can take it.
+- To store usage locally (and get revocation safeguards), turn on
+  `metrics: {}` on the Application and wire
+  `createProviderMetricsSink(app)`. Render warnings with
+  `revocationSafeguard(usage)`: it keys on `soleMatch` — the checks a row
+  was the ONLY thing allowing — and never claims an unused grant is safe to
+  revoke. Do not write copy that does.
+- Metrics are counts, not audit: sampled, lossy, and dropped under
+  back-pressure. Never derive an authorization decision, a compliance
+  record, or a billing figure from them.
+
 ## Verification
 
 Run `alfiz-verify` (or `verifyProject` programmatically) in CI. It checks:

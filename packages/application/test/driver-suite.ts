@@ -376,3 +376,90 @@ export const eventLogContractCases: DriverCase[] = [
     },
   },
 ];
+
+/**
+ * The rolling metric buckets. Optional on the contract — a driver that
+ * implements none of these simply cannot host `metrics` — but a driver that
+ * implements them must behave exactly like this, because the safeguard
+ * numbers are only as honest as the accumulation underneath them.
+ */
+export const metricsContractCases: DriverCase[] = [
+  {
+    name: "metrics: increments accumulate on the composite key",
+    async run(driver) {
+      const key = {
+        bucket: 86_400_000,
+        dimension: "grant" as const,
+        subject: "g1",
+        metric: "matched",
+      };
+      await driver.recordMetrics!([{ ...key, count: 3 }]);
+      await driver.recordMetrics!([{ ...key, count: 4 }]);
+      // A different metric on the same row is a different counter.
+      await driver.recordMetrics!([{ ...key, metric: "soleMatch", count: 2 }]);
+
+      const rows = await driver.readMetrics!({ dimension: "grant" });
+      assert.equal(rows.length, 2);
+      assert.equal(rows.find((r) => r.metric === "matched")!.count, 7);
+      assert.equal(rows.find((r) => r.metric === "soleMatch")!.count, 2);
+    },
+  },
+  {
+    name: "metrics: reads filter by dimension, subject, and bucket window",
+    async run(driver) {
+      const base = { dimension: "grant" as const, metric: "matched", count: 1 };
+      await driver.recordMetrics!([
+        { ...base, bucket: 0, subject: "g1" },
+        { ...base, bucket: 86_400_000, subject: "g1" },
+        { ...base, bucket: 86_400_000, subject: "g2" },
+        { ...base, bucket: 86_400_000, subject: "p1", dimension: "permission" },
+      ]);
+
+      assert.equal((await driver.readMetrics!({ dimension: "grant" })).length, 3);
+      assert.equal(
+        (await driver.readMetrics!({ dimension: "permission" })).length,
+        1,
+      );
+      assert.deepEqual(
+        (
+          await driver.readMetrics!({ dimension: "grant", subjects: ["g2"] })
+        ).map((r) => r.subject),
+        ["g2"],
+      );
+      // `since` is inclusive, `until` exclusive.
+      assert.equal(
+        (await driver.readMetrics!({ dimension: "grant", since: 86_400_000 }))
+          .length,
+        2,
+      );
+      assert.equal(
+        (await driver.readMetrics!({ dimension: "grant", until: 86_400_000 }))
+          .length,
+        1,
+      );
+    },
+  },
+  {
+    name: "metrics: pruning drops buckets before the cutoff only",
+    async run(driver) {
+      const base = {
+        dimension: "grant" as const,
+        subject: "g1",
+        metric: "matched",
+        count: 1,
+      };
+      await driver.recordMetrics!([
+        { ...base, bucket: 0 },
+        { ...base, bucket: 86_400_000 },
+        { ...base, bucket: 2 * 86_400_000 },
+      ]);
+      assert.equal(await driver.pruneMetrics!(2 * 86_400_000), 2);
+      const rows = await driver.readMetrics!({ dimension: "grant" });
+      assert.deepEqual(
+        rows.map((r) => r.bucket),
+        [2 * 86_400_000],
+      );
+      assert.equal(await driver.pruneMetrics!(0), 0);
+    },
+  },
+];

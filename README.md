@@ -168,8 +168,9 @@ so call `app.notifyScopeMoved(scope)` from the code path that changes a
 parent pointer; a 60-second chain TTL (configurable) bounds staleness for
 moves that were never reported. `can.fresh()` bypasses all caches — pair it
 with destructive actions and just-in-time elevations. Nothing on your
-request path is ever metered, priced, or throttled: checks are unmeterable
-by construction.
+request path is ever metered, priced, or throttled by Alfiz Cloud: it is
+never in the path of a check, so it cannot see one, bill for one, or slow
+one down.
 
 Those TTL bounds are per process. To tighten them across processes — other
 nodes, serverless invocations — turn on the **event log**: the Application
@@ -186,6 +187,61 @@ service) gives cold processes warm closures under the same freshness rules.
 | + event log & `revalidateAfterMs` | revalidation window (e.g. 5s) + one request | 0 queries warm; ONE single-row read per window, amortized over all principals |
 | + `cacheStore` (L2) | same as above | cold starts read one cache entry + one head read instead of the closure fan-out |
 | epoch unreachable (failure) | falls back to the TTL bounds | fail-closed to the database — stale data is never served past its window |
+
+## Metrics
+
+Every check can emit a structured observation — shape, decision,
+permission, scope type, principal, and the rows that decided it. It is off
+by default, synchronous, guarded, and fire-and-forget: a sink that throws,
+hangs, or falls over loses counts and never a decision.
+
+Point it at OpenTelemetry and you are done:
+
+```ts
+import { metrics } from "@opentelemetry/api";
+
+const alfiz = createAlfizClient({
+  catalog,
+  provider: app,
+  metrics: {
+    observer: otelMetricsObserver({ meter: metrics.getMeter("alfiz") }),
+    // Gates are user actions; visibility checks are hundreds per render.
+    // Sample them separately — one Math.random() inside the call, no I/O.
+    sampleRate: { gate: 1, visibility: 0.02 },
+  },
+});
+```
+
+Or read them directly, with no external system at all — the aggregator is a
+pure, bounded, windowed fold you can serve from your own process:
+
+```ts
+const local = createMetricsAggregator();
+// metrics: { observer: local.observer }
+app.get("/internal/permission-metrics", () => Response.json(local.snapshot()));
+```
+
+Or store them, and get the question worth having: **what breaks if I revoke
+this?** Turn on `metrics: {}` on the Application (one extra table) and point
+the client at it:
+
+```ts
+const sink = createProviderMetricsSink(app);         // aggregate → batch → store
+const usage = await app.getGrantUsage({ ids: [grantId] });
+revocationSafeguard(usage[0]);
+// → "This grant was the only thing allowing 1200 checks in the last 7 days."
+```
+
+That warning keys on `soleMatch` — checks where the row was the *sole*
+matcher — not on raw participation, because a grant fully shadowed by a
+broader one loses nothing when revoked, and a warning that cries wolf gets
+clicked through. And when a grant shows no recent use, Alfiz says exactly
+that and no more: absence of use is not evidence that revoking is safe.
+
+Metrics stay where they are produced. Alfiz Cloud never receives them, they
+are not a billing dimension, and nothing about the feature puts anything new
+on your request path. Counts are sampled and lossy by design; they are
+numbers, not audit.
 
 ## Packages
 

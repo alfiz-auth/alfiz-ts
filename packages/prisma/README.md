@@ -49,6 +49,19 @@ lazily created on first append, no seed required. A client generated
 WITHOUT them still satisfies the driver interface — the driver then omits
 the optional event methods and `events.persist` refuses at construction.
 
+## Permission metrics (AlfizMetric)
+
+One more additive model backs the Application's `metrics: {}` option:
+rolling counter buckets, keyed by `(bucket, dimension, subject, metric)`
+and incremented by upsert, so every app server reporting a window sums into
+the same numbers. Storage is bounded by attributed rows × retention ÷
+bucket size, and compaction is a `deleteMany` past the retention cutoff.
+Like the log models, a client generated WITHOUT it still satisfies the
+driver interface — the driver omits the metric methods and the Application
+refuses `metrics` at construction rather than accepting batches that go
+nowhere. Nothing in this table is access data: dropping it loses counts and
+changes no decision.
+
 ## Multi-node deployments: pass an advisory lock
 
 `runExclusive` defaults to an in-process mutex, which serializes graph

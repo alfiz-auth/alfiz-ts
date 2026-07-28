@@ -10,6 +10,8 @@ import type {
   CatalogDocument,
   GrantRow,
   InvalidationEvent,
+  MetricBucket,
+  MetricBucketKey,
   RevokeRow,
   RoleRecord,
   UserGroup,
@@ -35,6 +37,10 @@ const matchesGrant = (row: GrantRow, filter?: GrantFilter): boolean => {
   return true;
 };
 
+/** Metric buckets are keyed by their full composite identity. */
+const metricKey = (key: MetricBucketKey): string =>
+  `${key.bucket}|${key.dimension}|${key.subject}|${key.metric}`;
+
 export function memoryDriver(): StorageDriver {
   const grants = new Map<string, GrantRow>();
   const revokes = new Map<string, RevokeRow>();
@@ -43,6 +49,7 @@ export function memoryDriver(): StorageDriver {
   const users = new Map<string, StoredUser>();
   const requests = new Map<string, AccessRequest>();
   const audit: AuditEvent[] = [];
+  const metrics = new Map<string, MetricBucket>();
   let catalog: { version: number; document: CatalogDocument } | null = null;
   const locks = new Map<string, Promise<unknown>>();
   const events: Array<{ seq: number; event: InvalidationEvent; at: number }> =
@@ -218,6 +225,41 @@ export function memoryDriver(): StorageDriver {
       events.splice(0, index);
       prunedThrough = pruneUpTo;
       return before - events.length;
+    },
+
+    async recordMetrics(deltas) {
+      for (const delta of deltas) {
+        const key = metricKey(delta);
+        const existing = metrics.get(key);
+        if (existing) {
+          existing.count += delta.count;
+        } else {
+          metrics.set(key, { ...delta });
+        }
+      }
+    },
+    async readMetrics(query) {
+      const wanted =
+        query.subjects === undefined ? null : new Set(query.subjects);
+      const rows: MetricBucket[] = [];
+      for (const row of metrics.values()) {
+        if (row.dimension !== query.dimension) continue;
+        if (wanted !== null && !wanted.has(row.subject)) continue;
+        if (query.since !== undefined && row.bucket < query.since) continue;
+        if (query.until !== undefined && row.bucket >= query.until) continue;
+        rows.push({ ...row });
+      }
+      return rows;
+    },
+    async pruneMetrics(before) {
+      let deleted = 0;
+      for (const [key, row] of metrics) {
+        if (row.bucket < before) {
+          metrics.delete(key);
+          deleted++;
+        }
+      }
+      return deleted;
     },
 
     async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {

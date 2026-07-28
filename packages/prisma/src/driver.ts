@@ -25,6 +25,7 @@ import type {
   CatalogDocument,
   GrantRow,
   InvalidationEvent,
+  MetricDimension,
   Provenance,
   RequestDecision,
   RevokeRow,
@@ -48,6 +49,7 @@ import type {
   AlfizGrantRecord,
   AlfizGrantWhere,
   AlfizGroupRecord,
+  AlfizMetricDelegate,
   AlfizPrismaDelegates,
   AlfizRequestData,
   AlfizRequestRecord,
@@ -578,9 +580,85 @@ export function prismaDriver(
       ? eventMethods(db.alfizEpoch, db.alfizEvent, exclusive)
       : {}),
 
+    // -- metrics --------------------------------------------------------------
+    // Included only when the schema carries the AlfizMetric model, on the
+    // same reasoning as the event log above.
+    ...(db.alfizMetric !== undefined ? metricMethods(db.alfizMetric) : {}),
+
     // -- serialization --------------------------------------------------------
     async runExclusive<T>(key: string, fn: () => Promise<T>): Promise<T> {
       return exclusive(key, fn);
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Rolling permission-usage buckets
+// ---------------------------------------------------------------------------
+
+/**
+ * Counters, not rows: every write is an increment-or-create against a
+ * composite key, so concurrent reporters from many app servers sum instead
+ * of racing, and nothing here needs a lock. Batches arrive pre-aggregated
+ * and off the request path, so the statement count is the number of distinct
+ * buckets in a window — small, and bounded by attributed rows.
+ */
+function metricMethods(
+  metric: AlfizMetricDelegate,
+): Pick<
+  Required<StorageDriver>,
+  "recordMetrics" | "readMetrics" | "pruneMetrics"
+> {
+  return {
+    async recordMetrics(deltas) {
+      for (const delta of deltas) {
+        const identity = {
+          bucket: toBig(delta.bucket),
+          dimension: delta.dimension,
+          subject: delta.subject,
+          metric: delta.metric,
+        };
+        await metric.upsert({
+          where: { bucket_dimension_subject_metric: identity },
+          create: { ...identity, count: toBig(Math.round(delta.count)) },
+          update: { count: { increment: toBig(Math.round(delta.count)) } },
+        });
+      }
+    },
+    async readMetrics(query) {
+      const rows = await metric.findMany({
+        where: {
+          dimension: query.dimension,
+          ...(query.subjects === undefined
+            ? {}
+            : { subject: { in: [...query.subjects] } }),
+          ...(query.since === undefined && query.until === undefined
+            ? {}
+            : {
+                bucket: {
+                  ...(query.since === undefined
+                    ? {}
+                    : { gte: toBig(query.since) }),
+                  ...(query.until === undefined
+                    ? {}
+                    : { lt: toBig(query.until) }),
+                },
+              }),
+        },
+      });
+      return rows.map((row) => ({
+        bucket: Number(row.bucket),
+        dimension: row.dimension as MetricDimension,
+        subject: row.subject,
+        metric: row.metric,
+        count: Number(row.count),
+      }));
+    },
+    async pruneMetrics(before) {
+      const { count } = await metric.deleteMany({
+        where: { bucket: { lt: toBig(before) } },
+      });
+      return count;
     },
   };
 }

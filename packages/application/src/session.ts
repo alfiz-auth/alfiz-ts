@@ -87,7 +87,12 @@ export class AlfizSession<
     if (!(await this.client.can(this.actorPrincipal, key, scope))) return false;
     if (this.viewAs === null) return true;
     if (this.viewAs.kind === "user") {
-      return this.client.can({ userId: this.viewAs.userId }, key, scope);
+      // `observe: false`: an administrator looking through someone's eyes
+      // did not use that person's grants. Metrics attribution never follows
+      // the preview, exactly as audit attribution never does.
+      return this.client.can({ userId: this.viewAs.userId }, key, scope, {
+        observe: false,
+      });
     }
     return this.roleCan(this.viewAs.roleId, key, scope);
   }
@@ -96,7 +101,9 @@ export class AlfizSession<
     if (!(await this.client.canAny(this.actorPrincipal, pattern))) return false;
     if (this.viewAs === null) return true;
     if (this.viewAs.kind === "user") {
-      return this.client.canAny({ userId: this.viewAs.userId }, pattern);
+      return this.client.canAny({ userId: this.viewAs.userId }, pattern, {
+        observe: false,
+      });
     }
     // Role previews: the role's patterns intersected with the catalog.
     return this.rolePatternIntersects(this.viewAs.roleId, pattern);
@@ -212,7 +219,8 @@ export class AlfizSession<
         kind: "user",
         snap: await this.client.snapshot(
           { userId: this.viewAs.userId },
-          options,
+          // The previewed side is unobserved — see `can` above.
+          { ...options, observe: false },
         ),
       };
     }

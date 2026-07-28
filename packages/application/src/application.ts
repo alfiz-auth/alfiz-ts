@@ -23,8 +23,15 @@ import type {
   GrantRow,
   InvalidationEvent,
   InvalidationListener,
+  MetricBucket,
+  MetricBucketDelta,
+  MetricDimension,
+  MetricsBatch,
+  PermissionUsage,
   PrincipalRef,
   Provenance,
+  RowUsage,
+  UsageQuery,
   RequestFilter,
   RequestInput,
   RevokeInput,
@@ -39,6 +46,12 @@ import type {
 import {
   ALFIZ_INTERNAL_NAMESPACE,
   GLOBAL_SCOPE,
+  METRIC_GATE_ALLOW,
+  METRIC_GATE_DENY,
+  METRIC_MATCHED,
+  METRIC_SOLE_MATCH,
+  METRIC_VISIBILITY_ALLOW,
+  METRIC_VISIBILITY_DENY,
   ProviderWriteRejectedError,
   applyDecision,
   canDecideStage,
@@ -114,6 +127,35 @@ export interface ApplicationOptions {
         retention?:
           | { maxAgeMs?: number | undefined; maxRows?: number | undefined }
           | undefined;
+      }
+    | undefined;
+  /**
+   * Store permission-usage metrics: rolling counter buckets keyed by grant
+   * id, revoke id, role id, permission key, and scope type, fed by
+   * `reportMetrics` and read back by the usage methods and the revocation
+   * safeguards. Off by default — a deployment that only wants numbers in its
+   * own metrics stack points the client's observer at OpenTelemetry and
+   * never enables this.
+   *
+   * Requires a storage driver implementing `recordMetrics`, `readMetrics`,
+   * and `pruneMetrics`; construction throws when they are missing, on the
+   * same reasoning as `events.persist` — silently accepting metrics that go
+   * nowhere would make every safeguard read a confident zero.
+   */
+  metrics?:
+    | {
+        /**
+         * Bucket granularity (ms). Default one day. Storage is bounded by
+         * attributed rows × retention ÷ granularity, so this is the knob
+         * that trades resolution for rows.
+         */
+        bucketMs?: number | undefined;
+        /**
+         * How long buckets are kept (ms). Default 90 days. Pruning is
+         * opportunistic and off the write path — a failed prune costs disk,
+         * not correctness.
+         */
+        retentionMs?: number | undefined;
       }
     | undefined;
   clock?: (() => number) | undefined;
@@ -210,6 +252,10 @@ export class AlfizApplication<
    */
   private readonly pendingEvents: InvalidationEvent[] = [];
   private appendsSincePrune = 0;
+  private readonly metricsEnabled: boolean;
+  private readonly metricsBucketMs: number;
+  private readonly metricsRetentionMs: number;
+  private reportsSinceMetricPrune = 0;
 
   constructor(options: ApplicationOptions) {
     this.catalog = options.catalog;
@@ -246,6 +292,22 @@ export class AlfizApplication<
       };
     } else {
       this.epoch = undefined;
+    }
+
+    this.metricsEnabled = options.metrics !== undefined;
+    this.metricsBucketMs = options.metrics?.bucketMs ?? 86_400_000;
+    this.metricsRetentionMs = options.metrics?.retentionMs ?? 90 * 86_400_000;
+    if (this.metricsEnabled) {
+      const { storage } = this;
+      if (!storage.recordMetrics || !storage.readMetrics || !storage.pruneMetrics) {
+        // Same reasoning as `events.persist`: accepting batches that go
+        // nowhere would make every safeguard read a confident zero, which is
+        // worse than no safeguard at all.
+        throw new ProviderWriteRejectedError(
+          "metrics requires a storage driver implementing recordMetrics, readMetrics, and pruneMetrics",
+          "unsupported",
+        );
+      }
     }
   }
 
@@ -418,6 +480,7 @@ export class AlfizApplication<
       reporting: users.some((u) => u.managerUserId !== null),
       audit: true,
       multiParent,
+      metrics: this.metricsEnabled,
     };
   }
 
@@ -1919,6 +1982,237 @@ export class AlfizApplication<
     limit?: number | undefined;
   }): Promise<AuditEvent[]> {
     return this.storage.listAudit(filter);
+  }
+
+  // -- metrics ---------------------------------------------------------------
+  // Aggregated windows in, rolling usage out. Everything here sits off the
+  // request path by construction: the client aggregates in memory and hands
+  // over batches on its own schedule, and nothing in a check, a render, or a
+  // row write ever waits on this store.
+
+  private requireMetrics(): void {
+    if (!this.metricsEnabled) {
+      throw new ProviderWriteRejectedError(
+        "metrics are not enabled on this Application (pass `metrics: {}` to createAlfizApplication)",
+        "unsupported",
+      );
+    }
+  }
+
+  /** Floors an instant to its bucket start — daily by default. */
+  private bucketOf(at: number): number {
+    return Math.floor(at / this.metricsBucketMs) * this.metricsBucketMs;
+  }
+
+  /**
+   * Ingest one aggregated window. Counters accumulate, so batches from many
+   * app servers — each with its own client and its own instance id — sum
+   * into the same buckets, which is what makes the numbers deployment-wide.
+   *
+   * Nothing is validated against the catalog here: a metrics row is a
+   * counter, not access data, and rejecting a batch because one permission
+   * key was tombstoned mid-deploy would lose the whole window.
+   */
+  async reportMetrics(batch: MetricsBatch): Promise<void> {
+    this.requireMetrics();
+    const bucket = this.bucketOf(batch.windowStart);
+    // Merged before writing: two check counters differing only by shape fold
+    // into one gate-allow increment, so the batch costs as few statements as
+    // its distinct buckets, not as many as its counters.
+    const deltas = new Map<string, MetricBucketDelta>();
+    const add = (
+      dimension: MetricDimension,
+      subject: string,
+      metric: string,
+      count: number,
+    ): void => {
+      if (count <= 0) return;
+      const key = `${dimension}|${subject}|${metric}`;
+      const existing = deltas.get(key);
+      if (existing) existing.count += count;
+      else deltas.set(key, { bucket, dimension, subject, metric, count });
+    };
+
+    for (const row of batch.grants) {
+      add("grant", row.rowId, METRIC_MATCHED, row.estimatedMatched);
+      add("grant", row.rowId, METRIC_SOLE_MATCH, row.estimatedSoleMatch);
+    }
+    for (const row of batch.revokes) {
+      add("revoke", row.rowId, METRIC_MATCHED, row.estimatedMatched);
+      add("revoke", row.rowId, METRIC_SOLE_MATCH, row.estimatedSoleMatch);
+    }
+    for (const row of batch.roles) {
+      add("role", row.rowId, METRIC_MATCHED, row.estimatedMatched);
+      add("role", row.rowId, METRIC_SOLE_MATCH, row.estimatedSoleMatch);
+    }
+    for (const counter of batch.checks) {
+      const metric = counter.gate
+        ? counter.decision === "allow"
+          ? METRIC_GATE_ALLOW
+          : METRIC_GATE_DENY
+        : counter.decision === "allow"
+          ? METRIC_VISIBILITY_ALLOW
+          : METRIC_VISIBILITY_DENY;
+      add("permission", counter.permission, metric, counter.estimated);
+      // Two flat rollups rather than their cross product: bounded by
+      // catalog size and by scope-type count, and enough for every question
+      // the shipped surfaces ask.
+      add("scopeType", counter.scopeType, metric, counter.estimated);
+    }
+    if (deltas.size === 0) return;
+    await this.storage.recordMetrics!([...deltas.values()]);
+
+    // Retention compaction, opportunistic and unawaited — a failed prune
+    // costs disk, not correctness. Same posture as event-log pruning.
+    if (++this.reportsSinceMetricPrune >= 32) {
+      this.reportsSinceMetricPrune = 0;
+      void this.storage
+        .pruneMetrics!(this.bucketOf(this.now() - this.metricsRetentionMs))
+        .catch(() => undefined);
+    }
+  }
+
+  /** Bucket reads shared by every usage method. */
+  private async usageBuckets(
+    dimension: MetricDimension,
+    query: UsageQuery | undefined,
+  ): Promise<{
+    rows: MetricBucket[];
+    windowStart: number;
+    windowEnd: number;
+  }> {
+    this.requireMetrics();
+    const until = query?.until ?? this.now();
+    const since = query?.since ?? until - this.metricsRetentionMs;
+    const rows = await this.storage.readMetrics!({
+      dimension,
+      ...(query?.ids === undefined ? {} : { subjects: query.ids }),
+      since: this.bucketOf(since),
+      until,
+    });
+    return { rows, windowStart: since, windowEnd: until };
+  }
+
+  private async rowUsage(
+    dimension: MetricDimension,
+    query: UsageQuery | undefined,
+  ): Promise<RowUsage[]> {
+    const { rows, windowStart, windowEnd } = await this.usageBuckets(
+      dimension,
+      query,
+    );
+    const bySubject = new Map<string, RowUsage>();
+    for (const row of rows) {
+      let usage = bySubject.get(row.subject);
+      if (usage === undefined) {
+        usage = {
+          rowId: row.subject,
+          matched: 0,
+          soleMatch: 0,
+          windowStart,
+          windowEnd,
+          buckets: [],
+        };
+        bySubject.set(row.subject, usage);
+      }
+      let bucket = usage.buckets.find((b) => b.bucket === row.bucket);
+      if (bucket === undefined) {
+        bucket = { bucket: row.bucket, matched: 0, soleMatch: 0 };
+        usage.buckets.push(bucket);
+      }
+      if (row.metric === METRIC_MATCHED) {
+        usage.matched += row.count;
+        bucket.matched += row.count;
+      } else if (row.metric === METRIC_SOLE_MATCH) {
+        usage.soleMatch += row.count;
+        bucket.soleMatch += row.count;
+      }
+    }
+    for (const usage of bySubject.values()) {
+      usage.buckets.sort((a, b) => a.bucket - b.bucket);
+    }
+    return [...bySubject.values()];
+  }
+
+  /**
+   * Per-grant usage. `soleMatch` is the counterfactual one — the checks this
+   * row was the ONLY thing allowing, which is exactly the number that would
+   * have flipped to deny had it not existed. Feed it to
+   * `revocationSafeguard` for the warning copy.
+   */
+  async getGrantUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.rowUsage("grant", query);
+  }
+
+  /** Per-revoke usage: checks each revoke suppressed. Deleting one widens access. */
+  async getRevokeUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.rowUsage("revoke", query);
+  }
+
+  /** Per-role usage, for role-edit and role-delete safeguards. */
+  async getRoleUsage(query?: UsageQuery): Promise<RowUsage[]> {
+    return this.rowUsage("role", query);
+  }
+
+  /**
+   * Per-permission counts — the per-action metric. Gate and visibility
+   * traffic are reported separately and never summed: a project that renders
+   * a nav item on every page would otherwise drown out every action in the
+   * catalog.
+   */
+  async getPermissionUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+    return this.keyedUsage("permission", query);
+  }
+
+  /**
+   * Per-scope-type counts — the same rollup keyed by scope type. "Which
+   * parts of the hierarchy are actually checked" is a capacity question,
+   * not an access one, and it is the reading that tells you whether a scope
+   * type earns its complexity.
+   */
+  async getScopeTypeUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+    return this.keyedUsage("scopeType", query);
+  }
+
+  private async keyedUsage(
+    dimension: MetricDimension,
+    query: UsageQuery | undefined,
+  ): Promise<PermissionUsage[]> {
+    const { rows, windowStart, windowEnd } = await this.usageBuckets(
+      dimension,
+      query,
+    );
+    const byKey = new Map<string, PermissionUsage>();
+    for (const row of rows) {
+      let usage = byKey.get(row.subject);
+      if (usage === undefined) {
+        usage = {
+          permission: row.subject,
+          gateAllow: 0,
+          gateDeny: 0,
+          visibilityAllow: 0,
+          visibilityDeny: 0,
+          windowStart,
+          windowEnd,
+        };
+        byKey.set(row.subject, usage);
+      }
+      switch (row.metric) {
+        case METRIC_GATE_ALLOW:
+          usage.gateAllow += row.count;
+          break;
+        case METRIC_GATE_DENY:
+          usage.gateDeny += row.count;
+          break;
+        case METRIC_VISIBILITY_ALLOW:
+          usage.visibilityAllow += row.count;
+          break;
+        case METRIC_VISIBILITY_DENY:
+          usage.visibilityDeny += row.count;
+          break;
+      }
+    }
+    return [...byKey.values()];
   }
 
   // -- directory ingestion (org-root only) ----------------------------------

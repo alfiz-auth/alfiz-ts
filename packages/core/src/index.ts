@@ -23,3 +23,5 @@ export * from "./client.js";
 export * from "./snapshot.js";
 export * from "./listing.js";
 export * from "./tree.js";
+export * from "./metrics.js";
+export * from "./otel.js";

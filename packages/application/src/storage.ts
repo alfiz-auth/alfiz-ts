@@ -15,6 +15,9 @@ import type {
   CatalogDocument,
   GrantRow,
   InvalidationEvent,
+  MetricBucket,
+  MetricBucketDelta,
+  MetricBucketQuery,
   RevokeRow,
   RoleRecord,
   ScopeId,
@@ -155,6 +158,28 @@ export interface StorageDriver {
     at?: number | undefined;
     keepRows?: number | undefined;
   }): Promise<number>;
+
+  // -- metrics (OPTIONAL — the rolling usage buckets) -----------------------
+  // Implementing all three enables `metrics` on the Application: aggregated
+  // check counts, bucketed by time and keyed by grant id, revoke id, role
+  // id, permission key, or scope type. Storage is bounded by
+  // (attributed rows × retention buckets), writes arrive pre-aggregated and
+  // batched off the request path, and retention compaction is a delete.
+  //
+  // Counters ACCUMULATE: `recordMetrics` increments, it does not replace.
+  // Many app servers report into the same buckets and their counts sum,
+  // which is what makes the numbers whole-deployment numbers.
+
+  /**
+   * Applies a batch of counter increments, creating rows that do not exist.
+   * One statement per bucket at worst; an upsert-with-increment where the
+   * database has one.
+   */
+  recordMetrics?(deltas: readonly MetricBucketDelta[]): Promise<void>;
+  /** Buckets matching the query, in any order. */
+  readMetrics?(query: MetricBucketQuery): Promise<MetricBucket[]>;
+  /** Deletes buckets starting before `before` (epoch ms). Returns the count. */
+  pruneMetrics?(before: number): Promise<number>;
 
   /**
    * Serialize graph writes: two concurrent edge insertions can each be

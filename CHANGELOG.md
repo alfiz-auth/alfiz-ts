@@ -1,5 +1,137 @@
 # Changelog
 
+## 0.5.0 — permission metrics
+
+Two questions had no good answer from access data alone. *Which permissions
+are actually exercised?* — the one a product owner asks before deprecating a
+surface. And *if I revoke this grant, what breaks?* — the one an
+administrator asks with the delete button already under the cursor. Both are
+answerable at the only place that sees every check: the Client, in your own
+process.
+
+### The observation stream
+
+Every evaluated check can emit a structured `CheckObservation` — shape,
+decision, permission, scope type, principal, and the rows that decided it —
+to an observer you configure. It is off by default, synchronous, guarded,
+and fire-and-forget: an observer that throws, hangs, or falls over loses
+counts and never a decision, and nothing in the feature can add latency to a
+check.
+
+The observer is the product, not an implementation detail, and the shipped
+OpenTelemetry adapter is the proof — a few dozen lines against the same
+interface any sink of yours would use:
+
+```ts
+const alfiz = createAlfizClient({
+  catalog,
+  provider: app,
+  metrics: {
+    observer: otelMetricsObserver({ meter: metrics.getMeter("alfiz") }),
+    sampleRate: { gate: 1, visibility: 0.02 },
+  },
+});
+```
+
+Your dashboards, your alerting, your retention, joined to your application
+metrics. Alfiz does not host any of that and is not going to.
+
+### Sampling, for the request paths that need it
+
+`sampleRate` is evaluated with one random draw *inside the call*, before any
+observation is built — an unsampled check costs a comparison and allocates
+nothing. No storage read, no coordination: not pure, and fast, which is the
+trade a high-traffic path wants.
+
+Gates and visibility traffic sample separately, because they differ by
+orders of magnitude: one server render fires hundreds of `canAny` and
+`holds` checks, while gates correspond one-to-one with user actions and are
+usually worth keeping whole. Every observation carries the rate that kept
+it, so counts extrapolate honestly — and both figures survive, `observed`
+next to `estimated`, rather than one quietly standing in for the other.
+
+Sampling decides only whether a check is **counted**. It can never change an
+answer.
+
+### Reading them directly
+
+`createMetricsAggregator()` is a pure, windowed, bounded fold over the
+stream with a live `snapshot()` — a complete metrics API with no external
+system and no storage:
+
+```ts
+const local = createMetricsAggregator();
+app.get("/internal/permission-metrics", () => Response.json(local.snapshot()));
+```
+
+Memory is fixed regardless of traffic: scope instances aggregate to scope
+**type** unless a type opts in, principals live in a bounded map with an
+overflow flag, every counter map is capped, and each batch reports what it
+dropped. Windows are tagged with an instance id, so many app servers merge.
+
+### Storing them, and the revocation safeguard
+
+`metrics: {}` on the Application adds one table of rolling daily counters,
+keyed by grant, revoke, role, permission, and scope type, with retention
+compaction. `createProviderMetricsSink(app)` wires the client to it.
+Delivery is batched, pre-aggregated, unawaited, and back-pressured — under
+load it drops batches rather than growing a queue, because the right failure
+mode for a counter is losing counts, not adding latency.
+
+What that buys is the warning:
+
+```ts
+revocationSafeguard((await app.getGrantUsage({ ids: [grantId] }))[0]);
+// → "This grant was the only thing allowing 1200 checks in the last 7 days."
+```
+
+It keys on **`soleMatch`** — checks where the row was the *sole* matcher —
+not on raw participation. A check satisfied by two grants loses nothing when
+one is revoked, so warning about a grant fully shadowed by a broader one
+just teaches administrators to click through warnings; that case reads
+"matched 40 000 checks, but was never the only thing allowing them" instead.
+Revokes get the mirrored treatment, pointing the other way: deleting a
+revoke *widens* access.
+
+And when a grant shows no recent use, the copy says exactly that and stops.
+Absence of use is not evidence that revoking is safe — break-glass access is
+precisely the kind that sits unused for months.
+
+### Also in this release
+
+- **`capabilities().metrics`** joins the provider contract, gating the new
+  optional `reportMetrics` / `get*Usage` methods exactly as `audit` gates the
+  audit log. A deployment that has not opted in advertises `false`, stores
+  nothing, and renders nothing.
+- **`StorageDriver.recordMetrics` / `readMetrics` / `pruneMetrics`** are
+  optional, implemented by the memory and Prisma drivers. The Prisma schema
+  fragment gains one model, `AlfizMetric`; a client generated without it
+  still satisfies the delegate bundle, and enabling `metrics` against a
+  driver that cannot store them throws at construction rather than accepting
+  batches that go nowhere.
+- **`explain()` gains `impliedBy`** — the grants at a descendant scope behind
+  a §7.5 ancestor implication. `matchedGrants` keeps its exact meaning (rows
+  matching *at this scope*), so an implied allow still reports none there.
+- **Check shapes take an optional `CheckOptions`** (`{ observe }`), and
+  `snapshot()` an `observe` flag. View-as previews set it: an administrator
+  looking through someone's eyes did not use that person's grants, and
+  attribution never follows the preview.
+- **`require` and `requireAny` no longer delegate** to `can` / `canAny`
+  internally. One call now produces one observation, named for the shape
+  actually called.
+
+### The guarantee, restated precisely
+
+The old sentence — "checks are unmeterable by construction" — was the
+stronger claim and, with this release, the false one. The durable one is
+about dependency, and it is unchanged: **Alfiz Cloud is never in the path of
+a check**, so it cannot see one, bill for one, or slow one down. Permission
+metrics are your counts of your checks, in your database. There is no
+uplink, no central metrics store, and no cross-application metrics
+dashboard — that would make checks observable to the Service, and would be a
+deliberate amendment to the specification rather than a side effect of a
+feature. See §18 of `docs/SPECIFICATION.md`.
+
 ## 0.4.0 — the catalog says what it means
 
 The catalog input was overcommitted to a shape the data model never had.

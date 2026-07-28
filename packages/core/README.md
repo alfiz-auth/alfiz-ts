@@ -56,6 +56,21 @@ data a provider supplies — no storage, no I/O.
   closure-table query helpers.
 - **Headless tree** (`tree.ts`) — the wildcard-aware permission-tree
   selection logic behind role editors and grant pickers.
+- **Metrics** (`metrics.ts`, `otel.ts`) — the optional `CheckObservation`
+  stream off every check path, with the shape, decision, permission, scope
+  type, principal, and the rows that decided it. Sync, guarded, and
+  fire-and-forget: an observer that throws or hangs loses counts, never a
+  decision. `sampleRate` is one random draw inside the call before anything
+  is built (gates and visibility traffic sampled separately, each
+  observation carrying the rate that kept it, so counts extrapolate);
+  `createMetricsAggregator` is a pure bounded windowed fold with a live
+  `snapshot()` — a complete direct-read API needing no external system;
+  `otelMetricsObserver` writes into an OpenTelemetry `Meter` (structurally
+  typed, so `@opentelemetry/api` is not a dependency);
+  `createProviderMetricsSink` batches to a provider that stores usage; and
+  `revocationSafeguard` turns stored usage into the "what breaks if I revoke
+  this" warning — keyed on `soleMatch`, the counterfactual, never on raw
+  participation, and never claiming an unused grant is safe to remove.
 - **Provider contract** (`provider.ts`) — the single interface every
   provider implements; capability discovery for progressive disclosure.
 

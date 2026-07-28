@@ -47,15 +47,22 @@
  * being evaluated.
  */
 
-import type { CheckContext, CheckExplanation } from "./access.js";
+import type { CheckContext, CheckExplanation, GrantRow } from "./access.js";
 import {
   checkAny,
-  checkKey,
   explainKey,
   grantedScopesFor,
+  grantsMatchingKey,
   keyHeldAnywhere,
   revokedScopesFor,
 } from "./access.js";
+import type {
+  CheckDecision,
+  CheckObservation,
+  CheckShape,
+  MetricsRecorder,
+} from "./metrics.js";
+import { attributionOf, isGateShape, revokeIdsOf } from "./metrics.js";
 import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import {
@@ -80,6 +87,13 @@ export interface SnapshotOptions<S extends string = string> {
   scopes?: readonly LooseScopeId<S>[] | undefined;
   /** Bypass the client's caches: fresh closure supply, fresh ancestry. */
   fresh?: boolean | undefined;
+  /**
+   * Record metrics observations for checks made on this snapshot. Default
+   * `true` (and inert unless the client has `metrics` configured). View-as
+   * previews pass `false` on the previewed subject's side — attribution
+   * never follows the preview.
+   */
+  observe?: boolean | undefined;
 }
 
 /** Everything a snapshot evaluates over — assembled by `AlfizClient.snapshot`. */
@@ -97,6 +111,12 @@ export interface SnapshotInit {
    * consistency guarantee survives.
    */
   resolveChain: (scope: ScopeId) => Promise<readonly ScopeId[]>;
+  /**
+   * The client's metrics recorder, or `null` for an unobserved snapshot.
+   * Snapshot checks are synchronous and by far the highest-volume shape, so
+   * the sampling gate matters most here.
+   */
+  recorder?: MetricsRecorder | null | undefined;
 }
 
 const GLOBAL_CLOSURE: readonly ScopeId[] = [GLOBAL_SCOPE];
@@ -124,6 +144,7 @@ export class AlfizSnapshot<
   private readonly ctx: CheckContext;
   private readonly chains: Map<ScopeId, readonly ScopeId[]>;
   private readonly resolveChain: (scope: ScopeId) => Promise<readonly ScopeId[]>;
+  private readonly recorder: MetricsRecorder | null;
   private held: Set<PermissionKey> | null = null;
 
   constructor(init: SnapshotInit) {
@@ -134,7 +155,52 @@ export class AlfizSnapshot<
     this.ctx = init.ctx;
     this.chains = init.chains;
     this.resolveChain = init.resolveChain;
+    this.recorder = init.recorder ?? null;
     this.at = init.ctx.now;
+  }
+
+  /**
+   * The snapshot's metrics half. `at` is the SNAPSHOT's instant, not the
+   * sink's: every check in a request shares one clock, and the observation
+   * stream should say so.
+   */
+  private observe(input: {
+    sampleRate: number;
+    shape: CheckShape;
+    decision: CheckDecision;
+    permission: PermissionKey | PermissionPattern | null;
+    anyOf: boolean;
+    scope: ScopeId | undefined;
+    matchedGrants?: readonly GrantRow[] | undefined;
+    matchedRevokeIds?: readonly string[] | undefined;
+    implied?: boolean | undefined;
+  }): void {
+    const recorder = this.recorder;
+    if (recorder === null) return;
+    const attribution = attributionOf(input.matchedGrants ?? []);
+    const observation: CheckObservation = {
+      at: this.at,
+      shape: input.shape,
+      gate: isGateShape(input.shape),
+      decision: input.decision,
+      permission: input.permission,
+      anyOf: input.anyOf,
+      ...recorder.scopeDimension(input.scope),
+      principal: this.principal,
+      matchedGrantIds: attribution.matchedGrantIds,
+      soleMatchGrantId: attribution.soleMatchGrantId,
+      matchedRevokeIds: input.matchedRevokeIds ?? [],
+      roleIds: attribution.roleIds,
+      implied: input.implied ?? false,
+      fresh: false,
+      snapshot: true,
+      sampleRate: input.sampleRate,
+    };
+    recorder.record(observation);
+  }
+
+  private sampled(shape: CheckShape): number | null {
+    return this.recorder === null ? null : this.recorder.sampled(shape);
   }
 
   /**
@@ -231,9 +297,12 @@ export class AlfizSnapshot<
    * §7.5 ancestor implication, evaluated against the pre-resolved chains of
    * the principal's granted scopes — same result as `AlfizClient.can`.
    */
-  private impliedAt(key: PermissionKey, target: ScopeId): boolean {
-    if (!this.catalog.leaf(key)?.impliedOnAncestors) return false;
-    for (const grantScope of grantedScopesFor(this.ctx, key)) {
+  private impliedAt(key: PermissionKey, target: ScopeId): GrantRow[] | null {
+    if (!this.catalog.leaf(key)?.impliedOnAncestors) return null;
+    const rows = grantsMatchingKey(this.ctx, key);
+    const scopes = new Set<ScopeId>();
+    for (const row of rows) scopes.add(row.scope);
+    for (const grantScope of scopes) {
       if (grantScope === GLOBAL_SCOPE || grantScope === target) continue;
       const chain = this.chains.get(grantScope);
       if (!chain || !chain.includes(target)) continue;
@@ -245,27 +314,74 @@ export class AlfizSnapshot<
             patternMatchesKey(r.pattern, key) &&
             chain.includes(r.scope),
         );
-      if (!suppressed) return true;
+      if (!suppressed) return rows.filter((row) => row.scope === grantScope);
     }
-    return false;
+    return null;
   }
 
   /** Synchronous `can`: agrees with `client.can` for every resolvable scope. */
   can(key: K | readonly K[], scope?: LooseScopeId<S>): boolean {
+    return this.gate(key, scope, "can");
+  }
+
+  private gate(
+    key: K | readonly K[],
+    scope: LooseScopeId<S> | undefined,
+    shape: "can" | "require",
+  ): boolean {
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
     this.assertKeys(keys);
-    if (!this.active) return false;
+    const sampleRate = this.sampled(shape);
+    const observe = (
+      decision: CheckDecision,
+      permission: PermissionKey | null,
+      matched?: {
+        grants?: readonly GrantRow[] | undefined;
+        revokeIds?: readonly string[] | undefined;
+        implied?: boolean | undefined;
+      },
+    ): void => {
+      if (sampleRate === null) return;
+      this.observe({
+        sampleRate,
+        shape,
+        decision,
+        permission,
+        anyOf: keys.length > 1,
+        scope,
+        matchedGrants: matched?.grants,
+        matchedRevokeIds: matched?.revokeIds,
+        implied: matched?.implied,
+      });
+    };
+    if (!this.active) {
+      observe("deny", keys[0] ?? null);
+      return false;
+    }
     const closure = this.closureOf(scope);
+    let firstDenial: CheckExplanation | null = null;
     for (const k of keys) {
-      if (checkKey(this.ctx, k, closure)) return true;
+      const explanation = explainKey(this.ctx, k, closure);
+      if (explanation.allowed) {
+        observe("allow", k, { grants: explanation.matchedGrants });
+        return true;
+      }
+      firstDenial ??= explanation;
     }
     if (scope !== undefined && scope !== GLOBAL_SCOPE) {
       for (const k of keys) {
-        if (this.impliedAt(k, scope)) return true;
+        const implying = this.impliedAt(k, scope);
+        if (implying !== null) {
+          observe("allow", k, { grants: implying, implied: true });
+          return true;
+        }
       }
     }
+    observe("deny", keys[0] ?? null, {
+      revokeIds: firstDenial ? revokeIdsOf(firstDenial.matchedRevokes) : [],
+    });
     return false;
   }
 
@@ -275,17 +391,43 @@ export class AlfizSnapshot<
    * time. Never a gate — same rule as the client's.
    */
   canAny(pattern: P): boolean {
+    return this.anyCheck(pattern, "canAny");
+  }
+
+  private anyCheck(pattern: P, shape: "canAny" | "requireAny"): boolean {
     this.assertPattern(pattern);
-    if (!this.active) return false;
-    return checkAny(this.ctx, pattern, this.catalog.keys, this.chains);
+    const allowed =
+      this.active && checkAny(this.ctx, pattern, this.catalog.keys, this.chains);
+    const sampleRate = this.sampled(shape);
+    if (sampleRate !== null) {
+      this.observe({
+        sampleRate,
+        shape,
+        decision: allowed ? "allow" : "deny",
+        permission: pattern,
+        anyOf: false,
+        scope: undefined,
+      });
+    }
+    return allowed;
   }
 
   /** Throwing form of `can`. */
   require(key: K | readonly K[], scope?: LooseScopeId<S>): void {
-    this.assertKeys(
-      (Array.isArray(key) ? key : [key]) as readonly PermissionKey[],
-    );
+    const keys = (Array.isArray(key) ? key : [key]) as readonly PermissionKey[];
+    this.assertKeys(keys);
     if (!this.active) {
+      const sampleRate = this.sampled("require");
+      if (sampleRate !== null) {
+        this.observe({
+          sampleRate,
+          shape: "require",
+          decision: "deny",
+          permission: keys[0] ?? null,
+          anyOf: keys.length > 1,
+          scope,
+        });
+      }
       throw new AccessDeniedError({
         reason: "inactive",
         permission: key as PermissionKey | readonly PermissionKey[],
@@ -293,7 +435,7 @@ export class AlfizSnapshot<
         principal: this.principal,
       });
     }
-    if (!this.can(key, scope)) {
+    if (!this.gate(key, scope, "require")) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: key as PermissionKey | readonly PermissionKey[],
@@ -311,7 +453,7 @@ export class AlfizSnapshot<
    */
   requireAny(pattern: P): void {
     this.assertPattern(pattern);
-    if (!this.canAny(pattern)) {
+    if (!this.anyCheck(pattern, "requireAny")) {
       throw new AccessDeniedError({
         reason: this.active ? "forbidden" : "inactive",
         permission: pattern as PermissionKey,
@@ -333,6 +475,20 @@ export class AlfizSnapshot<
           ? this.catalog.keys.filter((key) => keyHeldAnywhere(this.ctx, key))
           : [],
       );
+      // Observed on the COMPUTATION, not on each read: the set is memoized
+      // per snapshot, so counting every access would count re-reads of one
+      // answer as new traffic.
+      const sampleRate = this.sampled("heldKeys");
+      if (sampleRate !== null) {
+        this.observe({
+          sampleRate,
+          shape: "heldKeys",
+          decision: this.held.size > 0 ? "allow" : "deny",
+          permission: null,
+          anyOf: false,
+          scope: undefined,
+        });
+      }
     }
     return this.held;
   }
@@ -344,8 +500,22 @@ export class AlfizSnapshot<
    */
   holds(key: LooseKey<K>): boolean {
     this.assertKeys([key as PermissionKey]);
-    if (!this.active) return false;
-    return keyHeldAnywhere(this.ctx, key as PermissionKey);
+    const held = this.active && keyHeldAnywhere(this.ctx, key as PermissionKey);
+    const sampleRate = this.sampled("holds");
+    if (sampleRate !== null) {
+      this.observe({
+        sampleRate,
+        shape: "holds",
+        decision: held ? "allow" : "deny",
+        permission: key as PermissionKey,
+        anyOf: false,
+        scope: undefined,
+        matchedGrants: held
+          ? grantsMatchingKey(this.ctx, key as PermissionKey)
+          : undefined,
+      });
+    }
+    return held;
   }
 
   /** The listing primitive, synchronously — feed to `planListing`. */
@@ -370,12 +540,18 @@ export class AlfizSnapshot<
     active: boolean;
     /** Allowed only through §7.5 ancestor implication, not a direct match. */
     implied: boolean;
+    /**
+     * The grants at a DESCENDANT scope that produced an implied allow.
+     * Empty unless `implied` — see `AlfizClient.explain`.
+     */
+    impliedBy: GrantRow[];
   } {
     this.assertKeys([key as PermissionKey]);
     const closure = this.closureOf(scope);
     const explanation = explainKey(this.ctx, key as PermissionKey, closure);
     let allowed = explanation.allowed && this.active;
     let implied = false;
+    let impliedBy: GrantRow[] = [];
     if (
       !allowed &&
       this.active &&
@@ -383,13 +559,16 @@ export class AlfizSnapshot<
       scope !== undefined &&
       scope !== GLOBAL_SCOPE
     ) {
-      implied = this.impliedAt(key as PermissionKey, scope);
+      const implying = this.impliedAt(key as PermissionKey, scope);
+      implied = implying !== null;
       allowed = implied;
+      impliedBy = implying ?? [];
     }
     return {
       ...explanation,
       allowed,
       implied,
+      impliedBy,
       objectClosure: [...closure],
       active: this.active,
     };

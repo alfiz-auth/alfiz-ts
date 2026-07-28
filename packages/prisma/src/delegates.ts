@@ -402,6 +402,51 @@ export interface AlfizEventDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizMetric (rolling permission-usage buckets)
+// ---------------------------------------------------------------------------
+
+export interface AlfizMetricRecord {
+  bucket: bigint;
+  dimension: string;
+  subject: string;
+  metric: string;
+  count: bigint;
+}
+
+/** The composite identity of a bucket — Prisma's generated `@@id` input. */
+export interface AlfizMetricWhereUnique {
+  bucket_dimension_subject_metric: {
+    bucket: bigint;
+    dimension: string;
+    subject: string;
+    metric: string;
+  };
+}
+
+export interface AlfizMetricWhere {
+  dimension?: string;
+  subject?: { in: string[] };
+  bucket?: { gte?: bigint; lt?: bigint };
+}
+
+export interface AlfizMetricDelegate {
+  /**
+   * Increment-or-create. Counters ACCUMULATE across every app server
+   * reporting into the same bucket, which is what makes the numbers
+   * deployment-wide rather than per-process.
+   */
+  upsert(args: {
+    where: AlfizMetricWhereUnique;
+    create: AlfizMetricRecord;
+    update: { count: { increment: bigint } };
+  }): Promise<unknown>;
+  findMany(args: { where: AlfizMetricWhere }): Promise<AlfizMetricRecord[]>;
+  deleteMany(args: { where: { bucket: { lt: bigint } } }): Promise<{
+    count: number;
+  }>;
+}
+
+// ---------------------------------------------------------------------------
 // The full delegate bundle
 // ---------------------------------------------------------------------------
 
@@ -429,4 +474,11 @@ export interface AlfizPrismaDelegates {
    */
   alfizEpoch?: AlfizEpochDelegate;
   alfizEvent?: AlfizEventDelegate;
+  /**
+   * OPTIONAL — present when the schema includes the AlfizMetric model
+   * (rolling permission-usage buckets). Absent, the driver omits the metric
+   * methods and the Application refuses `metrics` loudly rather than
+   * accepting batches that go nowhere.
+   */
+  alfizMetric?: AlfizMetricDelegate;
 }
