@@ -839,6 +839,15 @@ export interface RowUsage {
   buckets: Array<{ bucket: number; matched: number; soleMatch: number }>;
 }
 
+/** One bucket's counts for a permission or scope type. */
+export interface PermissionUsageBucket {
+  bucket: number;
+  gateAllow: number;
+  gateDeny: number;
+  visibilityAllow: number;
+  visibilityDeny: number;
+}
+
 /** Aggregated usage for one permission key, split by gate versus visibility. */
 export interface PermissionUsage {
   permission: string;
@@ -848,6 +857,14 @@ export interface PermissionUsage {
   visibilityDeny: number;
   windowStart: number;
   windowEnd: number;
+  /**
+   * Per-bucket detail, oldest first — the same shape `RowUsage` has carried
+   * since 0.5.0, and what a usage-over-time chart plots. Buckets with no
+   * traffic are absent rather than zero-filled: a reader that wants a dense
+   * axis knows the window and the granularity and can fill the gaps, and a
+   * sparse window should not pay for the empty days.
+   */
+  buckets: PermissionUsageBucket[];
 }
 
 export interface UsageQuery {

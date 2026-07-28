@@ -141,6 +141,33 @@ describe("reportMetrics", () => {
     expect(byScope).toMatchObject({ gateAllow: 12, gateDeny: 3 });
   });
 
+  it("returns per-bucket series alongside the totals", async () => {
+    const { app, advance } = makeApp({ metrics: {} });
+    const start = 1_000_000;
+    const counter = (estimated: number) => ({
+      permission: "docs.files.read",
+      decision: "allow" as const,
+      shape: "can" as const,
+      gate: true,
+      scopeType: "docs.folder",
+      observed: estimated,
+      estimated,
+    });
+    await app.reportMetrics(batch({ windowStart: start, checks: [counter(10)] }));
+    advance(2 * DAY);
+    await app.reportMetrics(
+      batch({ windowStart: start + 2 * DAY, checks: [counter(4)] }),
+    );
+
+    const [usage] = await app.getPermissionUsage({ ids: ["docs.files.read"] });
+    // Totals are exactly the series summed — one read answers both questions.
+    expect(usage!.gateAllow).toBe(14);
+    expect(usage!.buckets.map((b) => b.gateAllow)).toEqual([10, 4]);
+    expect(usage!.buckets[0]!.bucket).toBeLessThan(usage!.buckets[1]!.bucket);
+    // Empty days are absent rather than zero-filled.
+    expect(usage!.buckets).toHaveLength(2);
+  });
+
   it("buckets by day and reports per-bucket detail", async () => {
     const { app, advance } = makeApp({ metrics: {} });
     const start = 1_000_000;

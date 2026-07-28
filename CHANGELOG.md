@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.1 — usage over time
+
+`getPermissionUsage` and `getScopeTypeUsage` now return a `buckets` array
+alongside their totals, the same per-bucket shape `RowUsage` has carried
+since 0.5.0:
+
+```ts
+const [usage] = await app.getPermissionUsage({ ids: ["docs.files.delete"] });
+usage.gateAllow;                        // 1_284 — the total, unchanged
+usage.buckets.map((b) => b.gateAllow);  // [201, 173, 244, …] — day by day
+```
+
+The store has always bucketed by day; only the read collapsed it, which
+left a usage-over-time chart with no source for the one dimension that
+carries denials. The totals are exactly the series summed, so this costs one
+pass over rows already fetched and saves callers a round trip per bucket.
+
+Buckets with no traffic are absent rather than zero-filled — a caller that
+wants a dense axis knows the window and the granularity and can fill the
+gaps, and a sparse window should not pay for its empty days.
+
+Purely additive: a new field on a returned type, no contract method added,
+no storage change, nothing to migrate.
+
 ## 0.5.0 — permission metrics
 
 Two questions had no good answer from access data alone. *Which permissions

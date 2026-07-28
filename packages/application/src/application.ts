@@ -2194,23 +2194,45 @@ export class AlfizApplication<
           visibilityDeny: 0,
           windowStart,
           windowEnd,
+          buckets: [],
         };
         byKey.set(row.subject, usage);
+      }
+      // The stored granularity is already the series resolution — the totals
+      // below are just this list summed, so returning both costs one pass and
+      // saves every caller a second round trip to draw usage over time.
+      let bucket = usage.buckets.find((b) => b.bucket === row.bucket);
+      if (bucket === undefined) {
+        bucket = {
+          bucket: row.bucket,
+          gateAllow: 0,
+          gateDeny: 0,
+          visibilityAllow: 0,
+          visibilityDeny: 0,
+        };
+        usage.buckets.push(bucket);
       }
       switch (row.metric) {
         case METRIC_GATE_ALLOW:
           usage.gateAllow += row.count;
+          bucket.gateAllow += row.count;
           break;
         case METRIC_GATE_DENY:
           usage.gateDeny += row.count;
+          bucket.gateDeny += row.count;
           break;
         case METRIC_VISIBILITY_ALLOW:
           usage.visibilityAllow += row.count;
+          bucket.visibilityAllow += row.count;
           break;
         case METRIC_VISIBILITY_DENY:
           usage.visibilityDeny += row.count;
+          bucket.visibilityDeny += row.count;
           break;
       }
+    }
+    for (const usage of byKey.values()) {
+      usage.buckets.sort((a, b) => a.bucket - b.bucket);
     }
     return [...byKey.values()];
   }
