@@ -11,7 +11,7 @@
  */
 
 import type { GrantRow, Provenance, RevokeRow, RoleDef } from "./access.js";
-import type { CatalogDocument } from "./catalog.js";
+import type { CatalogDocument, ImportManifest } from "./catalog.js";
 import type { LoosePattern, PermissionPattern } from "./grammar.js";
 import type {
   MetricsBatch,
@@ -51,6 +51,13 @@ export interface ProviderCapabilities {
    * progressive disclosure, exactly like `audit`.
    */
   metrics: boolean;
+  /**
+   * Import manifests are accepted (`publishImports`) and readable
+   * (`getPublishedImports`). Off unless the provider stores them; components
+   * and drift reports render the consumption side only when it is on —
+   * progressive disclosure, exactly like `audit` and `metrics`.
+   */
+  imports: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +380,29 @@ export interface AlfizProvider {
   getPublishedCatalog(): Promise<{
     version: number;
     document: CatalogDocument;
+  } | null>;
+
+  // -- Import registration (OPTIONAL — gated by `capabilities().imports`) ----
+  // The consumption side, deliberately separate from `publishCatalog`. What
+  // an application ANNOUNCES is owned vocabulary others may grant against;
+  // what it CONSUMES is a dependency others can only warn it about. Folding
+  // the second into the first would let an application appear to define keys
+  // in a namespace it does not own — the shadowing namespace ownership
+  // exists to prevent.
+  //
+  // What it buys: the drift report today names roles and grants that
+  // reference unpublished keys, but never CODE. With manifests, a provider
+  // can say "application `docs` imports `zoom.breakout.manage`, tombstoned
+  // 30 days ago" — before the next deploy discovers it.
+
+  /** Versioned monotonically per application, exactly like `publishCatalog`. */
+  publishImports?(
+    manifest: ImportManifest,
+    provenance: Provenance,
+  ): Promise<{ version: number }>;
+  getPublishedImports?(): Promise<{
+    version: number;
+    manifest: ImportManifest;
   } | null>;
 
   // -- Organizational data (rejected when not org root) ---------------------

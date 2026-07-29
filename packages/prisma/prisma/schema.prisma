@@ -118,6 +118,17 @@ model AlfizCatalog {
   document Json
 }
 
+/// What this application CONSUMES — the import manifest, a versioned
+/// singleton (always id = 1), stored beside the catalog rather than inside
+/// it. What an application announces is owned vocabulary others may grant
+/// against; what it imports is a dependency others can only warn it about.
+/// OPTIONAL: omit this model and `capabilities().imports` is simply false.
+model AlfizImports {
+  id       Int  @id @default(1)
+  version  Int
+  manifest Json
+}
+
 /// The invalidation-log head — a singleton (always id = 1). `seq` is the
 /// sequence of the newest AlfizEvent row; `prunedThrough` the newest pruned
 /// one, so readers with an older cursor learn they cannot catch up

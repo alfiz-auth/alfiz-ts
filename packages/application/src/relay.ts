@@ -72,6 +72,8 @@ export const RELAY_OPS = [
   "listApproverQueue",
   "publishCatalog",
   "getPublishedCatalog",
+  "publishImports",
+  "getPublishedImports",
   "listRoles",
   "createRole",
   "updateRole",
@@ -676,6 +678,16 @@ export class RelayProvider implements AlfizProvider {
   }
   getPublishedCatalog(): ReturnType<AlfizProvider["getPublishedCatalog"]> {
     return this.call("getPublishedCatalog", []);
+  }
+  publishImports(
+    ...args: Parameters<NonNullable<AlfizProvider["publishImports"]>>
+  ): ReturnType<NonNullable<AlfizProvider["publishImports"]>> {
+    return this.call("publishImports", args);
+  }
+  getPublishedImports(): ReturnType<
+    NonNullable<AlfizProvider["getPublishedImports"]>
+  > {
+    return this.call("getPublishedImports", []);
   }
   listRoles(): ReturnType<AlfizProvider["listRoles"]> {
     return this.call("listRoles", []);

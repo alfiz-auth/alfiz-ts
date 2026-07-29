@@ -264,13 +264,114 @@ export interface NavItemInput {
   children?: readonly NavItemInput[];
 }
 
+// ---------------------------------------------------------------------------
+// Imports — permissions this application REFERENCES but does not own
+// ---------------------------------------------------------------------------
+
+/**
+ * An imported permission's local wiring. Everything a leaf declares, except
+ * that `scopes` names scope types THIS catalog declares: the owning
+ * application publishes the vocabulary, and only the importing application
+ * knows which of its own resources the permission applies to — and only it
+ * can resolve their ancestry.
+ */
+export interface ImportedPermissionInput extends PermissionLeafInput {
+  scopes?: readonly ScopeType[];
+}
+
+/**
+ * Imported entries, keyed by their full dotted form. Unlike `permissions`,
+ * a key here may be a subtree pattern (`zoom.meetings.*`) — you interface
+ * with a slice of someone else's namespace, and enumerating it is their job,
+ * not yours.
+ */
+export type ImportedPermissionsInput = Record<
+  string,
+  true | ImportedPermissionInput
+>;
+
+export interface ImportInput {
+  /** Provenance label: `"registry:zoom@^3"`, `"dashboard"`, `"monorepo:apps/billing"`. */
+  from?: string;
+  /**
+   * The foreign published document. Attaching it MATERIALIZES every leaf
+   * matching a declared entry into this catalog: wildcards stop being opaque,
+   * `keysMatching` / `canAny` / the permission tree behave exactly as they do
+   * for owned keys, and a typo becomes a build error again.
+   *
+   * Strongly recommended, and the reason is concrete: an import with no
+   * document cannot enumerate its keys, and several affordances are only as
+   * good as what they can enumerate (see {@link AnyCatalog.opaqueRegions}).
+   * Fetch it in CI from the registry and commit it, exactly as you already
+   * commit `alfiz-catalog.json`.
+   */
+  document?: CatalogDocument;
+  /** Default scope types for every entry; a per-entry `scopes` wins. */
+  scopes?: readonly ScopeType[];
+  permissions: ImportedPermissionsInput;
+  /**
+   * Refuse to admit keys this catalog cannot name. A wildcard entry still
+   * declares grantable vocabulary (roles, grants, and `canAny` all see it),
+   * but `can()` on an unenumerated key under it throws rather than being
+   * evaluated — the strict posture for an import with no document.
+   */
+  strict?: boolean;
+}
+
+/**
+ * Pins an import's key union to types emitted by `alfiz-verify codegen`,
+ * closing what a wildcard entry otherwise leaves open. `defineCatalog` cannot
+ * infer keys from a runtime `document` value — a document is data, not a
+ * literal — so the union crosses the wire the same way it does for
+ * `catalogFromDocument`: through codegen.
+ *
+ * ```ts
+ * // alfiz-verify codegen --catalog zoom.catalog.json --prefix Zoom --out zoom.gen.ts
+ * import type { ZoomKey } from "./zoom.gen.js";
+ *
+ * imports: {
+ *   zoom: importedKeys<ZoomKey>({
+ *     from: "registry:zoom@^3",
+ *     document: zoomDoc,
+ *     permissions: { "zoom.meetings.*": true },
+ *   }),
+ * }
+ * ```
+ */
+export function importedKeys<K extends string>(
+  input: ImportInput,
+): ImportInput & { readonly $keys: K } {
+  return input as ImportInput & { readonly $keys: K };
+}
+
 export interface CatalogInput {
   /**
    * The namespaces this application owns — its key prefixes. The first is the
    * primary. Required even standalone, where it is locally redundant:
    * catalogs are federation-shaped from the first commit.
+   *
+   * Owning a namespace is not the same as being able to check keys in it:
+   * permissions from another application go in {@link CatalogInput.imports}.
    */
   namespaces: readonly string[];
+  /**
+   * Permissions this application REFERENCES but does not own — imported from
+   * a hosted dashboard or a federated application (structurally the same
+   * thing: a foreign published `CatalogDocument`). Keyed by the foreign
+   * namespace, which must not be one this catalog owns.
+   *
+   * ```ts
+   * imports: {
+   *   zoom: {
+   *     from: "registry:zoom@^3",
+   *     document: zoomDoc,
+   *     scopes: ["docs.folder"],
+   *     permissions: { "zoom.host": true, "zoom.meetings.*": true },
+   *   },
+   * }
+   * ```
+   */
+  imports?: Record<string, ImportInput>;
   /**
    * The permissions, keyed by their full dotted key: one flat map, one
    * `group()` block, or an array mixing both. Groups are inferred from the
@@ -323,20 +424,75 @@ type PermissionsKeys<P> = P extends readonly unknown[]
 type InternalIncluded<C extends CatalogInput> =
   C["includeAlfizInternal"] extends false ? never : AlfizInternalKey;
 
-/** Every concrete permission key of catalog input `C`. */
-export type CatalogKeys<C extends CatalogInput> =
+/** The subtree-pattern half of a union of entries, and its complement. */
+type WildcardOnly<S extends string> = S extends `${string}.*` ? S : never;
+type ConcreteOnly<S extends string> = S extends `${string}.*` ? never : S;
+/** `"zoom.meetings.*"` → `"zoom.meetings"`. */
+type RegionPrefix<S extends string> = S extends `${infer B}.*` ? B : never;
+
+type ImportEntriesOf<C extends CatalogInput> = C["imports"] extends infer I
+  ? I extends Record<string, ImportInput>
+    ? I[StringKeys<I>]
+    : never
+  : never;
+
+/**
+ * The entries one import declares — its codegen-pinned key union when
+ * `importedKeys<K>()` supplied one, else the literal keys of `permissions`.
+ */
+type DeclaredImportKeys<E> = E extends { readonly $keys: infer K extends string }
+  ? K
+  : E extends { readonly permissions: infer P }
+    ? StringKeys<P>
+    : never;
+
+type ImportPermKeys<C extends CatalogInput> = DeclaredImportKeys<
+  ImportEntriesOf<C>
+>;
+
+/**
+ * Every CLOSED permission-key literal of `C` — owned keys plus concrete
+ * imports. This, and never {@link CatalogKeys}, is what feeds `Prefixes`:
+ * `Prefixes` recurses on `` `${infer Head}.${infer Rest}` ``, so handing it
+ * an open template (`` `zoom.meetings.${string}` ``) recurses into
+ * `` `${string}` `` and blows up inference (TS2589). See the note on
+ * {@link AnyCatalog}.
+ */
+type OwnedCatalogKeys<C extends CatalogInput> =
   | PermissionsKeys<C["permissions"]>
   | InternalIncluded<C>;
 
+type ConcreteCatalogKeys<C extends CatalogInput> =
+  | OwnedCatalogKeys<C>
+  | ConcreteOnly<ImportPermKeys<C>>;
+
 /**
- * Every valid pattern of `C`: keys, group wildcards, and the bare `*`.
- * Group paths are the dotted prefixes of the keys — groups are folders that
- * exist because keys live under them, never declared into being.
+ * The open half: one template member per imported wildcard. An import whose
+ * keys this catalog cannot enumerate genuinely has no closed key set, so the
+ * type says exactly that — the same shape {@link CatalogScopeIds} uses for
+ * the runtime half of a scope id. Pin it closed with `importedKeys<K>()`.
+ */
+type OpenImportKeys<C extends CatalogInput> =
+  `${RegionPrefix<WildcardOnly<ImportPermKeys<C>>>}.${string}`;
+
+/** Every permission key of catalog input `C`, owned and imported. */
+export type CatalogKeys<C extends CatalogInput> =
+  | ConcreteCatalogKeys<C>
+  | OpenImportKeys<C>;
+
+/**
+ * Every valid pattern of `C`: keys, group wildcards, imported subtree
+ * patterns, and the bare `*`. Group paths are the dotted prefixes of the
+ * OWNED keys — groups are folders that exist because keys live under them,
+ * never declared into being — while an imported namespace contributes only
+ * the patterns the import declared, because a wildcard broader than the
+ * import is a widening claim over a namespace this application does not own.
  */
 export type CatalogPatterns<C extends CatalogInput> =
   | "*"
   | CatalogKeys<C>
-  | `${Prefixes<CatalogKeys<C>>}.*`;
+  | `${Prefixes<OwnedCatalogKeys<C>>}.*`
+  | WildcardOnly<ImportPermKeys<C>>;
 
 /** The scope types catalog input `C` declares, as a literal union. */
 export type CatalogScopeTypes<C extends CatalogInput> =
@@ -482,6 +638,15 @@ export interface LeafMeta {
    */
   scopes: readonly ScopeType[];
   impliedOnAncestors: boolean;
+  /**
+   * Absent means owned — additive, so documents written before imports
+   * existed read back as owned, exactly as `conventions` did in 0.4.0.
+   * Imported leaves never appear in `toDocument()`: publishing another
+   * application's keys is the namespace shadowing federation forbids.
+   */
+  origin?: "owned" | "imported";
+  /** The `from` label of the import that contributed this leaf. */
+  importedFrom?: string | undefined;
 }
 
 export interface GroupMeta {
@@ -493,6 +658,71 @@ export interface GroupMeta {
   groups: readonly string[];
   /** Immediate leaf keys. */
   permissions: readonly PermissionKey[];
+  /** Absent means owned. See {@link LeafMeta.origin}. */
+  origin?: "owned" | "imported";
+  importedFrom?: string | undefined;
+}
+
+/**
+ * A declared imported wildcard whose key set this catalog CANNOT enumerate —
+ * an import with no attached `document`. It behaves as vocabulary everywhere
+ * a pattern is enough (grants, roles, `canAny`, the permission tree) and as a
+ * membership test in `hasKey`, but it can never be expanded into keys.
+ *
+ * Attaching the foreign document collapses a region into concrete leaves and
+ * removes it from {@link AnyCatalog.openRegions} entirely. That collapse is
+ * the whole incentive gradient of the feature: enumerated imports get typo
+ * safety, exact `keysMatching`, and precise revoke suppression; open ones get
+ * a conservative approximation of each.
+ */
+export interface ImportedRegion {
+  /** Always a `.*` form. */
+  pattern: PermissionPattern;
+  namespace: string;
+  from: string | undefined;
+  label: string | undefined;
+  description: string | undefined;
+  /** Resolved: the import's default scopes, overridden per entry. */
+  scopes: readonly ScopeType[];
+  /** From `ImportInput.strict` — the region declares vocabulary but admits no unenumerated key. */
+  strict: boolean;
+}
+
+/** What one imported namespace contributes, as published data. */
+export interface ImportManifestEntry {
+  namespace: string;
+  from: string | undefined;
+  /** A document was attached, so this namespace is fully enumerable. */
+  enumerated: boolean;
+  /**
+   * The entries exactly as declared — concrete keys and subtree patterns.
+   * This, not `keys`, is the contract: it is what a drift report compares
+   * against the namespace owner's published document, and what decides
+   * whether a pattern is grantable (see `isKnownPattern`).
+   */
+  patterns: readonly PermissionPattern[];
+  /** Concrete keys this catalog can name — declared outright, or materialized. */
+  keys: readonly PermissionKey[];
+  /** Declared wildcards that could not be enumerated (empty when `enumerated`). */
+  regions: readonly PermissionPattern[];
+}
+
+/**
+ * What an application CONSUMES, as its own wire shape — deliberately not a
+ * field on {@link CatalogDocument}. What you announce and what you reference
+ * are different contracts: the first is owned vocabulary others may grant
+ * against, the second is a dependency others can only warn you about.
+ *
+ * Published through `AlfizProvider.publishImports`, which is what lets a
+ * provider report the drift nobody can see today — "application `docs`
+ * imports `zoom.breakout.manage`, tombstoned 30 days ago". The existing drift
+ * report sees roles and grants, but never code.
+ */
+export interface ImportManifest {
+  formatVersion: 1;
+  /** The importing application's primary namespace. */
+  namespace: string;
+  imports: readonly ImportManifestEntry[];
 }
 
 export interface ScopeTypeMeta {
@@ -552,12 +782,26 @@ export class CatalogError extends Error {
 export interface AnyCatalog {
   readonly namespace: string;
   readonly namespaces: readonly string[];
+  /**
+   * Owned AND imported leaves, in one map. Deliberately not two: a parallel
+   * map would need every consumer of `leaves` / `keys` — `checkAny`,
+   * `heldKeys`, the snapshot, the session, request auto-stages, the
+   * permission tree, `closestPatterns` — taught to union them, and any one
+   * missed would fail OPEN on `checkAny` and CLOSED on `heldKeys`. Read
+   * `LeafMeta.origin` (or {@link keyOrigin}) where the distinction matters.
+   */
   readonly leaves: ReadonlyMap<PermissionKey, LeafMeta>;
   readonly groups: ReadonlyMap<string, GroupMeta>;
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
   readonly conventions: CatalogConventions;
+  /** What this catalog imports, keyed by foreign namespace. */
+  readonly imports: ReadonlyMap<string, ImportManifestEntry>;
+  /** Imported wildcards this catalog cannot enumerate, keyed by pattern. */
+  readonly openRegions: ReadonlyMap<PermissionPattern, ImportedRegion>;
   readonly keys: PermissionKey[];
+  readonly ownedKeys: PermissionKey[];
+  readonly importedKeys: PermissionKey[];
   readonly $key: string;
   readonly $pattern: string;
   readonly $scope: string;
@@ -571,7 +815,28 @@ export interface AnyCatalog {
     scope: ScopeId,
   ): CatalogIssue | null;
   appliesAt(key: PermissionKey, grantScope: ScopeId): boolean;
+  /** Where a key comes from, or `null` when this catalog does not know it. */
+  keyOrigin(key: string): "owned" | "imported" | "region" | null;
+  /**
+   * The open regions intersecting `pattern` — precisely what
+   * {@link keysMatching} provably cannot enumerate. Any affordance that
+   * answers a question by expanding a pattern into keys must consult this,
+   * or it silently answers "no" for an import it simply cannot see.
+   */
+  opaqueRegions(pattern: PermissionPattern): readonly ImportedRegion[];
+  /**
+   * Display data for a key, from a leaf or from the region covering it.
+   * `leaf()` stays exact on purpose — synthesizing a `LeafMeta` for a
+   * region key would invent `kind` and `destructive` from a string this
+   * catalog never saw, and make `leaf()` lie.
+   */
+  describe(key: string): {
+    origin: "owned" | "imported" | "region" | null;
+    leaf?: LeafMeta;
+    region?: ImportedRegion;
+  };
   toDocument(): CatalogDocument;
+  toImportManifest(): ImportManifest;
 }
 
 export class Catalog<C extends CatalogInput = CatalogInput> {
@@ -583,6 +848,8 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
   readonly conventions: CatalogConventions;
+  readonly imports: ReadonlyMap<string, ImportManifestEntry>;
+  readonly openRegions: ReadonlyMap<PermissionPattern, ImportedRegion>;
 
   /** Phantom-only members carrying the derived types. Never set at runtime. */
   declare readonly $key: CatalogKeys<C>;
@@ -597,6 +864,8 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
     navigation: readonly NavItem[];
     conventions?: CatalogConventions;
+    imports?: ReadonlyMap<string, ImportManifestEntry>;
+    openRegions?: ReadonlyMap<PermissionPattern, ImportedRegion>;
   }) {
     this.namespace = built.namespace;
     this.namespaces = built.namespaces;
@@ -605,15 +874,47 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     this.scopeTypes = built.scopeTypes;
     this.navigation = built.navigation;
     this.conventions = built.conventions ?? { depth: DEFAULT_KEY_DEPTH };
+    this.imports = built.imports ?? new Map();
+    this.openRegions = built.openRegions ?? new Map();
   }
 
-  /** All concrete keys, sorted. */
+  /** All concrete keys, owned and imported, sorted. */
   get keys(): PermissionKey[] {
     return [...this.leaves.keys()];
   }
 
+  get ownedKeys(): PermissionKey[] {
+    return this.keys.filter((k) => this.leaves.get(k)!.origin !== "imported");
+  }
+
+  get importedKeys(): PermissionKey[] {
+    return this.keys.filter((k) => this.leaves.get(k)!.origin === "imported");
+  }
+
+  /**
+   * The narrowest open region admitting `key`, or undefined. Strict regions
+   * declare vocabulary but admit no unenumerated key, so they are skipped
+   * here while still counting everywhere a pattern is enough.
+   */
+  private admittingRegion(key: string): ImportedRegion | undefined {
+    // A key is never a wildcard. Without this, `patternMatchesKey` below
+    // would happily match the string "zoom.meetings.*" against the region
+    // "zoom.meetings.*", making `hasKey` true for a PATTERN — which would
+    // let a gate check a wildcard, the one thing `can` must never do.
+    if (key.includes("*")) return undefined;
+    let best: ImportedRegion | undefined;
+    for (const region of this.openRegions.values()) {
+      if (region.strict) continue;
+      if (!patternMatchesKey(region.pattern, key)) continue;
+      if (best === undefined || region.pattern.length > best.pattern.length) {
+        best = region;
+      }
+    }
+    return best;
+  }
+
   hasKey(key: string): boolean {
-    return this.leaves.has(key);
+    return this.leaves.has(key) || this.admittingRegion(key) !== undefined;
   }
 
   hasGroup(path: string): boolean {
@@ -622,6 +923,36 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
 
   leaf(key: string): LeafMeta | undefined {
     return this.leaves.get(key);
+  }
+
+  keyOrigin(key: string): "owned" | "imported" | "region" | null {
+    const leaf = this.leaves.get(key);
+    if (leaf) return leaf.origin === "imported" ? "imported" : "owned";
+    return this.admittingRegion(key) !== undefined ? "region" : null;
+  }
+
+  describe(key: string): {
+    origin: "owned" | "imported" | "region" | null;
+    leaf?: LeafMeta;
+    region?: ImportedRegion;
+  } {
+    const leaf = this.leaves.get(key);
+    if (leaf) {
+      return {
+        origin: leaf.origin === "imported" ? "imported" : "owned",
+        leaf,
+      };
+    }
+    const region = this.admittingRegion(key);
+    return region ? { origin: "region", region } : { origin: null };
+  }
+
+  opaqueRegions(pattern: PermissionPattern): readonly ImportedRegion[] {
+    const out: ImportedRegion[] = [];
+    for (const region of this.openRegions.values()) {
+      if (patternsIntersect(region.pattern, pattern)) out.push(region);
+    }
+    return out;
   }
 
   /** The concrete catalog keys a pattern matches (forward-inclusion made visible). */
@@ -636,8 +967,35 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
    */
   isKnownPattern(pattern: PermissionPattern): boolean {
     if (pattern === "*") return true;
+    const ns = namespaceOf(pattern);
+    if (ns !== null && this.imports.has(ns)) {
+      return this.isKnownImportPattern(pattern, ns);
+    }
     if (pattern.endsWith(".*")) return this.groups.has(pattern.slice(0, -2));
     return this.leaves.has(pattern);
+  }
+
+  /**
+   * A pattern under an imported namespace is known only when it selects a
+   * SUBSET of something the import declared. The generic group-wildcard rule
+   * cannot be used here: imported group paths exist (so pickers and the tree
+   * can render them), and it would make `zoom.*` known to a catalog that
+   * imported only `zoom.meetings.*` — a widening claim over a namespace this
+   * application does not own, and one a role editor could then store.
+   */
+  private isKnownImportPattern(
+    pattern: PermissionPattern,
+    namespace: string,
+  ): boolean {
+    if (!pattern.endsWith(".*") && this.leaves.has(pattern)) return true;
+    const declared = this.imports.get(namespace);
+    if (declared === undefined) return false;
+    const selected = pattern.endsWith(".*") ? pattern.slice(0, -2) : pattern;
+    return declared.patterns.some(
+      (entry) =>
+        entry === pattern ||
+        (entry.endsWith(".*") && patternMatchesKey(entry, selected)),
+    );
   }
 
   /**
@@ -666,6 +1024,25 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     }
     const matched = this.keysMatching(pattern);
     if (matched.length === 0) {
+      // Before calling this a miss: an open region has no keys to match by
+      // construction, so grantability comes from the region's own wiring.
+      const regions = this.opaqueRegions(pattern);
+      if (regions.length > 0) {
+        const grantableHere = regions.some((r) => r.scopes.includes(type));
+        if (grantableHere) return null;
+        const declaredOnRegions = [...new Set(regions.flatMap((r) => r.scopes))];
+        return {
+          severity: "error",
+          path: pattern,
+          message:
+            `not grantable at scope type ${JSON.stringify(type)} — it is imported from ` +
+            `${JSON.stringify(regions[0]!.namespace)}, and an imported permission is grantable ` +
+            `only at scope types this catalog wires it to` +
+            (declaredOnRegions.length > 0
+              ? ` (wired to: ${declaredOnRegions.join(", ")}, or globally at "*")`
+              : ` (no scope types wired — set \`scopes\` on \`imports.${regions[0]!.namespace}\` to grant it below the global scope)`),
+        };
+      }
       const near = closestPatterns(this, pattern, "pattern");
       return {
         severity: "error",
@@ -709,21 +1086,42 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     const type = scopeTypeOf(grantScope);
     if (type === null) return false;
     const leaf = this.leaves.get(key);
-    if (!leaf) return false;
-    return leaf.scopes.includes(type);
+    if (leaf) return leaf.scopes.includes(type);
+    const region = this.admittingRegion(key);
+    return region ? region.scopes.includes(type) : false;
   }
 
-  /** The stable, serializable publish shape. */
+  /**
+   * The stable, serializable publish shape — OWNED vocabulary only.
+   * Publishing imported leaves would let an application define keys in a
+   * namespace it does not own, which is exactly the shadowing the registry's
+   * namespace ownership exists to prevent. What this catalog consumes
+   * publishes separately, through {@link toImportManifest}.
+   */
   toDocument(): CatalogDocument {
     return {
       formatVersion: 1,
       namespace: this.namespace,
-      namespaces: [...this.namespaces],
-      leaves: [...this.leaves.values()],
-      groups: [...this.groups.values()],
+      namespaces: this.namespaces.filter((ns) => !this.imports.has(ns)),
+      leaves: [...this.leaves.values()].filter((l) => l.origin !== "imported"),
+      groups: [...this.groups.values()].filter((g) => g.origin !== "imported"),
       scopeTypes: [...this.scopeTypes.values()],
       navigation: [...this.navigation],
       conventions: { ...this.conventions },
+    };
+  }
+
+  /** What this application references but does not own. See {@link ImportManifest}. */
+  toImportManifest(): ImportManifest {
+    return {
+      formatVersion: 1,
+      namespace: this.namespace,
+      imports: [...this.imports.values()].map((entry) => ({
+        ...entry,
+        patterns: [...entry.patterns],
+        keys: [...entry.keys],
+        regions: [...entry.regions],
+      })),
     };
   }
 }
@@ -910,6 +1308,185 @@ export function defineCatalog<const C extends CatalogInput>(
     }
   }
 
+  // --- Imports --------------------------------------------------------------
+  // Vocabulary this application references but does not own. The owning app
+  // publishes the keys; this app supplies the local wiring (which of ITS
+  // scope types they are grantable at), because only it can resolve those
+  // scopes' ancestry.
+  const importedLeaves = new Map<PermissionKey, LeafMeta>();
+  const openRegions = new Map<PermissionPattern, ImportedRegion>();
+  const importEntries = new Map<string, ImportManifestEntry>();
+  const importedNamespaces = new Set<string>();
+
+  /** Validates scope wiring against THIS catalog's declared scope types. */
+  const wiredScopes = (
+    path: string,
+    scopes: readonly ScopeType[],
+  ): readonly ScopeType[] => {
+    for (const type of scopes) {
+      if (!scopeTypes.has(type)) {
+        err(
+          path,
+          `wires imported permissions to undeclared scope type ${JSON.stringify(type)} — ` +
+            `an import names scope types THIS catalog declares, never the owning application's`,
+        );
+      }
+    }
+    return scopes;
+  };
+
+  for (const [ns, spec] of Object.entries(input.imports ?? {})) {
+    if (!isValidSegment(ns)) {
+      err(ns, "an imported namespace is a single valid segment");
+      continue;
+    }
+    if (ns === ALFIZ_INTERNAL_NAMESPACE) {
+      err(
+        ns,
+        `${ALFIZ_INTERNAL_NAMESPACE} is reserved for Alfiz itself and ships with every catalog — it is never imported`,
+      );
+      continue;
+    }
+    if (declared.has(ns)) {
+      err(
+        ns,
+        "is declared in `namespaces` — an application does not import what it owns; declare its keys in `permissions`",
+      );
+      continue;
+    }
+    importedNamespaces.add(ns);
+
+    const defaultScopes = wiredScopes(
+      `imports.${ns}`,
+      spec.scopes ?? [],
+    );
+    const document = spec.document;
+    if (document !== undefined && !document.namespaces.includes(ns)) {
+      err(
+        `imports.${ns}`,
+        `the attached document publishes [${document.namespaces.join(", ")}]; this import declares ${JSON.stringify(ns)}`,
+      );
+      continue;
+    }
+
+    const patterns: PermissionPattern[] = [];
+    const concreteKeys: PermissionKey[] = [];
+    const regionPatterns: PermissionPattern[] = [];
+
+    /** One imported leaf, wired locally. Document copy is metadata only. */
+    const addImportedLeaf = (
+      key: PermissionKey,
+      entry: ImportedPermissionInput,
+      fromDocument: LeafMeta | undefined,
+    ) => {
+      const segments = key.split(".");
+      const name = segments.at(-1)!;
+      importedLeaves.set(key, {
+        key,
+        groupPath: segments.slice(0, -1).join("."),
+        name,
+        label: entry.label ?? fromDocument?.label,
+        description: entry.description ?? fromDocument?.description,
+        kind: entry.kind ?? fromDocument?.kind ?? inferKind(name),
+        destructive:
+          entry.destructive ?? fromDocument?.destructive ?? inferDestructive(name),
+        // Local wiring, never the document's: its scope types name the
+        // owning application's resources, which this one cannot resolve.
+        scopes: entry.scopes
+          ? wiredScopes(key, entry.scopes)
+          : defaultScopes,
+        impliedOnAncestors: entry.impliedOnAncestors ?? false,
+        origin: "imported",
+        importedFrom: spec.from,
+      });
+      concreteKeys.push(key);
+    };
+
+    for (const [raw, value] of Object.entries(spec.permissions ?? {})) {
+      const entry: ImportedPermissionInput = value === true ? {} : value;
+      const issue = validatePattern(raw);
+      if (issue !== null) {
+        err(`imports.${ns}.${raw}`, issue.reason);
+        continue;
+      }
+      if (raw === "*") {
+        err(
+          `imports.${ns}`,
+          'an import declares specific keys or subtree patterns, never the bare "*" — importing everything from every namespace is not a contract',
+        );
+        continue;
+      }
+      if (namespaceOf(raw) !== ns) {
+        err(
+          `imports.${ns}.${raw}`,
+          `is not under the imported namespace ${JSON.stringify(ns)} — an import never declares keys outside the namespace it names`,
+        );
+        continue;
+      }
+      patterns.push(raw);
+
+      if (document !== undefined) {
+        // Enumerated: materialize every published leaf the entry selects.
+        const matched = document.leaves.filter((l) =>
+          patternMatchesKey(raw, l.key),
+        );
+        if (matched.length === 0) {
+          err(
+            `imports.${ns}.${raw}`,
+            `matches nothing in the published ${JSON.stringify(ns)} catalog — removed upstream, or a typo?`,
+          );
+          continue;
+        }
+        for (const leaf of matched) addImportedLeaf(leaf.key, entry, leaf);
+        continue;
+      }
+
+      if (raw.endsWith(".*")) {
+        regionPatterns.push(raw);
+        openRegions.set(raw, {
+          pattern: raw,
+          namespace: ns,
+          from: spec.from,
+          label: entry.label,
+          description: entry.description,
+          scopes: entry.scopes ? wiredScopes(raw, entry.scopes) : defaultScopes,
+          strict: spec.strict === true,
+        });
+      } else {
+        addImportedLeaf(raw, entry, undefined);
+      }
+    }
+
+    // Group paths under an import exist so pickers and the permission tree
+    // can render it; `isKnownPattern` deliberately does NOT read them (a
+    // group wildcard broader than the import is not a pattern you may store).
+    const registerGroup = (path: string) => {
+      if (groupInputs.has(path)) return;
+      const fromDoc = document?.groups.find((g) => g.path === path);
+      const meta: GroupInput = {};
+      if (fromDoc?.label !== undefined) meta.label = fromDoc.label;
+      if (fromDoc?.description !== undefined) {
+        meta.description = fromDoc.description;
+      }
+      addGroup(path, meta);
+    };
+    for (const key of concreteKeys) prefixesOf(key).forEach(registerGroup);
+    for (const region of regionPatterns) {
+      const path = region.slice(0, -2);
+      prefixesOf(path).forEach(registerGroup);
+      registerGroup(path);
+    }
+
+    importEntries.set(ns, {
+      namespace: ns,
+      from: spec.from,
+      enumerated: document !== undefined,
+      patterns,
+      keys: concreteKeys,
+      regions: regionPatterns,
+    });
+  }
+
   // --- Resolve leaves -------------------------------------------------------
   /** The nearest enclosing group that declares `scopes`; leaves override last. */
   const inheritedScopes = (key: string): readonly ScopeType[] => {
@@ -941,7 +1518,35 @@ export function defineCatalog<const C extends CatalogInput>(
       destructive: leaf.destructive ?? inferDestructive(name),
       scopes,
       impliedOnAncestors: leaf.impliedOnAncestors ?? false,
+      origin: "owned",
     });
+  }
+  // Imported concrete keys join the SAME map — see the note on
+  // `AnyCatalog.leaves` for why there is no second one. They are already
+  // fully resolved (local scope wiring applied), so they only need merging
+  // and their group paths registering.
+  for (const [key, meta] of importedLeaves) {
+    if (leaves.has(key)) {
+      err(key, "is declared both as an owned permission and as an import");
+      continue;
+    }
+    leaves.set(key, meta);
+  }
+  for (const key of importedLeaves.keys()) {
+    for (const prefix of prefixesOf(key)) groupPaths.add(prefix);
+  }
+  for (const pattern of openRegions.keys()) {
+    const path = pattern.slice(0, -2);
+    groupPaths.add(path);
+    for (const prefix of prefixesOf(path)) groupPaths.add(prefix);
+  }
+  for (const key of importedLeaves.keys()) {
+    if (groupPaths.has(key)) {
+      err(
+        key,
+        "is both an imported permission and a group path (other imported entries live under it) — group levels are folders, never permissions",
+      );
+    }
   }
   // Group-declared defaults too — a group with no leaves must still not
   // reference a scope type nobody declared.
@@ -979,16 +1584,28 @@ export function defineCatalog<const C extends CatalogInput>(
   for (const key of leafInputs.keys()) {
     pushChild(childLeaves, key.slice(0, key.lastIndexOf(".")), key);
   }
+  for (const key of importedLeaves.keys()) {
+    pushChild(childLeaves, key.slice(0, key.lastIndexOf(".")), key);
+  }
 
   const groups = new Map<string, GroupMeta>();
   for (const path of groupPaths) {
     const meta = groupInputs.get(path);
+    // A group path is imported exactly when its namespace is: imported and
+    // owned namespaces are disjoint by construction (an import of a namespace
+    // in `namespaces` is rejected above).
+    const ns = path.includes(".") ? namespaceOf(path) : path;
+    const imported = ns !== null && importedNamespaces.has(ns);
     groups.set(path, {
       path,
       label: meta?.label,
       description: meta?.description,
       groups: childGroups.get(path) ?? [],
       permissions: childLeaves.get(path) ?? [],
+      origin: imported ? "imported" : "owned",
+      ...(imported
+        ? { importedFrom: importEntries.get(ns)?.from }
+        : {}),
     });
   }
 
@@ -1021,17 +1638,24 @@ export function defineCatalog<const C extends CatalogInput>(
 
   return new Catalog<C>({
     namespace: primaryNamespace,
+    // Imported namespaces are listed too: `namespaces` answers "does this
+    // catalog speak this prefix at all", which every did-you-mean hint and
+    // the verifier's classifier ask. Ownership is the narrower question, and
+    // `imports` is what answers it — `toDocument()` filters on exactly that.
     namespaces: [
       ...declared,
       ...(input.includeAlfizInternal !== false
         ? [ALFIZ_INTERNAL_NAMESPACE]
         : []),
+      ...importedNamespaces,
     ],
     leaves: sortedLeaves,
     groups: sortedGroups,
     scopeTypes,
     navigation: buildNav(input.navigation ?? []),
     conventions: { depth },
+    imports: importEntries,
+    openRegions,
   });
 }
 
@@ -1049,8 +1673,12 @@ export function suggestPattern(
   pattern: string,
 ): string | null {
   if (catalog.isKnownPattern(pattern)) return null;
-  if (catalog.hasGroup(pattern)) return `${pattern}.*`;
-  return null;
+  if (!catalog.hasGroup(pattern)) return null;
+  // Imported group paths exist so pickers can render them, but a wildcard
+  // over one is only storable when the import actually declared it — never
+  // suggest a fix that would fail the same check.
+  const suggestion = `${pattern}.*`;
+  return catalog.isKnownPattern(suggestion) ? suggestion : null;
 }
 
 /**
@@ -1102,7 +1730,13 @@ export function closestPatterns(
       ? catalog.keys
       : [
           ...catalog.keys,
-          ...[...catalog.groups.keys()].map((path) => `${path}.*`),
+          // Every open region's prefix is registered as a group, so this
+          // covers imported subtree patterns too — filtered, because a group
+          // wildcard broader than an import is not a storable pattern and
+          // must never be offered as a fix.
+          ...[...catalog.groups.keys()]
+            .map((path) => `${path}.*`)
+            .filter((p) => catalog.isKnownPattern(p)),
         ];
   const max = Math.min(4, Math.max(2, Math.floor(value.length / 4)));
   const scored: Array<{ candidate: string; distance: number }> = [];
@@ -1144,21 +1778,48 @@ export function unknownPermissionContext(
   suggestion: string | null;
   didYouMean: string[];
   hint: string | undefined;
+  namespaceOrigin: "owned" | "imported" | "foreign";
+  importedPatterns: readonly string[];
 } {
+  const ns = namespaceOf(value);
+  const importEntry = ns === null ? undefined : catalog.imports.get(ns);
+  const namespaceOrigin: "owned" | "imported" | "foreign" =
+    importEntry !== undefined
+      ? "imported"
+      : ns !== null && catalog.namespaces.includes(ns)
+        ? "owned"
+        : "foreign";
+  const importedPatterns = importEntry?.patterns ?? [];
+
   const suggestion = suggestPattern(catalog, value);
   // A group path has ONE right answer; near-miss noise would bury it.
   if (suggestion !== null) {
-    return { suggestion, didYouMean: [], hint: undefined };
+    return {
+      suggestion,
+      didYouMean: [],
+      hint: undefined,
+      namespaceOrigin,
+      importedPatterns,
+    };
   }
   const didYouMean = closestPatterns(catalog, value, expected);
   let hint: string | undefined;
-  const ns = namespaceOf(value);
-  if (ns !== null && !catalog.namespaces.includes(ns)) {
+  if (namespaceOrigin === "imported") {
+    // The namespace is known — this is a reach beyond what was imported,
+    // which is a different fix from a typo and gets its own sentence.
+    hint =
+      `${JSON.stringify(ns)} is imported by this catalog, but this ${expected} is outside what it covers ` +
+      `(imported: ${importedPatterns.join(", ")}) — add the key or widen the pattern in \`imports.${ns}.permissions\``;
+  } else if (namespaceOrigin === "foreign") {
+    const imported = [...catalog.imports.keys()];
     hint =
       `the first segment ${JSON.stringify(ns)} is not a namespace of this catalog — ` +
-      `declared namespaces: ${catalog.namespaces.join(", ")}`;
+      `declared namespaces: ${catalog.namespaces.join(", ")}` +
+      (imported.length > 0
+        ? `; this catalog imports ${imported.join(", ")} — add ${JSON.stringify(ns)} to \`imports\` to reference it`
+        : `. If this permission belongs to another application, declare it in the catalog's \`imports\``);
   }
-  return { suggestion, didYouMean, hint };
+  return { suggestion, didYouMean, hint, namespaceOrigin, importedPatterns };
 }
 
 /**
@@ -1209,11 +1870,18 @@ export function catalogFromDocument<
       },
     ]);
   }
+  // A document written before imports existed carries no `origin`; a
+  // document is by definition what its publisher OWNS, so absent reads as
+  // owned. Normalized here rather than at every read site.
   const built: AnyCatalog = new Catalog({
     namespace: document.namespace,
     namespaces: [...document.namespaces],
-    leaves: new Map(document.leaves.map((l) => [l.key, l])),
-    groups: new Map(document.groups.map((g) => [g.path, g])),
+    leaves: new Map(
+      document.leaves.map((l) => [l.key, { ...l, origin: l.origin ?? "owned" }]),
+    ),
+    groups: new Map(
+      document.groups.map((g) => [g.path, { ...g, origin: g.origin ?? "owned" }]),
+    ),
     scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
     navigation: document.navigation,
     conventions: document.conventions ?? { depth: DEFAULT_KEY_DEPTH },
@@ -1250,9 +1918,18 @@ export function lintCatalog(catalog: AnyCatalog): CatalogIssue[] {
   // The blessed key depth is a CONVENTION, checked here rather than thrown at
   // boot: a two-level integration catalog (`zoom.host`) or a deeper feature
   // tree is a house-style decision, not a structural error.
+  // Imported entries are exempt from every convention below. They belong to
+  // another application's catalog: its depth, its naming floor, its choice of
+  // which tabs carry a read. Linting them would emit errors this codebase
+  // cannot fix — the wrong kind of finding for a tool whose value is that its
+  // output is always actionable.
+  const owned = <T extends { origin?: "owned" | "imported" }>(x: T): boolean =>
+    x.origin !== "imported";
+
   const { depth } = catalog.conventions;
   if (depth !== "any") {
     for (const leaf of catalog.leaves.values()) {
+      if (!owned(leaf)) continue;
       const actual = leaf.key.split(".").length;
       if (actual !== depth) {
         push(
@@ -1269,6 +1946,7 @@ export function lintCatalog(catalog: AnyCatalog): CatalogIssue[] {
   }
 
   for (const group of catalog.groups.values()) {
+    if (!owned(group)) continue;
     // A "tab" is a group that carries permissions directly.
     if (group.permissions.length === 0 && group.groups.length === 0) {
       push("error", group.path, "empty group: declare permissions or remove it");
@@ -1324,7 +2002,10 @@ export function lintCatalog(catalog: AnyCatalog): CatalogIssue[] {
           );
         } else if (
           pattern.endsWith(".*") &&
-          catalog.keysMatching(pattern).length === 0
+          catalog.keysMatching(pattern).length === 0 &&
+          // An open region has no keys to match BY CONSTRUCTION; warning
+          // that it "matches no keys" would be reporting the feature.
+          catalog.opaqueRegions(pattern).length === 0
         ) {
           push(
             "warning",

@@ -5,19 +5,28 @@
  * than a snapshot. No rendering here; this is state logic any UI can bind.
  */
 
-import type { AnyCatalog, LeafMeta } from "./catalog.js";
+import type { AnyCatalog, ImportedRegion, LeafMeta } from "./catalog.js";
 import type { PermissionPattern } from "./grammar.js";
-import { patternMatchesKey } from "./grammar.js";
+import { patternMatchesKey, patternsIntersect } from "./grammar.js";
 
 export interface PermTreeNode {
-  /** The group path or leaf key. */
+  /** The group path, leaf key, or (for a region) the group path it covers. */
   path: string;
   /** Last segment. */
   name: string;
   /** Short human-facing name (catalog `label`), falling back to `name`. */
   label: string;
-  kind: "group" | "leaf";
+  /**
+   * A `region` is an imported subtree whose keys this catalog cannot
+   * enumerate — it selects as one unit, like a leaf, because there is
+   * nothing underneath it to tick. Without this kind it would render as an
+   * empty group, and an empty group is never selectable: `isNodeChecked`
+   * has no leaves to satisfy, so it would be permanently untickable in
+   * every role editor.
+   */
+  kind: "group" | "leaf" | "region";
   leaf?: LeafMeta | undefined;
+  region?: ImportedRegion | undefined;
   description?: string | undefined;
   children: PermTreeNode[];
 }
@@ -26,11 +35,39 @@ export interface PermTreeNode {
 export function buildPermissionTree(
   catalog: AnyCatalog,
 ): PermTreeNode[] {
+  /** Regions rendered under a group path, keyed by that path. */
+  const regionsAt = new Map<string, ImportedRegion[]>();
+  for (const region of catalog.openRegions.values()) {
+    const at = region.pattern.slice(0, -2);
+    const parent = at.includes(".") ? at.slice(0, at.lastIndexOf(".")) : at;
+    const existing = regionsAt.get(parent);
+    if (existing) existing.push(region);
+    else regionsAt.set(parent, [region]);
+  }
+
   const build = (path: string): PermTreeNode => {
     const group = catalog.groups.get(path);
     if (!group) throw new Error(`unknown group ${JSON.stringify(path)}`);
+    const regionPaths = new Set(
+      (regionsAt.get(path) ?? []).map((r) => r.pattern.slice(0, -2)),
+    );
     const children: PermTreeNode[] = [
-      ...group.groups.map(build),
+      // A group that IS a region renders as the region, not as an empty
+      // folder shadowing it.
+      ...group.groups.filter((p) => !regionPaths.has(p)).map(build),
+      ...(regionsAt.get(path) ?? []).map((region) => {
+        const at = region.pattern.slice(0, -2);
+        const name = at.split(".").pop()!;
+        return {
+          path: at,
+          name,
+          label: region.label ?? name,
+          kind: "region" as const,
+          region,
+          description: region.description,
+          children: [],
+        };
+      }),
       ...group.permissions.map((key) => {
         const leaf = catalog.leaves.get(key)!;
         return {
@@ -58,9 +95,12 @@ export function buildPermissionTree(
   return topLevel.map(build);
 }
 
-/** The pattern a node stores when ticked: `<group>.*` for groups, the key for leaves. */
+/**
+ * The pattern a node stores when ticked: `<group>.*` for groups and for
+ * regions (a region IS its subtree pattern), the key for leaves.
+ */
 export function nodePattern(node: PermTreeNode): PermissionPattern {
-  return node.kind === "group" ? `${node.path}.*` : node.path;
+  return node.kind === "leaf" ? node.path : `${node.path}.*`;
 }
 
 /** Does `pattern` cover this node's entire subtree (group) or the leaf itself? */
@@ -87,14 +127,34 @@ const leafKeysUnder = (node: PermTreeNode): string[] =>
     ? [node.path]
     : node.children.flatMap((child) => leafKeysUnder(child));
 
-/** Fully selected: every leaf under the node matches some selection entry. */
+/** Regions under a node, as their stored patterns. */
+const regionPatternsUnder = (node: PermTreeNode): PermissionPattern[] =>
+  node.kind === "region"
+    ? [nodePattern(node)]
+    : node.children.flatMap((child) => regionPatternsUnder(child));
+
+/**
+ * Fully selected: every leaf AND every region under the node is covered.
+ *
+ * Regions are matched by intersection, not by key: they stand for keys this
+ * catalog cannot enumerate, so "is it covered" is a question about patterns.
+ * Counting them is also what makes an imported subtree tickable at all — a
+ * region node has no leaves under it, and a node with nothing to satisfy
+ * would otherwise read as permanently unchecked.
+ */
 export function isNodeChecked(
   selection: readonly PermissionPattern[],
   node: PermTreeNode,
 ): boolean {
   const keys = leafKeysUnder(node);
-  if (keys.length === 0) return false;
-  return keys.every((key) => selection.some((p) => patternMatchesKey(p, key)));
+  const regions = regionPatternsUnder(node);
+  if (keys.length === 0 && regions.length === 0) return false;
+  return (
+    keys.every((key) => selection.some((p) => patternMatchesKey(p, key))) &&
+    regions.every((region) =>
+      selection.some((p) => patternsIntersect(p, region)),
+    )
+  );
 }
 
 /** Partially selected: some but not all leaves under the node are covered. */
@@ -102,12 +162,19 @@ export function isNodeIndeterminate(
   selection: readonly PermissionPattern[],
   node: PermTreeNode,
 ): boolean {
-  if (node.kind === "leaf") return false;
-  const keys = leafKeysUnder(node);
-  const covered = keys.filter((key) =>
-    selection.some((p) => patternMatchesKey(p, key)),
+  if (node.kind === "leaf" || node.kind === "region") return false;
+  const units = [
+    ...leafKeysUnder(node).map((key) => ({ value: key, region: false })),
+    ...regionPatternsUnder(node).map((p) => ({ value: p, region: true })),
+  ];
+  const covered = units.filter((unit) =>
+    selection.some((p) =>
+      unit.region
+        ? patternsIntersect(p, unit.value)
+        : patternMatchesKey(p, unit.value),
+    ),
   ).length;
-  return covered > 0 && covered < keys.length;
+  return covered > 0 && covered < units.length;
 }
 
 /**

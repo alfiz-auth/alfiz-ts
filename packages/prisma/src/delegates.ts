@@ -308,6 +308,25 @@ export interface AlfizCatalogDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizImports (versioned singleton, id = 1) — what the application CONSUMES
+// ---------------------------------------------------------------------------
+
+export interface AlfizImportsRecord {
+  id: number;
+  version: number;
+  manifest: unknown;
+}
+
+export interface AlfizImportsDelegate {
+  upsert(args: {
+    where: { id: number };
+    create: { id: number; version: number; manifest: InputJsonValue };
+    update: { version: number; manifest: InputJsonValue };
+  }): Promise<unknown>;
+  findUnique(args: { where: { id: number } }): Promise<AlfizImportsRecord | null>;
+}
+
+// ---------------------------------------------------------------------------
 // AlfizAudit
 // ---------------------------------------------------------------------------
 
@@ -466,6 +485,12 @@ export interface AlfizPrismaDelegates {
   alfizRequest: AlfizRequestDelegate;
   alfizCatalog: AlfizCatalogDelegate;
   alfizAudit: AlfizAuditDelegate;
+  /**
+   * OPTIONAL — present when the schema includes the AlfizImports model. A
+   * client generated without it still satisfies this interface; the driver
+   * then omits the import methods and `capabilities().imports` is false.
+   */
+  alfizImports?: AlfizImportsDelegate;
   /**
    * OPTIONAL — present when the schema includes the AlfizEpoch/AlfizEvent
    * models (the persisted invalidation log). A client generated without

@@ -182,7 +182,13 @@ export class AlfizSession<
   ): Promise<boolean> {
     const ctx = await this.roleContext(roleId);
     if (!ctx) return false;
-    return checkAny(ctx, pattern, this.client.catalog.keys);
+    return checkAny(
+      ctx,
+      pattern,
+      this.client.catalog.keys,
+      undefined,
+      this.client.catalog.opaqueRegions(pattern),
+    );
   }
 
   /**
@@ -331,7 +337,16 @@ export class AlfizSessionSnapshot<
     if (this.preview === null) return true;
     if (this.preview.kind === "user") return this.preview.snap.canAny(pattern);
     const ctx = this.preview.ctx;
-    return ctx !== null && checkAny(ctx, pattern, this.catalog.keys);
+    return (
+      ctx !== null &&
+      checkAny(
+        ctx,
+        pattern,
+        this.catalog.keys,
+        undefined,
+        this.catalog.opaqueRegions(pattern),
+      )
+    );
   }
 
   /** Throwing form of `can`. Denials name the ACTOR — attribution never follows the preview. */

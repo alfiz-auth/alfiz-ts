@@ -13,7 +13,7 @@
 
 import type { PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
-import type { ScopeId } from "./scopes.js";
+import type { ScopeId, ScopeType } from "./scopes.js";
 import type { SubjectId } from "./subjects.js";
 import { groupSubject, orgSubject } from "./subjects.js";
 import type { CheckContext, GrantRow, Provenance } from "./access.js";
@@ -119,11 +119,19 @@ export interface AccessRequest {
  * applies revoke suppression exactly as `checkAny` does: a fully-revoked
  * requester never auto-approves, and a pattern matching no catalog key never
  * passes. Negative-always-wins holds here too.
+ *
+ * `opaqueRegions` (pass `catalog.opaqueRegions(pattern)`) covers imported
+ * wildcards, which enumerate no keys: without it a `holds_pattern` stage over
+ * an imported pattern abstains for everyone, silently, forever.
  */
 export function evaluateAutoPredicate(
   predicate: AutoApprovalPredicate,
   requester: CheckContext,
   catalogKeys: readonly PermissionKey[],
+  opaqueRegions?: readonly {
+    pattern: PermissionPattern;
+    scopes: readonly ScopeType[];
+  }[],
 ): boolean {
   switch (predicate.type) {
     case "in_group":
@@ -133,7 +141,13 @@ export function evaluateAutoPredicate(
     case "member_of":
       return requester.subjectClosure.has(predicate.subject);
     case "holds_pattern":
-      return checkAny(requester, predicate.pattern, catalogKeys);
+      return checkAny(
+        requester,
+        predicate.pattern,
+        catalogKeys,
+        undefined,
+        opaqueRegions,
+      );
   }
 }
 
@@ -263,13 +277,24 @@ export function runAutoStages(
   requester: CheckContext,
   now: number,
   catalogKeys: readonly PermissionKey[],
+  opaqueRegions?: readonly {
+    pattern: PermissionPattern;
+    scopes: readonly ScopeType[];
+  }[],
 ): StageAdvanceResult {
   let current: AccessRequest = request;
   let plan: StageAdvanceResult["grantPlan"];
   while (current.state === "pending") {
     const stage = current.stages[current.stageIndex];
     if (!stage || stage.kind !== "auto") break;
-    if (evaluateAutoPredicate(stage.predicate, requester, catalogKeys)) {
+    if (
+      evaluateAutoPredicate(
+        stage.predicate,
+        requester,
+        catalogKeys,
+        opaqueRegions,
+      )
+    ) {
       const advanced = applyDecision(current, {
         decidedBy: "auto",
         decision: "approved",

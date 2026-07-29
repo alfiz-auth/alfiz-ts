@@ -23,6 +23,7 @@ import type {
   ApprovalStage,
   AuditEvent,
   CatalogDocument,
+  ImportManifest,
   GrantRow,
   InvalidationEvent,
   MetricDimension,
@@ -49,6 +50,7 @@ import type {
   AlfizGrantRecord,
   AlfizGrantWhere,
   AlfizGroupRecord,
+  AlfizImportsDelegate,
   AlfizMetricDelegate,
   AlfizPrismaDelegates,
   AlfizRequestData,
@@ -569,6 +571,11 @@ export function prismaDriver(
       return rows.map(auditFromDb);
     },
 
+    // -- imports --------------------------------------------------------------
+    // Included only when the schema carries the AlfizImports model, on the
+    // same reasoning as the event log and metrics below.
+    ...(db.alfizImports !== undefined ? importMethods(db.alfizImports) : {}),
+
     // -- invalidation events --------------------------------------------------
     // Included only when the schema carries the AlfizEpoch/AlfizEvent models
     // (both delegates present), so clients generated from the pre-log
@@ -603,6 +610,33 @@ export function prismaDriver(
  * and off the request path, so the statement count is the number of distinct
  * buckets in a window — small, and bounded by attributed rows.
  */
+/**
+ * The import manifest: a versioned singleton, exactly like the catalog, and
+ * stored beside it rather than inside it — what an application consumes is a
+ * different contract from what it announces.
+ */
+function importMethods(
+  imports: AlfizImportsDelegate,
+): Pick<Required<StorageDriver>, "putImports" | "getImports"> {
+  return {
+    async putImports(version, manifest) {
+      await imports.upsert({
+        where: { id: 1 },
+        create: { id: 1, version, manifest: toJson(manifest) },
+        update: { version, manifest: toJson(manifest) },
+      });
+    },
+    async getImports() {
+      const row = await imports.findUnique({ where: { id: 1 } });
+      if (row === null) return null;
+      return {
+        version: row.version,
+        manifest: fromJson<ImportManifest>(row.manifest),
+      };
+    },
+  };
+}
+
 function metricMethods(
   metric: AlfizMetricDelegate,
 ): Pick<

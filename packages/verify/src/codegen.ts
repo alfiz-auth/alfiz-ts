@@ -10,6 +10,14 @@
  * from the document, and pin them back on with
  * `catalogFromDocument<AlfizKey, AlfizPattern, AlfizScopeId>(doc)`.
  *
+ * It is also how an IMPORT closes its key union. A wildcard import declares
+ * a subtree whose members `defineCatalog` cannot infer — a `document` is a
+ * runtime value, not a literal — so the union stays open unless the keys
+ * arrive as types. Generate them from the namespace owner's document and
+ * pin them with `importedKeys<ZoomKey>({ ... })`. A published document
+ * carries only what its publisher OWNS, so everything emitted here is
+ * exactly the foreign vocabulary an importer may reference.
+ *
  * The emitted module is deliberately dependency-free (pure type aliases),
  * so it can be committed, reviewed in diffs — a new permission shows up as
  * a one-line addition — and imported from anywhere, client bundles

@@ -8,6 +8,7 @@ import type {
   AccessRequest,
   AuditEvent,
   CatalogDocument,
+  ImportManifest,
   GrantRow,
   InvalidationEvent,
   MetricBucket,
@@ -51,6 +52,7 @@ export function memoryDriver(): StorageDriver {
   const audit: AuditEvent[] = [];
   const metrics = new Map<string, MetricBucket>();
   let catalog: { version: number; document: CatalogDocument } | null = null;
+  let imports: { version: number; manifest: ImportManifest } | null = null;
   const locks = new Map<string, Promise<unknown>>();
   const events: Array<{ seq: number; event: InvalidationEvent; at: number }> =
     [];
@@ -177,6 +179,13 @@ export function memoryDriver(): StorageDriver {
     },
     async getCatalog() {
       return catalog ? clone(catalog) : null;
+    },
+
+    async putImports(version, manifest) {
+      imports = { version, manifest: clone(manifest) };
+    },
+    async getImports() {
+      return imports ? clone(imports) : null;
     },
 
     async appendAudit(event) {

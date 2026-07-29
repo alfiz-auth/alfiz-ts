@@ -26,11 +26,14 @@ export interface VerifyIssue {
   severity: VerifySeverity;
   rule:
     | "unknown-pattern"
+    | "unknown-import"
+    | "implicit-import"
     | "visibility-as-gate"
     | "ungated-action"
     | "unreferenced-leaf"
     | "client-reachable-secret"
     | "ignored-file"
+    | "stale-suppression"
     | "catalog";
   file: string;
   line: number;
@@ -69,12 +72,35 @@ export interface VerifyOptions {
    * module becomes client-reachable).
    */
   forbidClientIdentifiers?: readonly string[] | undefined;
+  /**
+   * Whether a source of imported vocabulary is wired up — a registry, a
+   * hosted dashboard. It decides the severity of `implicit-import`, and it
+   * is DECLARED rather than detected: `verifyProject` is offline,
+   * deterministic, and provider-less by construction, and it must never
+   * reach the network to grade a codebase.
+   *
+   * Defaults to `"registry"` when the catalog already declares imports.
+   */
+  importSource?: "registry" | "none" | undefined;
+  /**
+   * Overrides that severity outright. `"off"` suppresses the rule; use it
+   * when foreign keys are an accepted, reviewed part of this codebase.
+   */
+  implicitImports?: "error" | "warn" | "off" | undefined;
+  /** Namespaces exempt from `implicit-import` entirely. */
+  implicitImportAllow?: readonly string[] | undefined;
 }
 
 export interface VerifyReport {
   issues: VerifyIssue[];
   /** Concrete keys referenced by at least one scanned call site or nav item. */
   referencedKeys: Set<string>;
+  /**
+   * Patterns referenced by a call site or nav item, verbatim. Imported
+   * wildcards expand to no keys, so pattern-wise reach is the only way to
+   * tell a live import from a stale one.
+   */
+  referencedPatterns: Set<string>;
   /** Files skipped by the `alfiz-verify-ignore-file` pragma, with their reasons. */
   skippedFiles: Array<{ file: string; reason: string }>;
   errorCount: number;
@@ -214,6 +240,68 @@ export function findIgnorePragma(sourceText: string): IgnorePragma | null {
   return fallback;
 }
 
+/** A per-line suppression: which rule, why, and whether anything used it. */
+export interface LineSuppression {
+  rule: string;
+  reason: string;
+  /** 1-based line the pragma sits on. */
+  line: number;
+}
+
+/**
+ * Per-line escape hatches, for the case the file-level pragma is far too
+ * blunt for: ONE runtime-string call site in a file whose other checks you
+ * very much want to keep.
+ *
+ * ```ts
+ * // alfiz-verify-ignore-next-line implicit-import legacy zoom bridge, removed in Q3
+ * await client.can(user, legacyKey);
+ * await client.can(user, k); // alfiz-verify-ignore-line implicit-import same
+ * ```
+ *
+ * The RULE NAME is required, not optional. An unqualified per-line ignore is
+ * how a `client-reachable-secret` error gets silenced by somebody reaching
+ * for the nearest way to quiet an unrelated warning. The reason is required
+ * on the same discipline as the file pragma: an unexplained exemption in a
+ * security tool is how exemptions rot.
+ *
+ * Returns suppressions keyed by the line they apply TO, not the line the
+ * comment sits on.
+ */
+export function findLineSuppressions(
+  sourceText: string,
+): Map<number, LineSuppression[]> {
+  const PRAGMA = /alfiz-verify-ignore-(next-line|line)\b[ \t]*(.*)$/;
+  const out = new Map<number, LineSuppression[]>();
+  const lines = sourceText.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    const raw = lines[i]!;
+    const commentAt = raw.indexOf("//");
+    if (commentAt < 0) continue;
+    const match = PRAGMA.exec(raw.slice(commentAt + 2).trim());
+    if (!match) continue;
+    const [rule = "", ...rest] = match[2]!.trim().split(/\s+/);
+    // `next-line` applies below; a trailing `line` pragma applies to its own
+    // line — but only when it TRAILS code, since a comment on its own line
+    // suppressing itself would suppress nothing.
+    const target =
+      match[1] === "next-line"
+        ? i + 2
+        : raw.slice(0, commentAt).trim() === ""
+          ? i + 2
+          : i + 1;
+    const entry: LineSuppression = {
+      rule,
+      reason: rest.join(" "),
+      line: i + 1,
+    };
+    const existing = out.get(target);
+    if (existing) existing.push(entry);
+    else out.set(target, [entry]);
+  }
+  return out;
+}
+
 const calleeName = (expr: ts.Expression): string | null => {
   if (ts.isIdentifier(expr)) return expr.text;
   if (ts.isPropertyAccessExpression(expr)) return expr.name.text;
@@ -259,15 +347,54 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
 
   const issues: VerifyIssue[] = [];
   const referencedKeys = new Set<string>();
+  /**
+   * Patterns reached by a call site, tracked alongside the keys. An open
+   * region expands to no keys, so imported reach can only be recorded
+   * pattern-wise — otherwise every import reads as unreferenced.
+   */
+  const referencedPatterns = new Set<string>();
   const skippedFiles: Array<{ file: string; reason: string }> = [];
-  const namespaces = new Set(catalog.namespaces);
+  const ownedNamespaces = new Set(
+    catalog.namespaces.filter((ns) => !catalog.imports.has(ns)),
+  );
+  const allowedExternal = new Set(options.implicitImportAllow ?? []);
 
-  /** Is this literal plausibly a permission reference we should validate? */
-  const isOurs = (text: string): boolean => {
-    if (!isValidPattern(text)) return false;
-    if (text === "*") return true;
+  /**
+   * The severity of a foreign permission. An application that has never
+   * declared an import has no plausible source for one, so it is a typo —
+   * error. An application that already imports has the mechanism wired, so a
+   * missing declaration is an omission — warning, with the snippet to paste.
+   * Declared, never detected: no network call decides a CI outcome.
+   */
+  const importSource =
+    options.importSource ?? (catalog.imports.size > 0 ? "registry" : "none");
+  const implicitPolicy =
+    options.implicitImports ?? (importSource === "registry" ? "warn" : "error");
+
+  /**
+   * Where a literal belongs. Replaces the old `isOurs` filter, which
+   * silently DROPPED every foreign-namespace literal — so a key that throws
+   * at runtime sailed through CI, which is the asymmetry this rule exists to
+   * close.
+   */
+  const classify = (
+    text: string,
+  ): "owned" | "imported" | "foreign" | "skip" => {
+    if (!isValidPattern(text)) return "skip";
+    if (text === "*") return "owned";
+    // A single-segment literal is structurally never a permission key — the
+    // catalog rejects one at build time — so it is ordinary prose unless it
+    // names a group this catalog HAS, which is the group-path near-miss
+    // (`requireAny(user, "docs")` where `"docs.*"` was meant). Without this
+    // guard, dropping the old namespace filter would report
+    // `gateAction("createInvoice")` as an unknown permission.
+    if (!text.includes(".")) {
+      return catalog.hasGroup(text) ? "owned" : "skip";
+    }
     const ns = namespaceOf(text);
-    return ns !== null && namespaces.has(ns);
+    if (ns === null) return "skip";
+    if (catalog.imports.has(ns)) return "imported";
+    return ownedNamespaces.has(ns) ? "owned" : "foreign";
   };
 
   for (const file of options.files) {
@@ -303,6 +430,24 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
       });
       continue;
     }
+    const suppressions = findLineSuppressions(text);
+    const usedSuppressions = new Set<LineSuppression>();
+
+    /**
+     * Every finding in this file goes through here, so a per-line pragma
+     * covers all of them rather than only the rule it was written beside.
+     */
+    const report = (issue: VerifyIssue): void => {
+      const matched = (suppressions.get(issue.line) ?? []).find(
+        (s) => s.rule === issue.rule,
+      );
+      if (matched !== undefined) {
+        usedSuppressions.add(matched);
+        return;
+      }
+      issues.push(issue);
+    };
+
     const source = ts.createSourceFile(
       file,
       text,
@@ -342,7 +487,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
 
     const visit = (node: ts.Node): void => {
       if (isClientFile && ts.isIdentifier(node) && forbidden.has(node.text)) {
-        issues.push({
+        report({
           severity: "error",
           rule: "client-reachable-secret",
           file,
@@ -359,7 +504,30 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
           for (const arg of node.arguments) {
             for (const literal of literalsIn(arg)) {
               const text = literal.text;
-              if (!isOurs(text)) continue;
+              const origin = classify(text);
+              if (origin === "skip") continue;
+              const line = lineOf(source, literal);
+
+              if (origin === "foreign") {
+                if (implicitPolicy === "off") continue;
+                const ns = namespaceOf(text);
+                if (ns !== null && allowedExternal.has(ns)) continue;
+                report({
+                  severity: implicitPolicy === "warn" ? "warning" : "error",
+                  rule: "implicit-import",
+                  file,
+                  line,
+                  message:
+                    `${JSON.stringify(text)} is in namespace ${JSON.stringify(ns)}, which this catalog ` +
+                    `neither owns nor imports` +
+                    (implicitPolicy === "warn"
+                      ? ` — declare it: imports: { ${ns}: { permissions: { ${JSON.stringify(text)}: true } } }`
+                      : `. If it belongs to another application, declare it in the catalog's \`imports\`; ` +
+                        `otherwise it is a typo, and this check will throw at runtime`),
+                });
+                continue;
+              }
+
               if (catalog.hasKey(text)) {
                 referencedKeys.add(text);
               } else if (!catalog.isKnownPattern(text)) {
@@ -370,11 +538,11 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
                 // typos, name the closest declared keys.
                 const { suggestion, didYouMean, hint } =
                   unknownPermissionContext(catalog, text, "pattern");
-                issues.push({
+                report({
                   severity: "error",
-                  rule: "unknown-pattern",
+                  rule: origin === "imported" ? "unknown-import" : "unknown-pattern",
                   file,
-                  line: lineOf(source, literal),
+                  line,
                   message: suggestion
                     ? `${JSON.stringify(text)} is a group, not a key — groups are folders, and subtree patterns end in .*: did you mean ${JSON.stringify(suggestion)}?`
                     : `${JSON.stringify(text)} is not in the catalog (typo, or an undeclared key)` +
@@ -384,7 +552,10 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
                       (hint ? ` (${hint})` : ""),
                 });
               } else {
-                // A known group wildcard: mark every key under it referenced.
+                // A known key, group wildcard, or import pattern. Record the
+                // pattern itself as well as the keys it expands to: an open
+                // region expands to none, and would otherwise read as dead.
+                referencedPatterns.add(text);
                 for (const key of catalog.keysMatching(text)) {
                   referencedKeys.add(key);
                 }
@@ -393,7 +564,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
           }
 
           if (visibility.has(name) && isServerFile) {
-            issues.push({
+            report({
               severity: "error",
               rule: "visibility-as-gate",
               file,
@@ -444,13 +615,50 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
 
     for (const action of exportedAsyncFunctions) {
       if (!gatedFunctions.has(action.node)) {
-        issues.push({
+        report({
           severity: "error",
           rule: "ungated-action",
           file,
           line: lineOf(source, action.node),
           message: `exported server action ${JSON.stringify(action.name)} contains no gate — every action gates on a concrete permission before doing work`,
         });
+      }
+    }
+
+    // Same reasoning as the misplaced file pragma: a security tool that
+    // quietly drops its own escape hatch is the wrong failure direction, and
+    // a suppression nobody needs any more is an exemption rotting in place.
+    for (const entries of suppressions.values()) {
+      for (const entry of entries) {
+        if (entry.rule === "") {
+          issues.push({
+            severity: "warning",
+            rule: "stale-suppression",
+            file,
+            line: entry.line,
+            message:
+              "alfiz-verify-ignore-next-line without a rule name — name the rule it suppresses (e.g. `implicit-import`), so it cannot silence an unrelated finding, and say why",
+          });
+          continue;
+        }
+        if (entry.reason === "") {
+          issues.push({
+            severity: "warning",
+            rule: "stale-suppression",
+            file,
+            line: entry.line,
+            message: `alfiz-verify-ignore for ${JSON.stringify(entry.rule)} without a reason — say why this call site is exempt`,
+          });
+        }
+        if (!usedSuppressions.has(entry)) {
+          issues.push({
+            severity: "warning",
+            rule: "stale-suppression",
+            file,
+            line: entry.line,
+            message: `alfiz-verify-ignore for ${JSON.stringify(entry.rule)} suppresses nothing here — the finding is gone, so remove the pragma`,
+          });
+        }
       }
     }
   }
@@ -462,6 +670,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
         ? item.permission
         : [item.permission as string];
       for (const pattern of patterns) {
+        referencedPatterns.add(pattern);
         for (const key of catalog.keysMatching(pattern)) referencedKeys.add(key);
       }
       walkNav(item.children);
@@ -472,17 +681,40 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
   // Coverage: catalog leaves no scanned gate or nav item references.
   // alfiz_internal.* leaves are gated inside Alfiz's own surfaces, not the
   // application's code, so they are exempt.
+  //
+  // Imported leaves are NOT exempt — a stale import is exactly as worth
+  // knowing as a dead permission, and it is the only signal that a
+  // dependency on another application has quietly ended. Only the wording
+  // changes, because the fix is different: drop the import, not the gate.
   for (const key of catalog.keys) {
     if (namespaceOf(key) === ALFIZ_INTERNAL_NAMESPACE) continue;
-    if (!referencedKeys.has(key)) {
-      issues.push({
-        severity: "warning",
-        rule: "unreferenced-leaf",
-        file: "<catalog>",
-        line: 0,
-        message: `${JSON.stringify(key)} is declared but referenced by no gate or nav item — dead permission, or missing enforcement?`,
-      });
-    }
+    if (referencedKeys.has(key)) continue;
+    const imported = catalog.leaves.get(key)?.origin === "imported";
+    issues.push({
+      severity: "warning",
+      rule: "unreferenced-leaf",
+      file: "<catalog>",
+      line: 0,
+      message: imported
+        ? `${JSON.stringify(key)} is imported but referenced by no gate or nav item — stale import?`
+        : `${JSON.stringify(key)} is declared but referenced by no gate or nav item — dead permission, or missing enforcement?`,
+    });
+  }
+
+  // An open region expands to no keys, so the loop above cannot see it. Its
+  // coverage question is the same one, asked pattern-wise.
+  for (const region of catalog.openRegions.values()) {
+    const reached = [...referencedPatterns].some(
+      (p) => p === region.pattern || catalog.opaqueRegions(p).includes(region),
+    );
+    if (reached) continue;
+    issues.push({
+      severity: "warning",
+      rule: "unreferenced-leaf",
+      file: "<catalog>",
+      line: 0,
+      message: `${JSON.stringify(region.pattern)} is imported but referenced by no gate or nav item — stale import?`,
+    });
   }
 
   // Catalog lint rides along, so one command covers the whole checklist.
@@ -499,6 +731,7 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
   return {
     issues,
     referencedKeys,
+    referencedPatterns,
     skippedFiles,
     errorCount: issues.filter((i) => i.severity === "error").length,
     warningCount: issues.filter((i) => i.severity === "warning").length,

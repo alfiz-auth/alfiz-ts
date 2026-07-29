@@ -21,6 +21,7 @@ import type {
   GrantInput,
   GrantQuery,
   GrantRow,
+  ImportManifest,
   InvalidationEvent,
   InvalidationListener,
   MetricBucket,
@@ -62,6 +63,7 @@ import {
   formatAlternatives,
   isGlobalScope,
   isValidSubject,
+  namespaceOf,
   parseSubject,
   planVirtualParentDissolution,
   runAutoStages,
@@ -481,6 +483,12 @@ export class AlfizApplication<
       audit: true,
       multiParent,
       metrics: this.metricsEnabled,
+      // The storage seam's import methods are optional, exactly as the
+      // event-log ones are: a driver written before manifests existed still
+      // satisfies the contract, and its clients simply render nothing.
+      imports:
+        this.storage.putImports !== undefined &&
+        this.storage.getImports !== undefined,
     };
   }
 
@@ -1252,7 +1260,15 @@ export class AlfizApplication<
       createdAt: now,
     };
     const requester = await this.contextFor({ userId: input.requesterUserId });
-    const result = runAutoStages(request, requester.ctx, now, this.catalog.keys);
+    // Every open region, not a pattern-filtered slice: the stages carry their
+    // own patterns and `checkAny` intersects per pattern anyway.
+    const result = runAutoStages(
+      request,
+      requester.ctx,
+      now,
+      this.catalog.keys,
+      [...this.catalog.openRegions.values()],
+    );
     request = result.request;
     await this.storage.insertRequest(request);
     await this.audit(
@@ -1360,6 +1376,7 @@ export class AlfizApplication<
           requester.ctx,
           now,
           this.catalog.keys,
+          [...this.catalog.openRegions.values()],
         );
         result = {
           request: advanced.request,
@@ -1453,6 +1470,22 @@ export class AlfizApplication<
         "validation",
       );
     }
+    // Namespace ownership, enforced locally as well as at the registry: a
+    // publish carries what this application OWNS. `Catalog.toDocument()`
+    // already filters imported leaves out, so a document arriving here with
+    // foreign keys was hand-assembled, and shadowing another application's
+    // namespace is the one thing a publish must never be able to do.
+    const published = new Set(document.namespaces);
+    for (const leaf of document.leaves) {
+      const ns = namespaceOf(leaf.key);
+      if (ns !== null && !published.has(ns)) {
+        throw new ProviderWriteRejectedError(
+          `catalog document publishes ${JSON.stringify(leaf.key)}, which is outside its own namespaces ` +
+            `[${document.namespaces.join(", ")}] — an application never defines keys in a namespace it does not own`,
+          "validation",
+        );
+      }
+    }
     const current = await this.storage.getCatalog();
     const version = (current?.version ?? 0) + 1;
     await this.storage.putCatalog(version, document);
@@ -1466,6 +1499,53 @@ export class AlfizApplication<
 
   async getPublishedCatalog() {
     return this.storage.getCatalog();
+  }
+
+  /**
+   * Registers what this application CONSUMES. Separate from the catalog
+   * publish on purpose — see `AlfizProvider.publishImports`. Emits no
+   * invalidation: a manifest changes nothing any client evaluates, it only
+   * tells the provider what to warn about.
+   */
+  async publishImports(
+    manifest: ImportManifest,
+    provenance: Provenance,
+  ): Promise<{ version: number }> {
+    this.assertProvenance(provenance);
+    const put = this.storage.putImports;
+    const get = this.storage.getImports;
+    if (put === undefined || get === undefined) {
+      throw new ProviderWriteRejectedError(
+        "this storage driver does not store import manifests (capabilities().imports is false)",
+        "unsupported",
+      );
+    }
+    if (manifest.formatVersion !== 1) {
+      throw new ProviderWriteRejectedError(
+        `unknown import manifest format ${String(manifest.formatVersion)}`,
+        "validation",
+      );
+    }
+    for (const entry of manifest.imports) {
+      if (entry.namespace === manifest.namespace) {
+        throw new ProviderWriteRejectedError(
+          `manifest declares an import of ${JSON.stringify(entry.namespace)}, which is the publishing application's own namespace`,
+          "validation",
+        );
+      }
+    }
+    const current = await get.call(this.storage);
+    const version = (current?.version ?? 0) + 1;
+    await put.call(this.storage, version, manifest);
+    await this.audit(provenance, "imports.publish", manifest.namespace, {
+      version,
+      namespaces: manifest.imports.map((i) => i.namespace),
+    });
+    return { version };
+  }
+
+  async getPublishedImports() {
+    return this.storage.getImports?.call(this.storage) ?? null;
   }
 
   // -- organizational data --------------------------------------------------

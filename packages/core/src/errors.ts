@@ -104,6 +104,15 @@ export interface UnknownPermissionDetails {
   didYouMean?: readonly string[] | undefined;
   /** An extra context sentence (e.g. the undeclared-namespace hint). */
   hint?: string | undefined;
+  /**
+   * Whether the permission's namespace is one this catalog owns, imports, or
+   * has never heard of. The three are different mistakes with different
+   * fixes: a typo, a reach beyond what an import covers, and a missing
+   * import declaration. Supplied by `unknownPermissionContext`.
+   */
+  namespaceOrigin?: "owned" | "imported" | "foreign" | undefined;
+  /** What the import for that namespace covers, when there is one. */
+  importedPatterns?: readonly string[] | undefined;
 }
 
 /**
@@ -137,6 +146,12 @@ export function formatUnknownPermission(
         `Use canAny(${value}) for the visibility question (never as a gate).`
       );
     }
+    if (options.namespaceOrigin === "imported") {
+      return `${value} is not covered by this catalog's import of that namespace.${extras}`;
+    }
+    if (options.namespaceOrigin === "foreign") {
+      return `${value} is not a permission key in this catalog, and belongs to a namespace it neither owns nor imports.${extras}`;
+    }
     return `${value} is not a permission key in this catalog (typo, or an undeclared key).${extras}`;
   }
   if (suggestion !== undefined) {
@@ -144,6 +159,12 @@ export function formatUnknownPermission(
       `${value} is a group, not a pattern — groups are folders, never keys, so it matches nothing. ` +
       `Did you mean ${JSON.stringify(suggestion)}?`
     );
+  }
+  if (options.namespaceOrigin === "imported") {
+    return `${value} is not covered by this catalog's import of that namespace.${extras}`;
+  }
+  if (options.namespaceOrigin === "foreign") {
+    return `${value} is not in this catalog, and belongs to a namespace it neither owns nor imports.${extras}`;
   }
   return `${value} is not in this catalog (typo, or an undeclared key).${extras}`;
 }
@@ -158,6 +179,10 @@ export class UnknownPermissionError extends Error {
   readonly suggestion: string | undefined;
   /** Declared keys/patterns near the offending string, closest first. */
   readonly didYouMean: readonly string[];
+  /** Whether the namespace is owned, imported, or unknown to this catalog. */
+  readonly namespaceOrigin: "owned" | "imported" | "foreign";
+  /** What the import for that namespace covers, when there is one. */
+  readonly importedPatterns: readonly string[];
 
   constructor(options: UnknownPermissionDetails) {
     super(formatUnknownPermission(options));
@@ -165,6 +190,19 @@ export class UnknownPermissionError extends Error {
     this.expected = options.expected;
     this.suggestion = options.suggestion ?? undefined;
     this.didYouMean = options.didYouMean ?? [];
+    this.namespaceOrigin = options.namespaceOrigin ?? "owned";
+    this.importedPatterns = options.importedPatterns ?? [];
+  }
+
+  /**
+   * The permission belongs to a namespace this catalog does not own — a
+   * missing import declaration or a reach beyond one, rather than a typo in
+   * this codebase's own vocabulary. Still a programming error, and still
+   * mapped to 500, never 403: framework adapters use this to say which fix
+   * to suggest, not to change the status code.
+   */
+  get isForeignNamespace(): boolean {
+    return this.namespaceOrigin !== "owned";
   }
 }
 

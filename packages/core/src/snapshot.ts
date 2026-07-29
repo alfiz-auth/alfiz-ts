@@ -117,6 +117,13 @@ export interface SnapshotInit {
    * the sampling gate matters most here.
    */
   recorder?: MetricsRecorder | null | undefined;
+  /**
+   * The client's implicit-import decision, verbatim. One name per question,
+   * same behavior on every surface: a permission the async `can` admits must
+   * be one the synchronous `snap.can` admits, or the two surfaces disagree
+   * about what the catalog covers. Absent = strict (throw), the default.
+   */
+  admitExternal?: ((permission: string, expected: "key" | "pattern") => void) | undefined;
 }
 
 const GLOBAL_CLOSURE: readonly ScopeId[] = [GLOBAL_SCOPE];
@@ -145,6 +152,10 @@ export class AlfizSnapshot<
   private readonly chains: Map<ScopeId, readonly ScopeId[]>;
   private readonly resolveChain: (scope: ScopeId) => Promise<readonly ScopeId[]>;
   private readonly recorder: MetricsRecorder | null;
+  private readonly admitExternal: (
+    permission: string,
+    expected: "key" | "pattern",
+  ) => void;
   private held: Set<PermissionKey> | null = null;
 
   constructor(init: SnapshotInit) {
@@ -156,6 +167,15 @@ export class AlfizSnapshot<
     this.chains = init.chains;
     this.resolveChain = init.resolveChain;
     this.recorder = init.recorder ?? null;
+    this.admitExternal =
+      init.admitExternal ??
+      ((permission, expected) => {
+        throw new UnknownPermissionError({
+          permission,
+          expected,
+          ...unknownPermissionContext(init.catalog, permission, expected),
+        });
+      });
     this.at = init.ctx.now;
   }
 
@@ -251,21 +271,13 @@ export class AlfizSnapshot<
   private assertKeys(keys: readonly PermissionKey[]): void {
     for (const key of keys) {
       if (this.catalog.hasKey(key)) continue;
-      throw new UnknownPermissionError({
-        permission: key,
-        expected: "key",
-        ...unknownPermissionContext(this.catalog, key, "key"),
-      });
+      this.admitExternal(key, "key");
     }
   }
 
   private assertPattern(pattern: PermissionPattern): void {
     if (this.catalog.isKnownPattern(pattern)) return;
-    throw new UnknownPermissionError({
-      permission: pattern,
-      expected: "pattern",
-      ...unknownPermissionContext(this.catalog, pattern, "pattern"),
-    });
+    this.admitExternal(pattern, "pattern");
   }
 
   /**
@@ -397,7 +409,14 @@ export class AlfizSnapshot<
   private anyCheck(pattern: P, shape: "canAny" | "requireAny"): boolean {
     this.assertPattern(pattern);
     const allowed =
-      this.active && checkAny(this.ctx, pattern, this.catalog.keys, this.chains);
+      this.active &&
+      checkAny(
+        this.ctx,
+        pattern,
+        this.catalog.keys,
+        this.chains,
+        this.catalog.opaqueRegions(pattern),
+      );
     const sampleRate = this.sampled(shape);
     if (sampleRate !== null) {
       this.observe({

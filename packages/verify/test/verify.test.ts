@@ -54,15 +54,225 @@ describe("unknown-pattern", () => {
     expect(byRule(report.issues, "unknown-pattern")).toEqual([]);
   });
 
-  it("ignores strings outside the catalog's namespaces and non-pattern strings", () => {
+  it("ignores non-pattern strings and ordinary prose", () => {
+    // The false-positive guard. Once foreign namespaces stopped being
+    // dropped wholesale, a project's own gate wrapper taking a plain string
+    // argument — `gateAction("createInvoice")` — had to not read as a
+    // permission. A single segment is structurally never a key.
     const report = run({
       "app/page.ts": `
-        await other.can(user, "stripe.charges.create");
         await client.can(user, "docs.files.read", "docs.folder:9");
+        await gateAction("createInvoice");
         console.log("hello world", "a.b!c");
       `,
     });
-    expect(byRule(report.issues, "unknown-pattern")).toEqual([]);
+    expect(report.issues.filter((i) => i.line > 0)).toEqual([]);
+  });
+});
+
+describe("implicit-import", () => {
+  // A foreign-namespace literal used to be SILENTLY DROPPED here while
+  // throwing at runtime: CI green, production 500. These tests pin the
+  // asymmetry closed.
+  const foreign = `await client.can(user, "zoom.host");`;
+
+  it("errors when no import source is configured — it is a typo", () => {
+    const report = run({ "app/page.ts": foreign });
+    const found = byRule(report.issues, "implicit-import");
+    expect(found.length).toBe(1);
+    expect(found[0]!.severity).toBe("error");
+    expect(found[0]!.message).toContain("neither owns nor imports");
+    expect(found[0]!.message).toContain("throw at runtime");
+    expect(report.errorCount).toBeGreaterThan(0);
+  });
+
+  it("warns when one is — the mechanism is wired, the declaration is missing", () => {
+    const report = run({ "app/page.ts": foreign }, { importSource: "registry" });
+    const found = byRule(report.issues, "implicit-import");
+    expect(found[0]!.severity).toBe("warning");
+    expect(found[0]!.message).toContain("imports: { zoom:");
+  });
+
+  it("warns by default once the catalog declares any import", () => {
+    const importing = defineCatalog({
+      namespaces: ["docs"],
+      includeAlfizInternal: false,
+      permissions: { "docs.files.read": true },
+      imports: { billing: { permissions: { "billing.invoices.read": true } } },
+    });
+    const report = run({ "app/page.ts": foreign }, { catalog: importing });
+    expect(byRule(report.issues, "implicit-import")[0]!.severity).toBe("warning");
+  });
+
+  it("is suppressible by config, wholesale or per namespace", () => {
+    expect(
+      byRule(
+        run({ "app/page.ts": foreign }, { implicitImports: "off" }).issues,
+        "implicit-import",
+      ),
+    ).toEqual([]);
+    expect(
+      byRule(
+        run({ "app/page.ts": foreign }, { implicitImportAllow: ["zoom"] }).issues,
+        "implicit-import",
+      ),
+    ).toEqual([]);
+  });
+});
+
+describe("unknown-import", () => {
+  const importing = defineCatalog({
+    namespaces: ["docs"],
+    includeAlfizInternal: false,
+    permissions: { "docs.files.read": true },
+    imports: {
+      zoom: { permissions: { "zoom.host": true, "zoom.meetings.*": true } },
+    },
+  });
+
+  it("accepts what the import covers", () => {
+    const report = run(
+      {
+        "app/page.ts": `
+          await client.can(user, "zoom.host");
+          await client.can(user, "zoom.meetings.create_meeting");
+          await client.canAny(user, "zoom.meetings.*");
+        `,
+      },
+      { catalog: importing },
+    );
+    expect(byRule(report.issues, "unknown-import")).toEqual([]);
+    expect(byRule(report.issues, "implicit-import")).toEqual([]);
+  });
+
+  it("errors on a reach beyond it — a declared namespace is not a blank cheque", () => {
+    const report = run(
+      {
+        "app/page.ts": `
+          await client.can(user, "zoom.webinars.read");
+          await client.canAny(user, "zoom.*");
+        `,
+      },
+      { catalog: importing },
+    );
+    const found = byRule(report.issues, "unknown-import");
+    expect(found.length).toBe(2);
+    expect(found[0]!.message).toContain("zoom.webinars.read");
+    // `zoom.*` is broader than the import — a widening claim over a
+    // namespace this application does not own.
+    expect(found[1]!.message).toContain("zoom.*");
+  });
+});
+
+describe("per-line suppression", () => {
+  const foreign = `await client.can(user, "zoom.host");`;
+
+  it("suppresses the named rule on the next line", () => {
+    const report = run({
+      "app/page.ts": `
+        // alfiz-verify-ignore-next-line implicit-import legacy bridge, removed in Q3
+        ${foreign}
+      `,
+    });
+    expect(byRule(report.issues, "implicit-import")).toEqual([]);
+    expect(byRule(report.issues, "stale-suppression")).toEqual([]);
+  });
+
+  it("suppresses a trailing pragma on its own line", () => {
+    const report = run({
+      "app/page.ts": `await client.can(user, "zoom.host"); // alfiz-verify-ignore-line implicit-import legacy bridge`,
+    });
+    expect(byRule(report.issues, "implicit-import")).toEqual([]);
+  });
+
+  it("suppresses only the rule it names", () => {
+    // An unqualified per-line ignore is how a client-reachable-secret error
+    // gets silenced by someone reaching for the nearest way to quiet an
+    // unrelated warning. So the rule name is load-bearing, not decorative.
+    const report = run({
+      "app/page.ts": `
+        // alfiz-verify-ignore-next-line unknown-pattern wrong rule on purpose
+        ${foreign}
+      `,
+    });
+    expect(byRule(report.issues, "implicit-import").length).toBe(1);
+  });
+
+  it("warns on a pragma with no rule name, no reason, or nothing to suppress", () => {
+    const noRule = run({
+      "app/page.ts": `
+        // alfiz-verify-ignore-next-line
+        await client.can(user, "docs.files.read");
+      `,
+    });
+    expect(byRule(noRule.issues, "stale-suppression")[0]!.message).toMatch(
+      /name the rule it suppresses/,
+    );
+
+    const noReason = run({
+      "app/page.ts": `
+        // alfiz-verify-ignore-next-line implicit-import
+        ${foreign}
+      `,
+    });
+    expect(byRule(noReason.issues, "stale-suppression")[0]!.message).toMatch(
+      /without a reason/,
+    );
+
+    const stale = run({
+      "app/page.ts": `
+        // alfiz-verify-ignore-next-line implicit-import nothing to suppress here
+        await client.can(user, "docs.files.read");
+      `,
+    });
+    expect(byRule(stale.issues, "stale-suppression")[0]!.message).toMatch(
+      /suppresses nothing here/,
+    );
+  });
+});
+
+describe("unreferenced-leaf, with imports", () => {
+  it("says 'stale import?' rather than 'dead permission?'", () => {
+    const importing = defineCatalog({
+      namespaces: ["docs"],
+      includeAlfizInternal: false,
+      conventions: { depth: "any" },
+      permissions: { "docs.files.read": true },
+      imports: {
+        zoom: { permissions: { "zoom.host": true, "zoom.meetings.*": true } },
+      },
+    });
+    const report = run(
+      { "app/page.ts": `await client.can(user, "docs.files.read");` },
+      { catalog: importing },
+    );
+    const messages = byRule(report.issues, "unreferenced-leaf").map(
+      (i) => i.message,
+    );
+    expect(messages).toEqual([
+      '"zoom.host" is imported but referenced by no gate or nav item — stale import?',
+      '"zoom.meetings.*" is imported but referenced by no gate or nav item — stale import?',
+    ]);
+  });
+
+  it("counts an open region as reached when a call site names it", () => {
+    const importing = defineCatalog({
+      namespaces: ["docs"],
+      includeAlfizInternal: false,
+      permissions: { "docs.files.read": true },
+      imports: { zoom: { permissions: { "zoom.meetings.*": true } } },
+    });
+    const report = run(
+      {
+        "app/page.ts": `
+          await client.can(user, "docs.files.read");
+          await client.canAny(user, "zoom.meetings.*");
+        `,
+      },
+      { catalog: importing },
+    );
+    expect(byRule(report.issues, "unreferenced-leaf")).toEqual([]);
+    expect(report.referencedPatterns.has("zoom.meetings.*")).toBe(true);
   });
 });
 

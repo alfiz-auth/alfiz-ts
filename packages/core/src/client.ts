@@ -71,7 +71,7 @@ import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
 import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
-import { patternMatchesKey } from "./grammar.js";
+import { namespaceOf, patternMatchesKey } from "./grammar.js";
 import type {
   AlfizProvider,
   InvalidationEvent,
@@ -164,7 +164,61 @@ export interface AlfizClientOptions {
    * See metrics.ts.
    */
   metrics?: MetricsOptions | undefined;
+  /**
+   * What to do with a check for a permission in a namespace this catalog
+   * neither owns nor imports — an *implicit* import. Default `"error"`,
+   * which is the behavior that has always been there.
+   *
+   * - `"error"` — throw `UnknownPermissionError`, as before.
+   * - `"warn"` — evaluate it, and report it once per distinct permission
+   *   through {@link onExternalPermission} (default: `console.warn`).
+   * - `"allow"` — evaluate it silently.
+   *
+   * Two things this policy deliberately never relaxes, whatever it is set
+   * to. A permission under a namespace this catalog OWNS always throws: an
+   * owned catalog is enumerable, so an unknown key in it is unambiguously a
+   * typo. A permission under an ENUMERATED import (one with an attached
+   * document) always throws too, and names what the import covers — that
+   * exactness is the whole return on committing the document.
+   *
+   * And what it never does: **no I/O**. There is no provider lookup here,
+   * no lazy fetch, no boot-time registry call. Runtime checks never leave
+   * the application in any topology, and `snapshot.can()` is synchronous —
+   * which is the structural proof, not just the promise, that this decision
+   * has to be pure.
+   *
+   * The safety rule that makes the permissive modes defensible lives in
+   * `access.ts`: a permission admitted by this policy is conferred only by a
+   * NAMESPACE-ANCHORED grant. `zoom.*` and narrower confer it; a bare global
+   * `*` does not. Without that, a typo in a foreign namespace would pass for
+   * exactly the broadly-privileged users who review and test it — the
+   * failure `UnknownPermissionError` exists to prevent.
+   */
+  externalPermissions?: "error" | "warn" | "allow";
+  /**
+   * Called once per distinct permission admitted under `externalPermissions:
+   * "warn"`. Replaces the default `console.warn`; point it at your logger or
+   * your metrics.
+   */
+  onExternalPermission?: (info: ExternalPermissionInfo) => void;
   clock?: () => number;
+}
+
+/**
+ * Where a permission was named. The metered check shapes, plus the two
+ * introspection surfaces that verify against the catalog but are never
+ * counted as checks.
+ */
+export type PermissionSite = CheckShape | "explain" | "grantedScopes";
+
+/** A permission admitted by the implicit-import policy. */
+export interface ExternalPermissionInfo {
+  permission: string;
+  expected: "key" | "pattern";
+  /** The foreign namespace, or `null` for the bare `*`. */
+  namespace: string | null;
+  /** Which surface reached it. */
+  shape: PermissionSite;
 }
 
 interface SubjectCacheEntry {
@@ -188,6 +242,7 @@ export function toCheckContext(
   data: SubjectAccessData,
   now: number,
   grantApplies?: (key: PermissionKey, grantScope: ScopeId) => boolean,
+  isUndeclared?: (key: PermissionKey) => boolean,
 ): CheckContext {
   return {
     subjectClosure: new Set(data.closure),
@@ -199,6 +254,7 @@ export function toCheckContext(
     },
     now,
     grantApplies,
+    isUndeclared,
   };
 }
 
@@ -308,6 +364,11 @@ export class AlfizClient<
     key: PermissionKey,
     grantScope: ScopeId,
   ) => boolean;
+  private readonly isUndeclared: (key: PermissionKey) => boolean;
+  private readonly externalPermissions: "error" | "warn" | "allow";
+  private readonly onExternalPermission: (info: ExternalPermissionInfo) => void;
+  /** Reported-once set, so a render loop warns once rather than per row. */
+  private readonly reportedExternal = new Set<string>();
   /** `null` when metrics are off — the branch every check path tests first. */
   private readonly recorder: MetricsRecorder | null;
 
@@ -333,6 +394,16 @@ export class AlfizClient<
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
+    this.isUndeclared = (key) => !this.catalog.hasKey(key);
+    this.externalPermissions = options.externalPermissions ?? "error";
+    this.onExternalPermission =
+      options.onExternalPermission ??
+      ((info) =>
+        console.warn(
+          `alfiz: ${JSON.stringify(info.permission)} is in namespace ${JSON.stringify(info.namespace)}, ` +
+            `which this catalog neither owns nor imports — evaluated because \`externalPermissions\` is not "error". ` +
+            `Declare it: imports: { ${info.namespace}: { permissions: { ${JSON.stringify(info.permission)}: true } } }`,
+        ));
     this.recorder =
       options.metrics === undefined ? null : new MetricsRecorder(options.metrics);
 
@@ -794,7 +865,49 @@ export class AlfizClient<
   // -- checks ---------------------------------------------------------------
 
   private ctxOf(data: SubjectAccessData): CheckContext {
-    return toCheckContext(data, this.now(), this.grantApplies);
+    return toCheckContext(
+      data,
+      this.now(),
+      this.grantApplies,
+      this.isUndeclared,
+    );
+  }
+
+  /**
+   * The implicit-import decision, shared by the key and pattern assertions.
+   * Pure and synchronous — no provider call, no fetch, nothing that could
+   * put Alfiz Cloud on a request path. See `externalPermissions`.
+   *
+   * Throws unless the permission is genuinely outside this catalog's reach
+   * AND the policy admits it. "Genuinely outside" is narrow on purpose: an
+   * owned namespace is enumerable, and an enumerated import knows its own
+   * keys, so in both cases an unknown permission is a mistake this codebase
+   * can fix, and saying so is more useful than letting it through.
+   */
+  private admitExternal(
+    permission: string,
+    expected: "key" | "pattern",
+    shape: PermissionSite,
+  ): void {
+    const context = unknownPermissionContext(this.catalog, permission, expected);
+    const namespace = namespaceOf(permission);
+    const enumeratedImport =
+      namespace !== null && this.catalog.imports.get(namespace)?.enumerated;
+    const admissible =
+      this.externalPermissions !== "error" &&
+      context.namespaceOrigin === "foreign" &&
+      namespace !== null;
+    if (!admissible || enumeratedImport === true) {
+      throw new UnknownPermissionError({
+        permission,
+        expected,
+        ...context,
+      });
+    }
+    if (this.externalPermissions === "warn" && !this.reportedExternal.has(permission)) {
+      this.reportedExternal.add(permission);
+      this.onExternalPermission({ permission, expected, namespace, shape });
+    }
   }
 
   /**
@@ -804,24 +917,19 @@ export class AlfizClient<
    * undeclared key would pass for any holder of a covering wildcard. See
    * {@link UnknownPermissionError}.
    */
-  private assertKeys(keys: readonly PermissionKey[]): void {
+  private assertKeys(keys: readonly PermissionKey[], shape: PermissionSite): void {
     for (const key of keys) {
       if (this.catalog.hasKey(key)) continue;
-      throw new UnknownPermissionError({
-        permission: key,
-        expected: "key",
-        ...unknownPermissionContext(this.catalog, key, "key"),
-      });
+      this.admitExternal(key, "key", shape);
     }
   }
 
-  private assertPattern(pattern: PermissionPattern): void {
+  private assertPattern(
+    pattern: PermissionPattern,
+    shape: PermissionSite,
+  ): void {
     if (this.catalog.isKnownPattern(pattern)) return;
-    throw new UnknownPermissionError({
-      permission: pattern,
-      expected: "pattern",
-      ...unknownPermissionContext(this.catalog, pattern, "pattern"),
-    });
+    this.admitExternal(pattern, "pattern", shape);
   }
 
   /**
@@ -862,6 +970,17 @@ export class AlfizClient<
       implied: input.implied ?? false,
       fresh: input.fresh ?? false,
       snapshot: input.snapshot ?? false,
+      // Derived, not passed: every shape gets the dimension without every
+      // call site remembering to set it. Both tests are needed — the key
+      // shapes carry a key and the pattern shapes carry a pattern, and a
+      // legitimate `docs.*` is a known pattern but never a known key.
+      // `permission` is null only for `heldKeys`, which names none.
+      externalPermission:
+        input.permission !== null &&
+        !this.catalog.hasKey(input.permission) &&
+        !this.catalog.isKnownPattern(input.permission)
+          ? true
+          : undefined,
       sampleRate: input.sampleRate,
     };
     recorder.record(observation);
@@ -885,7 +1004,7 @@ export class AlfizClient<
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
-    this.assertKeys(keys);
+    this.assertKeys(keys, shape);
     // Sampled BEFORE the work, so an unsampled check never pays for
     // attribution — and so the decision is one comparison, not a branch per
     // matched row further down.
@@ -1039,6 +1158,10 @@ export class AlfizClient<
       // Bound to this snapshot's freshness, so `resolve` mid-request keeps
       // the same cache posture the snapshot was taken with.
       resolveChain: (scope) => this.objectClosure(scope, fresh),
+      // The same implicit-import decision the async surface makes. Pure and
+      // synchronous, which is what lets the sync surface share it at all.
+      admitExternal: (permission, expected) =>
+        this.admitExternal(permission, expected, "can"),
     });
   }
 
@@ -1061,7 +1184,7 @@ export class AlfizClient<
     shape: "canAny" | "requireAny",
     options?: CheckOptions,
   ): Promise<boolean> {
-    this.assertPattern(pattern);
+    this.assertPattern(pattern, shape);
     const sampleRate = this.sampled(shape, options);
     const observe = (decision: CheckDecision): void => {
       if (sampleRate === null) return;
@@ -1091,7 +1214,13 @@ export class AlfizClient<
     for (const s of scopes) {
       closures.set(s, await this.objectClosure(s, false));
     }
-    const allowed = checkAny(ctx, pattern, this.catalog.keys, closures);
+    const allowed = checkAny(
+      ctx,
+      pattern,
+      this.catalog.keys,
+      closures,
+      this.catalog.opaqueRegions(pattern),
+    );
     observe(allowed ? "allow" : "deny");
     return allowed;
   }
@@ -1107,7 +1236,7 @@ export class AlfizClient<
     options?: CheckOptions,
   ): Promise<void> {
     const keys = (Array.isArray(key) ? key : [key]) as readonly PermissionKey[];
-    this.assertKeys(keys);
+    this.assertKeys(keys, "require");
     const data = await this.subjectData(principal, false);
     if (!data.active) {
       const sampleRate = this.sampled("require", options);
@@ -1154,7 +1283,7 @@ export class AlfizClient<
     pattern: P,
     options?: CheckOptions,
   ): Promise<void> {
-    this.assertPattern(pattern);
+    this.assertPattern(pattern, "requireAny");
     if (!(await this.anyCheck(principal, pattern, "requireAny", options))) {
       throw new AccessDeniedError({
         reason: "forbidden",
@@ -1186,7 +1315,7 @@ export class AlfizClient<
       impliedBy: GrantRow[];
     }
   > {
-    this.assertKeys([key as PermissionKey]);
+    this.assertKeys([key as PermissionKey], "explain");
     const [data, closure] = await Promise.all([
       this.subjectData(principal, false),
       this.objectClosure(scope, false),
@@ -1238,7 +1367,7 @@ export class AlfizClient<
     principal: PrincipalRef,
     key: LooseKey<K>,
   ): Promise<{ granted: Set<ScopeId>; revoked: Set<ScopeId> }> {
-    this.assertKeys([key as PermissionKey]);
+    this.assertKeys([key as PermissionKey], "grantedScopes");
     const data = await this.subjectData(principal, false);
     if (!data.active) return { granted: new Set(), revoked: new Set() };
     const ctx = this.ctxOf(data);
@@ -1263,7 +1392,7 @@ export class AlfizClient<
     key: LooseKey<K>,
     options?: CheckOptions,
   ): Promise<boolean> {
-    this.assertKeys([key as PermissionKey]);
+    this.assertKeys([key as PermissionKey], "holds");
     const sampleRate = this.sampled("holds", options);
     const data = await this.subjectData(principal, false);
     const observe = (decision: CheckDecision, grants?: GrantRow[]): void => {

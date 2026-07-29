@@ -12,9 +12,9 @@
  */
 
 import type { PermissionKey, PermissionPattern } from "./grammar.js";
-import { patternMatchesKey } from "./grammar.js";
-import type { ScopeId } from "./scopes.js";
-import { GLOBAL_SCOPE } from "./scopes.js";
+import { patternMatchesKey, patternsIntersect } from "./grammar.js";
+import type { ScopeId, ScopeType } from "./scopes.js";
+import { GLOBAL_SCOPE, scopeTypeOf } from "./scopes.js";
 import type { SubjectId } from "./subjects.js";
 
 /** Who or what created a row. Every grant and revoke carries provenance. */
@@ -199,6 +199,46 @@ export interface CheckContext {
    * never made grantable there. Absent = every matched key applies.
    */
   grantApplies?: ((key: PermissionKey, grantScope: ScopeId) => boolean) | undefined;
+  /**
+   * Is `key` outside the declared vocabulary entirely — admitted by the
+   * Client's implicit-import policy rather than found in any catalog, owned
+   * or imported? The Client supplies `(key) => !catalog.hasKey(key)`.
+   *
+   * It exists for one fixed rule, applied wherever a grant confers a key:
+   *
+   *   **A bare global `*` never confers an undeclared permission.**
+   *
+   * `*` means "everything in the declared vocabulary", and a key admitted by
+   * policy is by construction outside it. Without this, admitting foreign
+   * keys would reopen exactly the hole `UnknownPermissionError` was written
+   * to close: a misspelled gate silently PASSES for anyone holding a
+   * covering wildcard, so it admits precisely the broadly-privileged users
+   * who review and test it, and blocks the users it was written for.
+   * Any narrower pattern names its namespace by construction — wildcards may
+   * only be a final segment — so `zoom.*`, `zoom.meetings.*`, and
+   * `zoom.host` all still confer normally.
+   *
+   * Positive rows only. Revokes are unaffected: negative always wins, and a
+   * `*` revoke must keep suppressing everything it matches.
+   */
+  isUndeclared?: ((key: PermissionKey) => boolean) | undefined;
+}
+
+/** The one pattern that does not name a namespace. */
+const GLOBAL_PATTERN = "*";
+
+/**
+ * Does a grant's pattern confer `key`? Matching, plus the namespace-anchor
+ * rule for permissions no catalog declares (see `CheckContext.isUndeclared`).
+ */
+function grantPatternConfers(
+  ctx: CheckContext,
+  pattern: PermissionPattern,
+  key: PermissionKey,
+): boolean {
+  if (!patternMatchesKey(pattern, key)) return false;
+  if (pattern !== GLOBAL_PATTERN) return true;
+  return ctx.isUndeclared === undefined || !ctx.isUndeclared(key);
 }
 
 /**
@@ -253,7 +293,7 @@ export function explainKey(
     if (isExpired(grant, ctx.now)) continue;
     if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
     for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
-      if (patternMatchesKey(pattern, key)) {
+      if (grantPatternConfers(ctx, pattern, key)) {
         matchedGrants.push(grant);
         break;
       }
@@ -278,21 +318,81 @@ export function explainKey(
  * makes revoke suppression exact for scoped grants; without it, suppression
  * is checked at the grant's own scope and `*` only, which can only ever
  * over-show — acceptable for a visibility affordance, and documented.
+ *
+ * `opaqueRegions` is the imported half, and it is not optional in spirit:
+ * an imported wildcard with no attached document enumerates NO concrete
+ * keys, so without it this function answers a confident `false` for access
+ * the subject genuinely holds — a whole nav section vanishing with no error
+ * to search for, which is exactly the failure `UnknownPermissionError`
+ * exists to prevent. Pass `catalog.opaqueRegions(pattern)` at every call
+ * site. Regions are matched by pattern INTERSECTION rather than by key,
+ * which makes revoke suppression conservative: a revoke overlapping any
+ * part of a region suppresses the whole region here. That is fail-closed —
+ * the right direction for a visibility affordance, and the one behavior
+ * difference between an enumerated import and an open one.
  */
 export function checkAny(
   ctx: CheckContext,
   pattern: PermissionPattern,
   catalogKeys: readonly PermissionKey[],
   grantScopeClosures?: ReadonlyMap<ScopeId, readonly ScopeId[]>,
+  opaqueRegions?: readonly {
+    pattern: PermissionPattern;
+    scopes: readonly ScopeType[];
+  }[],
 ): boolean {
   const keys = catalogKeys.filter((key) => patternMatchesKey(pattern, key));
-  if (keys.length === 0) return false;
+  const regions = (opaqueRegions ?? []).filter((r) =>
+    patternsIntersect(r.pattern, pattern),
+  );
+  if (keys.length === 0 && regions.length === 0) return false;
 
   const closureOfGrantScope = (scope: ScopeId): readonly ScopeId[] => {
     const provided = grantScopeClosures?.get(scope);
     if (provided) return provided;
     return scope === GLOBAL_SCOPE ? [GLOBAL_SCOPE] : [scope, GLOBAL_SCOPE];
   };
+
+  /** A region stands in for keys, so scope applicability is its own wiring. */
+  const regionAppliesAt = (
+    region: { scopes: readonly ScopeType[] },
+    grantScope: ScopeId,
+  ): boolean => {
+    if (grantScope === GLOBAL_SCOPE) return true;
+    const type = scopeTypeOf(grantScope);
+    return type !== null && region.scopes.includes(type);
+  };
+
+  for (const region of regions) {
+    for (const grant of ctx.rows.grants) {
+      if (!ctx.subjectClosure.has(grant.subject)) continue;
+      if (isExpired(grant, ctx.now)) continue;
+      if (!regionAppliesAt(region, grant.scope)) continue;
+      let matches = false;
+      for (const p of patternsOfGrant(grant, ctx.rows.roles)) {
+        if (patternsIntersect(p, region.pattern)) {
+          matches = true;
+          break;
+        }
+      }
+      if (!matches) continue;
+      const grantScopeClosure = new Set(closureOfGrantScope(grant.scope));
+      let suppressed = false;
+      if (ctx.userId !== null) {
+        for (const revoke of ctx.rows.revokes) {
+          if (
+            revoke.userId === ctx.userId &&
+            patternsIntersect(revoke.pattern, region.pattern) &&
+            grantScopeClosure.has(revoke.scope)
+          ) {
+            suppressed = true;
+            break;
+          }
+        }
+      }
+      if (!suppressed) return true;
+    }
+  }
 
   for (const key of keys) {
     for (const grant of ctx.rows.grants) {
@@ -301,7 +401,7 @@ export function checkAny(
       if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
       let matches = false;
       for (const p of patternsOfGrant(grant, ctx.rows.roles)) {
-        if (patternMatchesKey(p, key)) {
+        if (grantPatternConfers(ctx, p, key)) {
           matches = true;
           break;
         }
@@ -344,7 +444,7 @@ export function grantsMatchingKey(
     if (isExpired(grant, ctx.now)) continue;
     if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
     for (const pattern of patternsOfGrant(grant, ctx.rows.roles)) {
-      if (patternMatchesKey(pattern, key)) {
+      if (grantPatternConfers(ctx, pattern, key)) {
         rows.push(grant);
         break;
       }
@@ -386,7 +486,7 @@ export function keyHeldAnywhere(ctx: CheckContext, key: PermissionKey): boolean 
     if (ctx.grantApplies && !ctx.grantApplies(key, grant.scope)) continue;
     if (
       patternsOfGrant(grant, ctx.rows.roles).some((p) =>
-        patternMatchesKey(p, key),
+        grantPatternConfers(ctx, p, key),
       )
     ) {
       granted = true;

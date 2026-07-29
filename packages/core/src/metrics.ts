@@ -120,6 +120,14 @@ export interface CheckObservation {
   /** Evaluated on a request-scoped snapshot rather than an async client call. */
   snapshot: boolean;
   /**
+   * The permission was admitted by the implicit-import policy — it is
+   * declared in no catalog, owned or imported, and was evaluated only
+   * because `externalPermissions` is not `"error"`. Counting these is the
+   * point: an implicit import is a temporary state, and a number is how you
+   * find the call sites still relying on one.
+   */
+  externalPermission?: boolean | undefined;
+  /**
    * The probability that kept this observation (1 when unsampled). Multiply
    * counts by `1 / sampleRate` to estimate the true volume — the aggregator
    * and the OTel adapter both do, and both keep the raw count alongside.

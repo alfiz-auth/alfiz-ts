@@ -14,6 +14,7 @@ import type {
   AuditEvent,
   CatalogDocument,
   GrantRow,
+  ImportManifest,
   InvalidationEvent,
   MetricBucket,
   MetricBucketDelta,
@@ -118,6 +119,13 @@ export interface StorageDriver {
   // -- catalog --------------------------------------------------------------
   putCatalog(version: number, document: CatalogDocument): Promise<void>;
   getCatalog(): Promise<{ version: number; document: CatalogDocument } | null>;
+
+  // -- imports (OPTIONAL) ---------------------------------------------------
+  // What the application CONSUMES, stored separately from what it publishes.
+  // Optional so a driver written before manifests existed still satisfies the
+  // contract — `capabilities().imports` reports whether both are present.
+  putImports?(version: number, manifest: ImportManifest): Promise<void>;
+  getImports?(): Promise<{ version: number; manifest: ImportManifest } | null>;
 
   // -- audit ----------------------------------------------------------------
   appendAudit(event: AuditEvent): Promise<void>;

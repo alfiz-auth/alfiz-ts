@@ -17,8 +17,19 @@
  *     "gateNames": ["assertTeaches"],         // YOUR gate wrappers — ADDED to the defaults
  *     "visibilityNames": ["showIfAny"],       // your visibility wrappers — added to the defaults
  *     "serverFilePatterns": ["app/actions/"], // RegExp sources — added to the defaults
- *     "forbidClientIdentifiers": ["ALFIZ_SERVICE_KEYS"]
+ *     "forbidClientIdentifiers": ["ALFIZ_SERVICE_KEYS"],
+ *     "importSource": "registry",            // a registry/dashboard is wired up
+ *     "implicitImports": "warn",             // "error" | "warn" | "off"
+ *     "implicitImportAllow": ["zoom"]        // namespaces exempt entirely
  *   }
+ *
+ * A permission from a namespace the catalog neither owns nor imports is an
+ * IMPLICIT import. It errors by default — an application that has never
+ * declared an import has no plausible source for one, so it is a typo, and
+ * it would throw at runtime. Where a registry or hosted dashboard IS wired
+ * up (declared above, or implied by the catalog already declaring imports),
+ * it is a warning naming the `imports` declaration to add. Suppress one call
+ * site with `// alfiz-verify-ignore-next-line implicit-import <reason>`.
  *
  * The name lists are ADDITIVE here: the CLI is the batteries-included path,
  * and forgetting to restate `can` should not un-gate your whole codebase.
@@ -60,6 +71,18 @@ interface CliConfig {
   /** RegExp sources for extra server-file paths, added to the built-ins. */
   serverFilePatterns?: string[];
   forbidClientIdentifiers?: string[];
+  /**
+   * Foreign published catalogs, by namespace — the documents an import
+   * resolves against. Paths to `catalog.toDocument()` JSON, fetched from the
+   * registry in CI and committed exactly as `catalog` itself is.
+   */
+  imports?: Record<string, string>;
+  /** Declares that a registry / hosted dashboard is wired up. Never probed. */
+  importSource?: "registry" | "none";
+  /** Severity override for the `implicit-import` rule. */
+  implicitImports?: "error" | "warn" | "off";
+  /** Namespaces exempt from `implicit-import` entirely. */
+  implicitImportAllow?: string[];
 }
 
 const DEFAULT_EXCLUDES = ["node_modules", "dist", ".next", ".git"];
@@ -167,6 +190,13 @@ function main(argv: string[]): number {
     ],
     serverFilePatterns: [...DEFAULT_SERVER_FILE_PATTERNS, ...extraServerPatterns],
     forbidClientIdentifiers: config.forbidClientIdentifiers,
+    ...(config.importSource ? { importSource: config.importSource } : {}),
+    ...(config.implicitImports
+      ? { implicitImports: config.implicitImports }
+      : {}),
+    ...(config.implicitImportAllow
+      ? { implicitImportAllow: config.implicitImportAllow }
+      : {}),
   });
 
   for (const issue of report.issues) {
