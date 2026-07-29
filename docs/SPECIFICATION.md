@@ -14,7 +14,7 @@ Identity (users, sessions, organizations) is deliberately left to identity provi
 
 **No infrastructure opinions, all semantic opinions.** The Client is unopinionated about storage, transport, and deployment — any conforming provider serves it. It is *maximally* opinionated about semantics: union-only inheritance, negative-always-wins precedence, forward-inclusive wildcards, the naming floor. The semantic opinions are the product and are not pluggable.
 
-**The catalog is explicit and lives in code.** Permissions are declared in a single source-of-truth catalog module per application, not inferred from call sites and not configured in a dashboard. Call-site checks are verified *against* the catalog at build time, but the catalog carries structure that call sites cannot express: navigation wiring, the read-versus-action taxonomy, scope-type declarations, and requestability (§9.2). Under federation the catalog additionally becomes a published contract (§5.2).
+**The catalog is explicit and lives in code.** Permissions are declared in a single source-of-truth catalog module per application, not inferred from call sites and not configured in a dashboard. Call-site checks are verified *against* the catalog at build time, but the catalog carries structure that call sites cannot express: navigation wiring, the read-versus-action taxonomy, scope-type declarations, and requestability (§9.2). Under federation the catalog additionally becomes a published contract (§5.2). Permissions the application references but does not own are declared too, as imports (§4.1) — explicitly, in the same module, for the same reason.
 
 **Inheritance is union-only; negation is personal-only.** Groups, roles, and object hierarchies can only widen access. The single negative layer is the individual revoke, and it always wins. This invariant is load-bearing: it makes cycle condensation sound (§10.3), keeps precedence a single rule rather than a matrix, keeps effective access auditable — and makes org-root merges tractable (§2.6), since positive access data unions safely.
 
@@ -116,6 +116,8 @@ Every tab defines, at minimum, read permission(s) and one action permission per 
 
 Every consumer of permissions supports subtree wildcards: `*` matches everything; `<project>.*` matches a whole project; `<project>.<tab>.*` matches everything under a tab. Wildcards are **forward-inclusive**: a stored `mathaniyy.approvals.*` pattern grants permissions added under that group in the future, automatically. This is a deliberate semantic commitment with a known tradeoff — a role holding `admin.*` silently acquires every future admin capability — and the Client owns and documents it rather than making it configurable. Pickers and role editors store the `<group>.*` pattern when a whole group is selected, which is what makes forward-inclusion real rather than a snapshot. Forward-inclusion also does the heavy lifting under federation: a role holding a subtree pattern absorbs newly published permissions with no registry coordination (§5.3).
 
+A wildcard over an **imported** namespace has one extra property, forced by the same honesty: an import whose owner's document is not attached cannot be expanded into keys at all. Such a pattern is an *open region* (§4.1), and every affordance that would answer by expanding — visibility intersection, the permission tree, coverage linting — must consult regions directly rather than an empty key list, or it answers a confident "no" for access the subject genuinely holds. Region answers are approximations, and each is fail-closed: visibility over a region is suppressed by any overlapping revoke, not only a covering one.
+
 Broad-versus-narrow authority over a resource family — "may issue codes in every payment namespace" versus "only application-fee codes" — is not modeled with parallel blanket-and-variant permission keys. It is modeled with **scopes**: one permission (`issue_code`), granted at a broad scope or a narrow one (§7). The grammar keeps one key per action; the scope system carries the breadth.
 
 ## 4. The catalog
@@ -123,6 +125,66 @@ Broad-versus-narrow authority over a resource family — "may issue codes in eve
 The catalog module declares the application's permission tree, scope types (§7.1), navigation wiring, per-scope-type grantability, and requestability (§9.2). It is the single source of truth for the application: template-literal types are derived from it, static verification checks call sites against it, and the administration components render from it.
 
 Permissions are declared by their **full dotted key** — the same notation every check, grant, role pattern, and navigation entry uses — so the catalog reads in the language of the system it describes and a key at a call site greps to its declaration. Grouping is an organizing affordance layered on top, never a requirement: a small catalog is one flat map of keys, and a large one is composed from `group()` blocks, each a named unit carrying one group's metadata and scope defaults. Because keys are absolute, blocks compose by concatenation rather than by structural merge, which is what makes a per-feature catalog file — declared next to the code it gates — a supported layout rather than a workaround. The catalog is authored against the Client and verified by the Client; *publishing* it is a provider operation — the Application stores it locally, the Service versions and registers it (§5). The catalog is application-domain, not organizational-domain: each application owns its namespace's catalog at every topology, which is why catalogs publish rather than promote.
+
+### 4.1 Imported permissions
+
+A catalog declares two kinds of vocabulary, and the distinction is
+ownership, not shape. `namespaces` are the prefixes the application **owns** —
+what it may define and what it publishes. `imports` are prefixes it merely
+**references**: permissions from the hosted dashboard, or from a federated
+sibling. Both are structurally the same thing, a foreign published catalog
+document, and both are declared in code like everything else.
+
+Splitting the two is what makes the rest coherent. Before it, `namespaces`
+answered both "which keys may I declare" and "which keys may I check", so
+checking a permission another application owned meant claiming its
+namespace — precisely the shadowing §5.2 forbids.
+
+An import declares specific keys or subtree patterns, never the bare `*`,
+and its entries must live under the namespace it names. The scope types an
+import wires its permissions to are the **importing** application's, never
+the owner's: the owner publishes vocabulary, and only the importer can
+resolve its own resources' ancestry. The default is global-only.
+
+**Enumerated and open.** With the owner's document attached, an import
+materializes into ordinary leaves: wildcards expand, visibility answers
+exactly, a typo fails the build. Without one, a wildcard becomes an *open
+region* — declared, grantable, and checkable, but not expandable. Regions
+are the honest representation of "a subtree someone else owns and I cannot
+enumerate", and every affordance that would otherwise answer by expanding a
+pattern into keys must consult them instead (§3.3). Their approximations
+are fail-closed by construction: visibility over a region is suppressed by
+any overlapping revoke, and an open region contributes no concrete key to
+`heldKeys`.
+
+**Implicit imports.** A check for a permission in a namespace the catalog
+neither owns nor imports is an omission, not a topology. Static
+verification reports it — an error where no import source is configured,
+since an application that has never imported has no plausible source for a
+foreign key, and a warning where one is. At runtime it raises
+`UnknownPermissionError` unless the deployment relaxes
+`externalPermissions`, and even relaxed, two cases never soften: a
+permission under an owned namespace (enumerable, so unambiguously a typo)
+and one outside an enumerated import (which knows its own keys). Nothing in
+this path performs I/O — the decision is local and synchronous, as §2.7 and
+§12 require of everything on a check path.
+
+A permission admitted by that policy is declared in no catalog, so the bare
+global `*` does not confer it: `*` means everything in the declared
+vocabulary. Any narrower pattern names its namespace by construction and
+confers normally. Without this rule, admitting foreign keys would restore
+the failure §13.2 exists to prevent — a misspelled gate passing for exactly
+the broadly-privileged reviewers who would never notice.
+
+**What an application consumes publishes separately** from what it
+announces. A catalog document carries owned vocabulary only; the import
+manifest is its own artifact and its own provider operation. The two are
+different contracts — the first is vocabulary others may grant against, the
+second a dependency others can only warn about — and merging them would let
+an application appear to define keys in a namespace it does not own. The
+separation is also what extends drift (§5.3) to code: today the registry
+names roles and grants referencing unpublished keys, never the imports that
+still reference a tombstone.
 
 ## 5. Federation
 
@@ -142,7 +204,7 @@ Publishes are **versioned** monotonically per namespace, and out-of-order publis
 
 **Additions** require no coordination: forward-inclusive wildcards absorb new keys into existing subtree grants automatically, and new leaves otherwise simply appear in editors.
 
-**Removals are tombstones, never deletes.** A key an application stops publishing may still be referenced by central roles and grant rows; hard deletion would silently rewrite role meanings. Tombstoned keys stop matching checks but remain visible in editors as deprecated, and the registry produces a drift report ("role X references 3 permissions no longer published by any application").
+**Removals are tombstones, never deletes.** A key an application stops publishing may still be referenced by central roles, grant rows, and other applications' imports (§4.1); hard deletion would silently rewrite role meanings. Tombstoned keys stop matching checks but remain visible in editors as deprecated, and the registry produces a drift report ("role X references 3 permissions no longer published by any application"). Published import manifests extend that report to code, which roles and grants alone cannot reach: an application still importing a tombstoned key learns before its next deploy discovers it.
 
 **Skew is bounded and safe-by-direction.** During rolling deploys the registry briefly disagrees with some running instance's compiled catalog. Enforcement is always local to each instance's own catalog; combined with forward-inclusive grants, skew in the widening direction is safe and skew in the narrowing direction is merely stale — the same bounded-staleness posture as §12, and stated alongside it.
 
@@ -344,7 +406,7 @@ Every action or surface gates at four points, and is not done until all four hol
 
 ### 13.2 Static verification
 
-The four-point checklist is enforced by tooling, not discipline. The Client ships build-time checks: **typed keys** via template-literal types derived from the catalog, so every key and pattern at every call site is compile-time verified; **coverage linting**, warning on catalog leaves referenced by no gate and erroring on exported server actions containing no gate at all; **gate-shape linting**, erroring on `canAny` used in server actions or route handlers; and **catalog linting**, erroring on keys that deviate from the catalog's declared depth convention, on tabs below the "read + one-permission-per-action" floor, on scope-type violations, on requestable declarations without a resolvable policy, and on missing namespace declarations. The split is deliberate and load-bearing: what is structurally broken fails at boot, what is merely off-convention fails in CI — so a house style is a setting the linter enforces rather than a law the constructor imposes. These checks are what makes the shipped convention document trustworthy for agent use: agents are exactly the users who will skip step three of four, and verification catches what convention alone would not.
+The four-point checklist is enforced by tooling, not discipline. The Client ships build-time checks: **typed keys** via template-literal types derived from the catalog, so every key and pattern at every call site is compile-time verified; **coverage linting**, warning on catalog leaves referenced by no gate and erroring on exported server actions containing no gate at all; **gate-shape linting**, erroring on `canAny` used in server actions or route handlers; and **catalog linting**, erroring on keys that deviate from the catalog's declared depth convention, on tabs below the "read + one-permission-per-action" floor, on scope-type violations, on requestable declarations without a resolvable policy, and on missing namespace declarations — over OWNED entries only, since another application's keys answer to its conventions, not this one's, and a finding this codebase cannot act on is the wrong kind of finding. Verification also grades the two ways a call site can reach outside the catalog: a reach beyond what an import covers, and an *implicit* import — a permission in a namespace neither owned nor imported, an error where no import source is configured and a warning where one is (§4.1). Both severities are decided from declared configuration; verification is offline and deterministic by construction, and never reaches the network to grade a codebase. The split is deliberate and load-bearing: what is structurally broken fails at boot, what is merely off-convention fails in CI — so a house style is a setting the linter enforces rather than a law the constructor imposes. These checks are what makes the shipped convention document trustworthy for agent use: agents are exactly the users who will skip step three of four, and verification catches what convention alone would not.
 
 ### 13.3 View-as
 

@@ -74,6 +74,60 @@ fail the build.
 - Requestability is catalog data (scope types) or role data (`requestable`).
   Nothing is requestable by default.
 
+## Imported permissions
+
+Permissions this application REFERENCES but does not own — from a hosted
+dashboard, or from a federated sibling application — go in `imports`, never
+in `permissions`. `namespaces` means "namespaces I own"; importing one you
+own is an error.
+
+```ts
+import zoomDoc from "./zoom.catalog.json" with { type: "json" };
+
+defineCatalog({
+  namespaces: ["docs"],
+  permissions: { "docs.files.read": { kind: "read" } },
+  imports: {
+    zoom: {
+      from: "registry:zoom@^3",
+      document: zoomDoc,              // ← attach it; see below
+      scopes: ["docs.folder"],        // YOUR scope types, never zoom's
+      permissions: { "zoom.host": true, "zoom.meetings.*": true },
+    },
+  },
+});
+```
+
+- **Attach the `document`.** Fetch the namespace owner's published catalog in
+  CI and commit it, exactly as you already commit `alfiz-catalog.json`. With
+  it, an import behaves like owned vocabulary: wildcards expand, `canAny`
+  answers exactly, and a typo is a build error. Without it, wildcards become
+  opaque *regions* — still grantable and checkable, but approximated
+  everywhere an answer needs expanding a pattern into keys, and an
+  unenumerated key under one is admitted sight unseen.
+- **`scopes` names scope types THIS catalog declares.** The owning
+  application publishes vocabulary; only you know which of your resources it
+  applies to, and only you can resolve their ancestry. A foreign scope type
+  is a build error. The default is `[]` — grantable globally only.
+- **Import the narrowest thing that works.** A pattern broader than what you
+  imported is rejected: importing `zoom.meetings.*` does not make `zoom.*`
+  storable, because that is a widening claim over a namespace you do not own.
+- **Close the key union with codegen.** `alfiz-verify codegen --catalog
+  zoom.catalog.json --prefix Zoom`, then
+  `importedKeys<ZoomKey>({ … })` — a wildcard import otherwise widens
+  `KeyOf` by one template member, since a subtree you cannot enumerate has
+  no closed key set.
+- **What you publish never includes imports.** `toDocument()` carries owned
+  vocabulary only; what you consume publishes separately via
+  `toImportManifest()` and `app.publishImports(...)`. Point
+  `alfiz-verify.config.json` at both.
+
+A check for a permission in a namespace you neither own nor import is an
+*implicit* import: an `alfiz-verify` error by default, a warning where a
+registry or dashboard is configured, and at runtime an
+`UnknownPermissionError` unless `externalPermissions` is relaxed. Declaring
+the import is the fix, and it is one line.
+
 ## The four-point wiring checklist
 
 An action or surface is NOT done until all four hold:

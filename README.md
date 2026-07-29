@@ -105,6 +105,49 @@ Typed keys and `alfiz-verify` cover literal call sites; this covers the
 runtime-string paths they cannot see — and closes the hole where a
 misspelled gate key would pass for anyone holding a covering wildcard.
 
+### Permissions you reference but don't own
+
+Every application announces its own catalog. Some also *interface* with
+another's — the hosted dashboard, or a federated sibling. `namespaces` is
+what you own; `imports` is what you reference:
+
+```ts
+import zoomDoc from "./zoom.catalog.json" with { type: "json" };
+
+export const catalog = defineCatalog({
+  namespaces: ["docs"],
+  permissions: { "docs.files.read": { scopes: ["docs.folder"] } },
+  imports: {
+    zoom: {
+      from: "registry:zoom@^3",
+      document: zoomDoc,           // fetched in CI, committed
+      scopes: ["docs.folder"],     // YOUR scope types — zoom's are unresolvable here
+      permissions: { "zoom.host": true, "zoom.meetings.*": true },
+    },
+  },
+});
+
+await app.createRole({ name: "Teacher", patterns: ["docs.files.*", "zoom.host"] });
+```
+
+From there the catalog works normally: typed keys, verified call sites,
+grants, role bundles, pickers. Attaching the owner's `document` is the
+recommended shape and the difference is concrete — with it, wildcards
+expand, `canAny` answers exactly, and `zoom.hostt` fails the build; without
+it a wildcard is an *opaque region*, still grantable and checkable but
+approximated wherever an answer needs expanding a pattern into keys. What
+you publish never includes imports (that would be defining keys in someone
+else's namespace); what you *consume* publishes separately, so a provider
+can tell you that you still import a tombstoned key.
+
+Checking a permission you neither own nor import is an **implicit** import:
+an `alfiz-verify` error by default, a warning where an import source is
+configured, and either is suppressible. At runtime it raises
+`UnknownPermissionError` unless you relax
+`createAlfizClient({ externalPermissions: "warn" })` — which never softens a
+typo in your own namespace, or one outside an import that knows its keys,
+and never performs I/O to decide.
+
 Granting is one row, however the access came to be — an admin, a role, a
 group, an approved request, `everyone`:
 
@@ -139,6 +182,11 @@ Alfiz is unopinionated about storage, transport, and deployment — and
   a direct grant on a deeper object. Not configurable.
 - **Forward-inclusive wildcards.** A stored `docs.*` grants keys added under
   `docs` in the future. Deliberate, documented, owned.
+- **The global `*` confers only declared vocabulary.** A permission admitted
+  by `externalPermissions` — declared in no catalog, owned or imported —
+  needs a grant that names its namespace. `zoom.*` confers it; a bare `*`
+  does not. Otherwise a typo in a foreign namespace would pass for exactly
+  the broadly-privileged users who review and test the gate.
 - **Everything reduces to the grant row** `(subject, role-or-pattern, scope,
   expiry?)` with provenance. Requests, public access, machine scopes, and
   time-bound elevation are all this row.

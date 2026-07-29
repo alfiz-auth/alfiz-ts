@@ -1,5 +1,123 @@
 # Changelog
 
+## 0.6.0 — imported permissions
+
+Every application announces its own catalog. Some also *interface* with
+another's — the hosted dashboard, or a federated sibling — and until now the
+library handled that case inconsistently in the worst possible direction:
+`alfiz-verify` silently dropped any literal outside your namespaces, while
+`can()` threw for the same string. CI green, production 500. The
+cross-namespace role composition the registry exists to enable could not be
+expressed in a catalog at all.
+
+The cause was one field doing two jobs. `namespaces` answered both "which
+keys may I declare" and "which keys may I check", so referencing another
+application's permission meant claiming its namespace. Those are now split:
+
+```ts
+defineCatalog({
+  namespaces: ["docs"],                       // what you OWN
+  permissions: { "docs.files.read": true },
+  imports: {                                  // what you REFERENCE
+    zoom: {
+      from: "registry:zoom@^3",
+      document: zoomDoc,                      // fetched in CI, committed
+      scopes: ["docs.folder"],                // YOUR scope types, never zoom's
+      permissions: { "zoom.host": true, "zoom.meetings.*": true },
+    },
+  },
+});
+```
+
+From there the catalog machinery works normally. Attaching the owner's
+`document` is the recommended shape and the difference is concrete: with it
+wildcards expand, `canAny` answers exactly, and `zoom.hostt` fails the
+build. Without it a wildcard is an **opaque region** — declared, grantable,
+and checkable, but approximated wherever an answer would need expanding a
+pattern into keys, and those approximations are fail-closed.
+
+Scope wiring is deliberately the importer's: the owner publishes
+vocabulary, and only you can resolve your own resources' ancestry. A foreign
+scope type is a build error. So is a pattern broader than what you imported
+— importing `zoom.meetings.*` does not make `zoom.*` storable, because that
+is a widening claim over a namespace you do not own.
+
+Checking a permission you neither own nor import is an **implicit** import.
+`alfiz-verify` reports it: an error where no import source is configured
+(an application that has never imported has no plausible source for a
+foreign key, so it is a typo), a warning where one is, naming the
+declaration to paste. At runtime it still throws unless you opt in:
+
+```ts
+createAlfizClient({ catalog, provider, externalPermissions: "warn" });
+```
+
+Two cases never soften, whatever the setting: a permission under a
+namespace you own (enumerable, so unambiguously a typo) and one outside an
+import that knows its own keys. And the policy performs no I/O — no
+provider lookup, no lazy fetch, no boot-time registry call. Runtime checks
+never leave your application, and `snapshot.can()` being synchronous is the
+structural proof, not just the promise.
+
+One new semantic, in the fixed-not-pluggable list: **a bare global `*` does
+not confer a permission no catalog declares.** `*` means everything in the
+declared vocabulary; any narrower pattern names its namespace by
+construction and confers normally. Without this, admitting foreign keys
+would restore the exact failure `UnknownPermissionError` exists to
+prevent — a misspelled gate passing for the broadly-privileged reviewers
+who would never notice, and denying everyone it was written for.
+
+What you publish is unchanged: `toDocument()` carries owned vocabulary
+only, because publishing imported leaves would define keys in a namespace
+you do not own. What you *consume* publishes separately, as its own
+artifact and its own provider operation:
+
+```ts
+await app.publishImports(catalog.toImportManifest(), provenance);
+```
+
+That is what extends drift the one direction it could never reach. The
+registry names roles and grants referencing tombstoned keys; it has never
+been able to name the code that still imports one.
+
+### Also
+
+- `alfiz-verify` gains per-line suppression:
+  `// alfiz-verify-ignore-next-line <rule> <reason>` and its trailing
+  `-line` form, for the case the file pragma is far too blunt for. The rule
+  name is required, not optional — an unqualified per-line ignore is how a
+  `client-reachable-secret` error gets silenced by somebody reaching for the
+  nearest way to quiet an unrelated warning. A pragma with no reason, no
+  rule, or nothing left to suppress is itself a warning.
+- `catalogFromDocument(document, { imports, documents })` rebuilds a catalog
+  that knows its imports. A published document carries owned vocabulary by
+  design, so tooling reading one alone would have called every imported key
+  foreign.
+- `alfiz-verify.config.json` gains `importManifest`, `imports`,
+  `importSource`, `implicitImports`, and `implicitImportAllow`.
+- The permission tree gains a `region` node kind. Regions have no leaves
+  under them, and a node with nothing to satisfy can never read as fully
+  selected — so an imported subtree would otherwise have been permanently
+  untickable in every role editor built on the kit.
+- `lintCatalog` skips imported entries. Another application's keys answer to
+  its depth convention and its naming floor, not yours, and a finding your
+  codebase cannot act on is the wrong kind of finding.
+- Optional provider surface: `publishImports` / `getPublishedImports`,
+  gated by `capabilities().imports`, with an optional `AlfizImports` Prisma
+  model and two new relay ops. A driver without them still satisfies the
+  contract.
+
+### Breaking
+
+`alfiz-verify` previously **skipped** foreign-namespace literals in silence,
+so a project already referencing them will see new findings. This is the
+correct direction — those call sites throw at runtime today — but it will
+move your error count. Declare the import, or set
+`"implicitImports": "off"`.
+
+`ProviderCapabilities` gains a required `imports` field; a hand-written
+provider implementation needs one line.
+
 ## 0.5.1 — usage over time
 
 `getPermissionUsage` and `getScopeTypeUsage` now return a `buckets` array

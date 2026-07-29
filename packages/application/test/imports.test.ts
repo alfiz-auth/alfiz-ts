@@ -159,7 +159,7 @@ describe("publishing", () => {
           namespace: "docs",
           from: undefined,
           enumerated: false,
-          patterns: ["docs.other.read"],
+          entries: [{ pattern: "docs.other.read", scopes: [] }],
           keys: [],
           regions: [],
         },

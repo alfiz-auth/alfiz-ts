@@ -695,12 +695,17 @@ export interface ImportManifestEntry {
   /** A document was attached, so this namespace is fully enumerable. */
   enumerated: boolean;
   /**
-   * The entries exactly as declared — concrete keys and subtree patterns.
-   * This, not `keys`, is the contract: it is what a drift report compares
-   * against the namespace owner's published document, and what decides
-   * whether a pattern is grantable (see `isKnownPattern`).
+   * The entries exactly as declared — concrete keys and subtree patterns,
+   * each with the local scope wiring it was given. This, not `keys`, is the
+   * contract: it is what a drift report compares against the namespace
+   * owner's published document, what decides whether a pattern is grantable
+   * (see `isKnownPattern`), and what makes the manifest a complete
+   * reconstruction source for `catalogFromDocument`.
    */
-  patterns: readonly PermissionPattern[];
+  entries: readonly {
+    pattern: PermissionPattern;
+    scopes: readonly ScopeType[];
+  }[];
   /** Concrete keys this catalog can name — declared outright, or materialized. */
   keys: readonly PermissionKey[];
   /** Declared wildcards that could not be enumerated (empty when `enumerated`). */
@@ -991,8 +996,8 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     const declared = this.imports.get(namespace);
     if (declared === undefined) return false;
     const selected = pattern.endsWith(".*") ? pattern.slice(0, -2) : pattern;
-    return declared.patterns.some(
-      (entry) =>
+    return declared.entries.some(
+      ({ pattern: entry }) =>
         entry === pattern ||
         (entry.endsWith(".*") && patternMatchesKey(entry, selected)),
     );
@@ -1118,7 +1123,10 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
       namespace: this.namespace,
       imports: [...this.imports.values()].map((entry) => ({
         ...entry,
-        patterns: [...entry.patterns],
+        entries: entry.entries.map((e) => ({
+          pattern: e.pattern,
+          scopes: [...e.scopes],
+        })),
         keys: [...entry.keys],
         regions: [...entry.regions],
       })),
@@ -1369,7 +1377,10 @@ export function defineCatalog<const C extends CatalogInput>(
       continue;
     }
 
-    const patterns: PermissionPattern[] = [];
+    const entries: Array<{
+      pattern: PermissionPattern;
+      scopes: readonly ScopeType[];
+    }> = [];
     const concreteKeys: PermissionKey[] = [];
     const regionPatterns: PermissionPattern[] = [];
 
@@ -1423,7 +1434,10 @@ export function defineCatalog<const C extends CatalogInput>(
         );
         continue;
       }
-      patterns.push(raw);
+      const entryScopes = entry.scopes
+        ? wiredScopes(raw, entry.scopes)
+        : defaultScopes;
+      entries.push({ pattern: raw, scopes: entryScopes });
 
       if (document !== undefined) {
         // Enumerated: materialize every published leaf the entry selects.
@@ -1449,7 +1463,7 @@ export function defineCatalog<const C extends CatalogInput>(
           from: spec.from,
           label: entry.label,
           description: entry.description,
-          scopes: entry.scopes ? wiredScopes(raw, entry.scopes) : defaultScopes,
+          scopes: entryScopes,
           strict: spec.strict === true,
         });
       } else {
@@ -1481,7 +1495,7 @@ export function defineCatalog<const C extends CatalogInput>(
       namespace: ns,
       from: spec.from,
       enumerated: document !== undefined,
-      patterns,
+      entries,
       keys: concreteKeys,
       regions: regionPatterns,
     });
@@ -1789,7 +1803,7 @@ export function unknownPermissionContext(
       : ns !== null && catalog.namespaces.includes(ns)
         ? "owned"
         : "foreign";
-  const importedPatterns = importEntry?.patterns ?? [];
+  const importedPatterns = importEntry?.entries.map((e) => e.pattern) ?? [];
 
   const suggestion = suggestPattern(catalog, value);
   // A group path has ONE right answer; near-miss noise would bury it.
@@ -1856,11 +1870,32 @@ export interface TypedCatalog<
  * another team's published catalog get the same typed `can` as the team
  * that owns the source module.
  */
+export interface CatalogFromDocumentOptions {
+  /**
+   * What the application CONSUMES, as published by `toImportManifest()`.
+   * A `CatalogDocument` carries owned vocabulary only — that is the point of
+   * it — so a catalog rebuilt from one alone would treat every imported key
+   * as foreign. `alfiz-verify` is the case this exists for: it grades a
+   * codebase from documents, and without the manifest it would report every
+   * legitimate imported key as an implicit import.
+   */
+  imports?: ImportManifest | undefined;
+  /**
+   * The namespace owners' published documents, keyed by namespace. Optional
+   * enrichment: the manifest already names every key and pattern, so this
+   * only recovers display copy and the read/action taxonomy.
+   */
+  documents?: Record<string, CatalogDocument> | undefined;
+}
+
 export function catalogFromDocument<
   K extends string = string,
   P extends string = string,
   S extends string = string,
->(document: CatalogDocument): TypedCatalog<K, P, S> {
+>(
+  document: CatalogDocument,
+  options: CatalogFromDocumentOptions = {},
+): TypedCatalog<K, P, S> {
   if (document.formatVersion !== 1) {
     throw new CatalogError([
       {
@@ -1873,18 +1908,89 @@ export function catalogFromDocument<
   // A document written before imports existed carries no `origin`; a
   // document is by definition what its publisher OWNS, so absent reads as
   // owned. Normalized here rather than at every read site.
+  const leaves = new Map<PermissionKey, LeafMeta>(
+    document.leaves.map((l) => [l.key, { ...l, origin: l.origin ?? "owned" }]),
+  );
+  const groups = new Map<string, GroupMeta>(
+    document.groups.map((g) => [g.path, { ...g, origin: g.origin ?? "owned" }]),
+  );
+  const imports = new Map<string, ImportManifestEntry>();
+  const openRegions = new Map<PermissionPattern, ImportedRegion>();
+  const namespaces = [...document.namespaces];
+
+  for (const entry of options.imports?.imports ?? []) {
+    imports.set(entry.namespace, entry);
+    namespaces.push(entry.namespace);
+    const foreign = options.documents?.[entry.namespace];
+    const groupPaths = new Set<string>();
+
+    for (const key of entry.keys) {
+      const segments = key.split(".");
+      const name = segments.at(-1)!;
+      const published = foreign?.leaves.find((l) => l.key === key);
+      const wiring = entry.entries.find((e) => patternMatchesKey(e.pattern, key));
+      leaves.set(key, {
+        key,
+        groupPath: segments.slice(0, -1).join("."),
+        name,
+        label: published?.label,
+        description: published?.description,
+        kind: published?.kind ?? inferKind(name),
+        destructive: published?.destructive ?? inferDestructive(name),
+        scopes: wiring?.scopes ?? [],
+        impliedOnAncestors: false,
+        origin: "imported",
+        importedFrom: entry.from,
+      });
+      for (const prefix of prefixesOf(key)) groupPaths.add(prefix);
+    }
+
+    for (const region of entry.regions) {
+      const at = region.slice(0, -2);
+      const wiring = entry.entries.find((e) => e.pattern === region);
+      openRegions.set(region, {
+        pattern: region,
+        namespace: entry.namespace,
+        from: entry.from,
+        label: foreign?.groups.find((g) => g.path === at)?.label,
+        description: undefined,
+        scopes: wiring?.scopes ?? [],
+        // A reconstructed catalog cannot know the original `strict` flag —
+        // it was never on the wire. Permissive matches the default.
+        strict: false,
+      });
+      groupPaths.add(at);
+      for (const prefix of prefixesOf(at)) groupPaths.add(prefix);
+    }
+
+    for (const path of groupPaths) {
+      const published = foreign?.groups.find((g) => g.path === path);
+      groups.set(path, {
+        path,
+        label: published?.label,
+        description: published?.description,
+        groups: [...groupPaths].filter(
+          (p) => p.startsWith(`${path}.`) && !p.slice(path.length + 1).includes("."),
+        ),
+        permissions: entry.keys.filter(
+          (k) => k.startsWith(`${path}.`) && !k.slice(path.length + 1).includes("."),
+        ),
+        origin: "imported",
+        importedFrom: entry.from,
+      });
+    }
+  }
+
   const built: AnyCatalog = new Catalog({
     namespace: document.namespace,
-    namespaces: [...document.namespaces],
-    leaves: new Map(
-      document.leaves.map((l) => [l.key, { ...l, origin: l.origin ?? "owned" }]),
-    ),
-    groups: new Map(
-      document.groups.map((g) => [g.path, { ...g, origin: g.origin ?? "owned" }]),
-    ),
+    namespaces,
+    leaves,
+    groups,
     scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
     navigation: document.navigation,
     conventions: document.conventions ?? { depth: DEFAULT_KEY_DEPTH },
+    imports,
+    openRegions,
   });
   return built as TypedCatalog<K, P, S>;
 }

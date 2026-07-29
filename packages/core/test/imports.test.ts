@@ -53,10 +53,9 @@ describe("declaring an import", () => {
     const catalog = withImport({
       zoom: { from: "registry:zoom@^3", permissions: { "zoom.host": true, "zoom.meetings.*": true } },
     });
-    expect(catalog.imports.get("zoom")?.patterns).toEqual([
-      "zoom.host",
-      "zoom.meetings.*",
-    ]);
+    expect(
+      catalog.imports.get("zoom")?.entries.map((e) => e.pattern),
+    ).toEqual(["zoom.host", "zoom.meetings.*"]);
     expect(catalog.hasKey("zoom.host")).toBe(true);
     expect(catalog.keyOrigin("zoom.host")).toBe("imported");
     expect(catalog.keyOrigin("docs.files.read")).toBe("owned");
@@ -293,7 +292,7 @@ describe("publishing", () => {
           namespace: "zoom",
           from: "registry:zoom@^3",
           enumerated: true,
-          patterns: ["zoom.host"],
+          entries: [{ pattern: "zoom.host", scopes: [] }],
           keys: ["zoom.host"],
           regions: [],
         },

@@ -18,6 +18,8 @@
  *     "visibilityNames": ["showIfAny"],       // your visibility wrappers — added to the defaults
  *     "serverFilePatterns": ["app/actions/"], // RegExp sources — added to the defaults
  *     "forbidClientIdentifiers": ["ALFIZ_SERVICE_KEYS"],
+ *     "importManifest": "alfiz-imports.json",// catalog.toImportManifest() output
+ *     "imports": { "zoom": "zoom.catalog.json" }, // foreign published documents
  *     "importSource": "registry",            // a registry/dashboard is wired up
  *     "implicitImports": "warn",             // "error" | "warn" | "off"
  *     "implicitImportAllow": ["zoom"]        // namespaces exempt entirely
@@ -77,6 +79,12 @@ interface CliConfig {
    * registry in CI and committed exactly as `catalog` itself is.
    */
   imports?: Record<string, string>;
+  /**
+   * The import manifest written by `catalog.toImportManifest()`. REQUIRED to
+   * verify a project that imports: a catalog document carries owned
+   * vocabulary only, so without this every imported key reads as foreign.
+   */
+  importManifest?: string;
   /** Declares that a registry / hosted dashboard is wired up. Never probed. */
   importSource?: "registry" | "none";
   /** Severity override for the `implicit-import` rule. */
@@ -164,7 +172,23 @@ function main(argv: string[]): number {
     return 2;
   }
   const document = JSON.parse(readFileSync(resolve(config.catalog), "utf8"));
-  const catalog = catalogFromDocument(document);
+  let manifest;
+  const documents: Record<string, unknown> = {};
+  try {
+    if (config.importManifest !== undefined) {
+      manifest = JSON.parse(readFileSync(resolve(config.importManifest), "utf8"));
+    }
+    for (const [ns, path] of Object.entries(config.imports ?? {})) {
+      documents[ns] = JSON.parse(readFileSync(resolve(path), "utf8"));
+    }
+  } catch (err) {
+    console.error(`alfiz-verify: cannot read an imported catalog: ${String(err)}`);
+    return 2;
+  }
+  const catalog = catalogFromDocument(document, {
+    imports: manifest,
+    documents: documents as never,
+  });
   const files = collectFiles(config.include ?? ["src"], [
     ...DEFAULT_EXCLUDES,
     ...(config.exclude ?? []),
