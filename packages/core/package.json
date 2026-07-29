@@ -1,6 +1,6 @@
 {
   "name": "@alfiz/core",
-  "version": "0.6.0",
+  "version": "0.5.2",
   "description": "The Alfiz Client: permission grammar, catalog, closure evaluation, check shapes, caching, and the provider contract. Pure functions over provider-supplied data \u2014 no storage, no I/O.",
   "license": "UNLICENSED",
   "type": "module",

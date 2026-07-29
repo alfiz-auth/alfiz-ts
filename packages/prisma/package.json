@@ -1,6 +1,6 @@
 {
   "name": "@alfiz/prisma",
-  "version": "0.6.0",
+  "version": "0.5.2",
   "description": "The Prisma storage driver for the Alfiz Application: implements the storage seam over any Prisma client generated from the bundled schema fragment, with @prisma/client kept out of the dependency graph via a structural delegate interface.",
   "license": "UNLICENSED",
   "type": "module",
@@ -22,7 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@alfiz/core": "^0.6.0",
-    "@alfiz/application": "^0.6.0"
+    "@alfiz/core": "^0.5.2",
+    "@alfiz/application": "^0.5.2"
   }
 }

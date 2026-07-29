@@ -1,6 +1,12 @@
 # Changelog
 
-## 0.6.0 — imported permissions
+## 0.5.2 — imported permissions
+
+> **A patch number carrying two breaking changes.** Read the Breaking
+> section at the end of this entry before upgrading — `alfiz-verify` will
+> report call sites it previously passed in silence, and a hand-written
+> provider needs one new field. The version number is deliberately small;
+> the changes under it are not.
 
 Every application announces its own catalog. Some also *interface* with
 another's — the hosted dashboard, or a federated sibling — and until now the
