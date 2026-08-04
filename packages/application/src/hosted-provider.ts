@@ -3,6 +3,9 @@
  * over the Alfiz Provider API — an API connection wrapped in the
  * contract's abstract class, and the second of the system's two provider
  * implementations (the first being `AlfizApplication`, the local one).
+ * Fetch-only — it needs nothing from this package beyond living next to
+ * the handler that serves its far side, so both halves of the wire ship
+ * together.
  *
  * A `HostedProvider` never stores or decides anything itself: every read
  * and write is forwarded to the serving side — a linked Application's
@@ -36,7 +39,6 @@ import type {
   GrantQuery,
   GrantRow,
   ImportManifest,
-  InvalidationEvent,
   MetricsBatch,
   OrgSnapshot,
   PermissionUsage,
@@ -484,5 +486,3 @@ void _hostedImplementsContract;
 export function createHostedProvider(target: HostedProviderTarget): HostedProvider {
   return new HostedProvider(target);
 }
-
-export type { InvalidationEvent };

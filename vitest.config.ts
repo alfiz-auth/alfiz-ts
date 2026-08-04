@@ -9,7 +9,6 @@ export default defineConfig({
     alias: {
       "@alfiz/core": pkg("core"),
       "@alfiz/application": pkg("application"),
-      "@alfiz/hosted": pkg("hosted"),
     },
   },
   test: {

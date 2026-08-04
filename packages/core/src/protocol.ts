@@ -12,7 +12,7 @@
  * This module is pure data: operation names, paths, request/response
  * conventions, and the typed-error wire shape. It performs no I/O — the
  * Application serves the API (`createProviderHandler`), and the hosted
- * provider consumes it (`@alfiz/hosted`).
+ * provider consumes it (`HostedProvider`, also in `@alfiz/application`).
  *
  * Wire conventions, fixed by this contract:
  * - Every operation is `POST {base}/v1/{op}` with a JSON object body of the

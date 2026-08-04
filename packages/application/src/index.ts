@@ -13,5 +13,6 @@ export * from "./memory.js";
 export * from "./application.js";
 export * from "./events.js";
 export * from "./provider-api.js";
+export * from "./hosted-provider.js";
 export * from "./session.js";
 export * from "./service-principal.js";

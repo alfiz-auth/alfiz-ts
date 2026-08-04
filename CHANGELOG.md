@@ -2,10 +2,10 @@
 
 ## 0.6.0 — the provider seam, made explicit
 
-> **Breaking.** The relay module is replaced by the Alfiz Provider API and
-> the `@alfiz/hosted` package. If you mounted `createRelayHandler` or
-> called `createRelayProvider`, read the Breaking section — the rename is
-> mechanical, but the wire format underneath changed shape.
+> **Breaking.** The relay module is replaced by the Alfiz Provider API.
+> If you mounted `createRelayHandler` or called `createRelayProvider`,
+> read the Breaking section — the rename is mechanical, but the wire
+> format underneath changed shape.
 
 The provider contract has always been the system's single load-bearing
 interface, implemented identically by the Application and the Service. What
@@ -23,10 +23,11 @@ it, by design:
 - `AlfizApplication` (`@alfiz/application`) — the **local** provider,
   against your own database. Standalone, the org root; unchanged in what
   it does.
-- `HostedProvider` (`@alfiz/hosted`, new package) — the **hosted**
-  provider: an API connection wrapped in the abstract class, the seam the
-  hosted Dashboard, data-plane-less consumers, and Federation attach
-  through. Fetch-only, depends on nothing but `@alfiz/core`.
+- `HostedProvider` (also `@alfiz/application`) — the **hosted** provider:
+  an API connection wrapped in the abstract class, the seam the hosted
+  Dashboard, data-plane-less consumers, and Federation attach through.
+  Fetch-only; it lives next to the handler that serves its far side, so
+  both halves of the wire ship together.
 
 The base class carries only what is invariant across every implementation:
 the abstract statement of the contract (checked against the `AlfizProvider`
@@ -70,10 +71,9 @@ operations remain the cross-process invalidation transport.
   Mount it under a catch-all so `POST {base}/v1/{op}` reaches it; the old
   single-endpoint mount no longer matches anything.
 - `createRelayProvider` / `RelayProvider` → `createHostedProvider` /
-  `HostedProvider`, moved to the new `@alfiz/hosted` package. The
-  constructor target is unchanged (`url`, `secret`, `timeoutMs`,
-  `fetchImpl`) — `url` is now the base URL below which `/v1/{op}` paths
-  are appended.
+  `HostedProvider` (still `@alfiz/application`). The constructor target is
+  unchanged (`url`, `secret`, `timeoutMs`, `fetchImpl`) — `url` is now the
+  base URL below which `/v1/{op}` paths are appended.
 - The wire format changed from `{ op, args }` positional RPC at one URL to
   per-operation paths with named-field bodies, per the OpenAPI document.
   Both ends of a link must upgrade together.

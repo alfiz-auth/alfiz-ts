@@ -4,7 +4,7 @@
 # conforming provider in any implementation language serves exactly these
 # operations, and a conforming consumer speaks them. The TypeScript
 # reference implementations are `createProviderHandler` (@alfiz/application,
-# the serving side) and `HostedProvider` (@alfiz/hosted, the consuming
+# the serving side) and `HostedProvider` (also @alfiz/application, the consuming
 # side); both mirror this document field for field, and the test suite
 # holds this file and the operation manifest in `@alfiz/core` (protocol.ts)
 # in exact correspondence.

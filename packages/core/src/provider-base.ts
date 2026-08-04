@@ -8,7 +8,7 @@
  * - the **local provider** (`AlfizApplication`, `@alfiz/application`):
  *   the contract against the application's own database, standalone the
  *   org root — the complete system with no external dependency; and
- * - the **hosted provider** (`HostedProvider`, `@alfiz/hosted`): the same
+ * - the **hosted provider** (`HostedProvider`, also `@alfiz/application`): the same
  *   contract with its far side reached over the Alfiz Provider API — the
  *   Dashboard/Federation seam, an API connection wrapped in this class.
  *

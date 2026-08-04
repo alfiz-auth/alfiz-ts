@@ -8,7 +8,7 @@
  * every remote operation lands in the same provider methods local code
  * calls, so provider-side enforcement (org-root gating, validation, graph
  * integrity, audit) applies to remote writes exactly as to local ones. The
- * consuming side is `HostedProvider` (`@alfiz/hosted`) — the same contract
+ * consuming side is `HostedProvider` (same package) — the same contract
  * with this handler on its far side; the delegating end never becomes a
  * second writer.
  *

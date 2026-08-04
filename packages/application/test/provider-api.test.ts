@@ -18,9 +18,13 @@ import type {
   ApplicationOptions,
   ProviderHandlerOptions,
 } from "@alfiz/application";
-import { createProviderHandler } from "@alfiz/application";
-import { HostedProvider, ProviderTransportError, createHostedProvider } from "@alfiz/hosted";
-import { admin, makeApp } from "../../application/test/fixtures.js";
+import {
+  HostedProvider,
+  ProviderTransportError,
+  createHostedProvider,
+  createProviderHandler,
+} from "@alfiz/application";
+import { admin, makeApp } from "./fixtures.js";
 
 const SECRET = "provider-secret-from-the-link-step";
 const URL_BASE = "https://app.example/internal/alfiz";
