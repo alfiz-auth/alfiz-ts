@@ -17,6 +17,8 @@ export * from "./access.js";
 export * from "./catalog.js";
 export * from "./requests.js";
 export * from "./provider.js";
+export * from "./provider-base.js";
+export * from "./protocol.js";
 export * from "./cache.js";
 export * from "./errors.js";
 export * from "./client.js";

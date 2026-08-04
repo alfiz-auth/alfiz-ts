@@ -46,6 +46,7 @@ import type {
 } from "@alfiz/core";
 import {
   ALFIZ_INTERNAL_NAMESPACE,
+  AlfizProviderBase,
   GLOBAL_SCOPE,
   METRIC_GATE_ALLOW,
   METRIC_GATE_DENY,
@@ -221,20 +222,21 @@ export interface DirectoryImportResult {
  * always.
  */
 export class AlfizApplication<
-  P extends string = string,
-  S extends string = string,
-> implements AlfizProvider
+    P extends string = string,
+    S extends string = string,
+  >
+  extends AlfizProviderBase
+  implements AlfizProvider
 {
   readonly catalog: AnyCatalog;
-  readonly resolveAncestors: AncestryResolver;
+  override readonly resolveAncestors: AncestryResolver;
   /** Present when `events.persist` is on — see {@link EpochSource}. */
-  readonly epoch: EpochSource | undefined;
+  override readonly epoch: EpochSource | undefined;
 
   private readonly storage: StorageDriver;
   private readonly orgRoot: boolean;
   private readonly now: () => number;
   private readonly newId: () => string;
-  private readonly listeners = new Set<InvalidationListener>();
   private readonly groupTopologyTtl: number;
   private groupTopology: {
     parents: Map<string, readonly string[]>;
@@ -260,6 +262,7 @@ export class AlfizApplication<
   private reportsSinceMetricPrune = 0;
 
   constructor(options: ApplicationOptions) {
+    super();
     this.catalog = options.catalog;
     this.storage = options.storage;
     this.orgRoot = options.orgRoot ?? true;
@@ -314,13 +317,12 @@ export class AlfizApplication<
   }
 
   // -- events ---------------------------------------------------------------
+  // Listener registry and `ingestEvents` come from `AlfizProviderBase`.
+  // Coupling the topology cache to `emitInvalidation` (rather than to
+  // `emit`) keeps it honest on EVERY arrival path — local writes, epoch
+  // replay through `ingestEvents`, and snapshot applies alike.
 
-  onInvalidate(listener: InvalidationListener): () => void {
-    this.listeners.add(listener);
-    return () => this.listeners.delete(listener);
-  }
-
-  private emit(event: InvalidationEvent): void {
+  protected override emitInvalidation(event: InvalidationEvent): void {
     // Every write that can change group parentage emits a `group:` subject
     // event (or `all`), so busting here keeps the topology cache honest at
     // every emission site — including replayed events from other processes.
@@ -331,8 +333,12 @@ export class AlfizApplication<
       this.groupTopology = null;
       this.groupTopologyGen++;
     }
+    super.emitInvalidation(event);
+  }
+
+  private emit(event: InvalidationEvent): void {
     if (this.persistEvents) this.pendingEvents.push(event);
-    for (const listener of this.listeners) listener(event);
+    this.emitInvalidation(event);
   }
 
   /**
@@ -362,26 +368,6 @@ export class AlfizApplication<
           keepRows: this.eventRetention.maxRows,
         })
         .catch(() => undefined);
-    }
-  }
-
-  /**
-   * Re-emit events read from ANOTHER process's writes (via `epoch.since`,
-   * typically by the event poller) into this Application's local listener
-   * stream, so attached clients and the topology cache bust as if the write
-   * were local. Ingested events are never re-persisted — they are already
-   * in the log.
-   */
-  ingestEvents(events: readonly InvalidationEvent[]): void {
-    for (const event of events) {
-      if (
-        event.type === "all" ||
-        (event.type === "subject" && event.subject.startsWith("group:"))
-      ) {
-        this.groupTopology = null;
-        this.groupTopologyGen++;
-      }
-      for (const listener of this.listeners) listener(event);
     }
   }
 
@@ -1507,7 +1493,7 @@ export class AlfizApplication<
    * invalidation: a manifest changes nothing any client evaluates, it only
    * tells the provider what to warn about.
    */
-  async publishImports(
+  override async publishImports(
     manifest: ImportManifest,
     provenance: Provenance,
   ): Promise<{ version: number }> {
@@ -1544,7 +1530,7 @@ export class AlfizApplication<
     return { version };
   }
 
-  async getPublishedImports() {
+  override async getPublishedImports() {
     return this.storage.getImports?.call(this.storage) ?? null;
   }
 
@@ -2093,7 +2079,7 @@ export class AlfizApplication<
    * counter, not access data, and rejecting a batch because one permission
    * key was tombstoned mid-deploy would lose the whole window.
    */
-  async reportMetrics(batch: MetricsBatch): Promise<void> {
+  override async reportMetrics(batch: MetricsBatch): Promise<void> {
     this.requireMetrics();
     const bucket = this.bucketOf(batch.windowStart);
     // Merged before writing: two check counters differing only by shape fold
@@ -2220,17 +2206,17 @@ export class AlfizApplication<
    * have flipped to deny had it not existed. Feed it to
    * `revocationSafeguard` for the warning copy.
    */
-  async getGrantUsage(query?: UsageQuery): Promise<RowUsage[]> {
+  override async getGrantUsage(query?: UsageQuery): Promise<RowUsage[]> {
     return this.rowUsage("grant", query);
   }
 
   /** Per-revoke usage: checks each revoke suppressed. Deleting one widens access. */
-  async getRevokeUsage(query?: UsageQuery): Promise<RowUsage[]> {
+  override async getRevokeUsage(query?: UsageQuery): Promise<RowUsage[]> {
     return this.rowUsage("revoke", query);
   }
 
   /** Per-role usage, for role-edit and role-delete safeguards. */
-  async getRoleUsage(query?: UsageQuery): Promise<RowUsage[]> {
+  override async getRoleUsage(query?: UsageQuery): Promise<RowUsage[]> {
     return this.rowUsage("role", query);
   }
 
@@ -2240,7 +2226,7 @@ export class AlfizApplication<
    * a nav item on every page would otherwise drown out every action in the
    * catalog.
    */
-  async getPermissionUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+  override async getPermissionUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
     return this.keyedUsage("permission", query);
   }
 
@@ -2250,7 +2236,7 @@ export class AlfizApplication<
    * not an access one, and it is the reading that tells you whether a scope
    * type earns its complexity.
    */
-  async getScopeTypeUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
+  override async getScopeTypeUsage(query?: UsageQuery): Promise<PermissionUsage[]> {
     return this.keyedUsage("scopeType", query);
   }
 

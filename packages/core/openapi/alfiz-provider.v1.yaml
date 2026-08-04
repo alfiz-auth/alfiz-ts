@@ -1,0 +1,2092 @@
+# The Alfiz Provider API — the provider contract's wire form.
+#
+# This document is normative and deliberately language-agnostic: a
+# conforming provider in any implementation language serves exactly these
+# operations, and a conforming consumer speaks them. The TypeScript
+# reference implementations are `createProviderHandler` (@alfiz/application,
+# the serving side) and `HostedProvider` (@alfiz/hosted, the consuming
+# side); both mirror this document field for field, and the test suite
+# holds this file and the operation manifest in `@alfiz/core` (protocol.ts)
+# in exact correspondence.
+#
+# Conventions (also stated in protocol.ts):
+# - Every operation is `POST {base}/v1/{op}` with a JSON object body of the
+#   operation's named parameters (`{}` when there are none).
+# - Every success is `200` with a JSON object body — never a bare array,
+#   primitive, or null — so any response can grow a field without a wire
+#   break. Void operations return `{}`.
+# - Every failure is a non-2xx status carrying the ErrorEnvelope. The
+#   status is a transport hint; the envelope is normative. Provider-domain
+#   errors carry `name: ProviderWriteRejectedError` (with its `code`) or
+#   `name: GraphCycleError` (with `detail.path`); protocol-level failures
+#   (bad credentials, unknown op, malformed body) carry
+#   `name: ProviderApiError`.
+# - Timestamps are epoch milliseconds. Maps cross as plain JSON objects.
+# - The live invalidation stream never crosses this API: `epoch.head` /
+#   `epoch.since` are the cross-process invalidation transport.
+openapi: 3.1.0
+
+info:
+  title: Alfiz Provider API
+  version: 1.0.0
+  description: >-
+    The Alfiz provider contract over HTTPS: closure supply, row operations,
+    request workflows, catalog registration, organizational data, audit,
+    metrics reads, the epoch (cache-freshness) reads, and the org-snapshot
+    operations that promotion, demotion, and read-model sync ride on.
+    Served by an Application (the local provider, via its handler mount)
+    or by a managed service; consumed by hosted dashboards, CLIs, and
+    federated peers. Nothing in this API is on any runtime check path —
+    checks evaluate in-process against provider-supplied data and never
+    cross this wire.
+
+servers:
+  - url: "{base}"
+    description: >-
+      The mount point chosen by the serving deployment (for an Application,
+      an internal route; for a managed service, its API origin). All paths
+      below are relative to it.
+    variables:
+      base:
+        default: https://app.example/internal/alfiz
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: transport
+    description: Liveness, identity, and link-time discovery.
+  - name: capabilities
+    description: Capability discovery — progressive disclosure over the wire.
+  - name: closure-supply
+    description: Everything a Client needs to evaluate a principal.
+  - name: epoch
+    description: The persisted-event freshness signal.
+  - name: grants
+  - name: revokes
+  - name: cleanup
+    description: Referential cleanup paired with host-side deletions.
+  - name: requests
+  - name: catalog
+  - name: roles
+    description: Organizational data — rejected when the provider is not the org root.
+  - name: groups
+    description: Organizational data — rejected when the provider is not the org root.
+  - name: users
+    description: Organizational data — rejected when the provider is not the org root.
+  - name: audit
+  - name: metrics
+    description: Optional — gated by `capabilities().metrics`.
+  - name: org-snapshot
+    description: Promotion, demotion, and read-model sync.
+
+paths:
+  /v1/ping:
+    post:
+      operationId: ping
+      tags: [transport]
+      summary: Liveness, identity, and link-time discovery.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The serving side's identity and discovery flags.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PingResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/capabilities:
+    post:
+      operationId: capabilities
+      tags: [capabilities]
+      summary: Which optional capabilities this provider serves.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The capability flags. Components render accordingly.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProviderCapabilities" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getSubjectAccess:
+    post:
+      operationId: getSubjectAccess
+      tags: [closure-supply]
+      summary: The principal's subject closure and the access rows visible to it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal]
+              properties:
+                principal: { $ref: "#/components/schemas/PrincipalRef" }
+      responses:
+        "200":
+          description: The closure supply for one principal.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SubjectAccessData" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/resolveAncestors:
+    post:
+      operationId: resolveAncestors
+      tags: [closure-supply]
+      summary: >-
+        The ancestry seam, as an operation. Serves ADMIN surfaces only —
+        runtime checks resolve ancestry in-process and never cross this API.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope]
+              properties:
+                scope: { $ref: "#/components/schemas/ScopeId" }
+      responses:
+        "200":
+          description: Ancestors ordered nearest-first, ending at `*`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ancestors]
+                properties:
+                  ancestors:
+                    type: array
+                    items: { $ref: "#/components/schemas/ScopeId" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/epoch.head:
+    post:
+      operationId: epochHead
+      tags: [epoch]
+      summary: >-
+        The sequence number of the most recently persisted invalidation
+        event (0 when none). One tiny read whose cost is independent of
+        organization size — unchanged head means nothing changed anywhere.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The head sequence.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [seq]
+                properties:
+                  seq: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/epoch.since:
+    post:
+      operationId: epochSince
+      tags: [epoch]
+      summary: >-
+        Events after `seq`, oldest first, for selective catch-up — replayed
+        through the same busting logic the live stream feeds.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [seq]
+              properties:
+                seq: { type: integer }
+                limit:
+                  type: integer
+                  description: At most this many events; provider-chosen default.
+      responses:
+        "200":
+          description: >-
+            The missed events, or `{gap: true}` when `seq` predates event
+            retention — the caller must bust everything and resume from head.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/EpochEventsPage" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/createGrant:
+    post:
+      operationId: createGrant
+      tags: [grants]
+      summary: Write one grant row. Validated against the published catalog.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input: { $ref: "#/components/schemas/GrantInput" }
+      responses:
+        "200":
+          description: The written row.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grant]
+                properties:
+                  grant: { $ref: "#/components/schemas/GrantRow" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/createGrants:
+    post:
+      operationId: createGrants
+      tags: [grants]
+      summary: >-
+        The bulk write for migrations and imports — every input validated
+        BEFORE any row is written; one bad input rejects the whole batch.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [inputs, provenance]
+              properties:
+                inputs:
+                  type: array
+                  items: { $ref: "#/components/schemas/GrantInputWithoutProvenance" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200":
+          description: The written rows, in input order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/GrantRow" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteGrant:
+    post:
+      operationId: deleteGrant
+      tags: [grants]
+      summary: Delete one grant row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grantId, provenance]
+              properties:
+                grantId: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listGrants:
+    post:
+      operationId: listGrants
+      tags: [grants]
+      summary: Grant rows matching the filter.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: "#/components/schemas/GrantQuery" }
+      responses:
+        "200":
+          description: The matching rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [grants]
+                properties:
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/GrantRow" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/countGrants:
+    post:
+      operationId: countGrants
+      tags: [grants]
+      summary: How many grants match — without materializing them.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: "#/components/schemas/GrantQuery" }
+      responses:
+        "200":
+          description: The count.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count]
+                properties:
+                  count: { type: integer }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/createRevoke:
+    post:
+      operationId: createRevoke
+      tags: [revokes]
+      summary: Write one personal revoke. Negative-always-wins, scope-inclusive.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input: { $ref: "#/components/schemas/RevokeInput" }
+      responses:
+        "200":
+          description: The written row.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revoke]
+                properties:
+                  revoke: { $ref: "#/components/schemas/RevokeRow" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteRevoke:
+    post:
+      operationId: deleteRevoke
+      tags: [revokes]
+      summary: Delete one revoke row. Deleting a revoke WIDENS access.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [revokeId, provenance]
+              properties:
+                revokeId: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listRevokes:
+    post:
+      operationId: listRevokes
+      tags: [revokes]
+      summary: Revoke rows matching the filter.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: object
+                  properties:
+                    userId: { type: string }
+                    scope: { $ref: "#/components/schemas/ScopeId" }
+      responses:
+        "200":
+          description: The matching rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [revokes]
+                properties:
+                  revokes:
+                    type: array
+                    items: { $ref: "#/components/schemas/RevokeRow" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteSubject:
+    post:
+      operationId: deleteSubject
+      tags: [cleanup]
+      summary: >-
+        Remove every grant held by the subject; for user subjects, also
+        their revokes, stored record, implicit-group grants, and pending
+        requests. Call from the same code path that deletes the principal.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [subject, provenance]
+              properties:
+                subject: { $ref: "#/components/schemas/SubjectId" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/CleanupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteScope:
+    post:
+      operationId: deleteScope
+      tags: [cleanup]
+      summary: >-
+        Remove every grant and personal revoke AT the scope and cancel
+        pending requests targeting it. Call per deleted resource id; the
+        global scope is not deletable.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [scope, provenance]
+              properties:
+                scope: { $ref: "#/components/schemas/ScopeId" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/CleanupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/submitRequest:
+    post:
+      operationId: submitRequest
+      tags: [requests]
+      summary: Submit an access request — a proposed grant tuple plus justification.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input]
+              properties:
+                input: { $ref: "#/components/schemas/RequestInput" }
+      responses:
+        "200": { $ref: "#/components/responses/RequestResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/decideRequest:
+    post:
+      operationId: decideRequest
+      tags: [requests]
+      summary: Decide the stage currently awaiting a decision.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requestId, decision]
+              properties:
+                requestId: { type: string }
+                decision: { $ref: "#/components/schemas/DecisionInput" }
+      responses:
+        "200": { $ref: "#/components/responses/RequestResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/cancelRequest:
+    post:
+      operationId: cancelRequest
+      tags: [requests]
+      summary: Cancel a pending request (requester only).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [requestId, byUserId]
+              properties:
+                requestId: { type: string }
+                byUserId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/RequestResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listRequests:
+    post:
+      operationId: listRequests
+      tags: [requests]
+      summary: Requests matching the filter.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: "#/components/schemas/RequestFilter" }
+      responses:
+        "200": { $ref: "#/components/responses/RequestListResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listApproverQueue:
+    post:
+      operationId: listApproverQueue
+      tags: [requests]
+      summary: The requests the approver may currently decide — the approver queue.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [approverUserId]
+              properties:
+                approverUserId: { type: string }
+      responses:
+        "200": { $ref: "#/components/responses/RequestListResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/publishCatalog:
+    post:
+      operationId: publishCatalog
+      tags: [catalog]
+      summary: >-
+        Accept a verified catalog publish. Versioned monotonically;
+        out-of-order publishes are rejected.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [document, provenance]
+              properties:
+                document: { $ref: "#/components/schemas/CatalogDocument" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/VersionResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getPublishedCatalog:
+    post:
+      operationId: getPublishedCatalog
+      tags: [catalog]
+      summary: The most recently published catalog, or null when none.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The published catalog, versioned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [published]
+                properties:
+                  published:
+                    oneOf:
+                      - { $ref: "#/components/schemas/PublishedCatalog" }
+                      - type: "null"
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/publishImports:
+    post:
+      operationId: publishImports
+      tags: [catalog]
+      summary: >-
+        Accept an import manifest — what the application CONSUMES, published
+        separately from what it announces. Gated by `capabilities().imports`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [manifest, provenance]
+              properties:
+                manifest: { $ref: "#/components/schemas/ImportManifest" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/VersionResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getPublishedImports:
+    post:
+      operationId: getPublishedImports
+      tags: [catalog]
+      summary: The most recently published import manifest, or null when none.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The published manifest, versioned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [published]
+                properties:
+                  published:
+                    oneOf:
+                      - { $ref: "#/components/schemas/PublishedImports" }
+                      - type: "null"
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listRoles:
+    post:
+      operationId: listRoles
+      tags: [roles]
+      summary: Every role definition.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The role records.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roles]
+                properties:
+                  roles:
+                    type: array
+                    items: { $ref: "#/components/schemas/RoleRecord" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/createRole:
+    post:
+      operationId: createRole
+      tags: [roles]
+      summary: Create a role. Creating an id that already exists is a conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input, provenance]
+              properties:
+                input: { $ref: "#/components/schemas/RoleInput" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/RoleResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/updateRole:
+    post:
+      operationId: updateRole
+      tags: [roles]
+      summary: Update a role. Identity is the opaque id — renaming never breaks grants.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roleId, input, provenance]
+              properties:
+                roleId: { type: string }
+                input: { $ref: "#/components/schemas/RoleUpdate" }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/RoleResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteRole:
+    post:
+      operationId: deleteRole
+      tags: [roles]
+      summary: Delete a role.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roleId, provenance]
+              properties:
+                roleId: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listGroups:
+    post:
+      operationId: listGroups
+      tags: [groups]
+      summary: Every user group.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The groups.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [groups]
+                properties:
+                  groups:
+                    type: array
+                    items: { $ref: "#/components/schemas/UserGroup" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/createGroup:
+    post:
+      operationId: createGroup
+      tags: [groups]
+      summary: Create a group. Creating an id that already exists is a conflict.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input, provenance]
+              properties:
+                input:
+                  type: object
+                  required: [name]
+                  properties:
+                    id: { type: string }
+                    name: { type: string }
+                    description: { type: string }
+                    parents:
+                      type: array
+                      items: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/GroupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/updateGroup:
+    post:
+      operationId: updateGroup
+      tags: [groups]
+      summary: Rename / re-describe a group. Parentage and membership have their own operations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupId, input, provenance]
+              properties:
+                groupId: { type: string }
+                input:
+                  type: object
+                  properties:
+                    name: { type: string }
+                    description: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/GroupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/setGroupParents:
+    post:
+      operationId: setGroupParents
+      tags: [groups]
+      summary: >-
+        Graph write: transactional DAG enforcement, cycle paths named in
+        errors (`detail.path` on a GraphCycleError envelope).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupId, parents, provenance]
+              properties:
+                groupId: { type: string }
+                parents:
+                  type: array
+                  items: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/GroupResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/deleteGroup:
+    post:
+      operationId: deleteGroup
+      tags: [groups]
+      summary: Delete a group.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupId, provenance]
+              properties:
+                groupId: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/setGroupMembership:
+    post:
+      operationId: setGroupMembership
+      tags: [groups]
+      summary: Replace one user's explicit group memberships.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, groupIds, provenance]
+              properties:
+                userId: { type: string }
+                groupIds:
+                  type: array
+                  items: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getGroupMembers:
+    post:
+      operationId: getGroupMembers
+      tags: [groups]
+      summary: One group's member user ids.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupId]
+              properties:
+                groupId: { type: string }
+      responses:
+        "200":
+          description: The member user ids.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [userIds]
+                properties:
+                  userIds:
+                    type: array
+                    items: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/setUserActive:
+    post:
+      operationId: setUserActive
+      tags: [users]
+      summary: >-
+        The offboarding switch: an inactive principal evaluates to NO
+        access, every check shape, immediately on the next closure supply.
+        Creates the record when absent; reversible, unlike deleteSubject.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, active, provenance]
+              properties:
+                userId: { type: string }
+                active: { type: boolean }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/setReportingEdge:
+    post:
+      operationId: setReportingEdge
+      tags: [users]
+      summary: "Graph write: the reporting tree. `managerUserId: null` clears the edge."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [userId, managerUserId, provenance]
+              properties:
+                userId: { type: string }
+                managerUserId:
+                  oneOf:
+                    - { type: string }
+                    - type: "null"
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getReportingEdges:
+    post:
+      operationId: getReportingEdges
+      tags: [users]
+      summary: Every reporting edge, as a userId → managerUserId object.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The edges.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [edges]
+                properties:
+                  edges:
+                    type: object
+                    additionalProperties: { type: string }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/dissolveVirtualParent:
+    post:
+      operationId: dissolveVirtualParent
+      tags: [groups]
+      summary: >-
+        Dissolve a virtual parent: snapshot its grants down to each child
+        with provenance, then remove it — after which the children drift
+        freely.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [groupId, provenance]
+              properties:
+                groupId: { type: string }
+                provenance: { $ref: "#/components/schemas/Provenance" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/listAuditEvents:
+    post:
+      operationId: listAuditEvents
+      tags: [audit]
+      summary: Audit entries, newest first.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter:
+                  type: object
+                  properties:
+                    target: { type: string }
+                    limit: { type: integer }
+      responses:
+        "200":
+          description: The audit entries.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events]
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: "#/components/schemas/AuditEvent" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/reportMetrics:
+    post:
+      operationId: reportMetrics
+      tags: [metrics]
+      summary: >-
+        Ingest one aggregated window. Never individual checks — windowed
+        counts tagged with an instance id; batches from many app servers
+        merge wherever they land. Fire-and-forget on the sending side.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch]
+              properties:
+                batch: { $ref: "#/components/schemas/MetricsBatch" }
+      responses:
+        "200": { $ref: "#/components/responses/EmptyResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getGrantUsage:
+    post:
+      operationId: getGrantUsage
+      tags: [metrics]
+      summary: >-
+        Per-grant usage over a window — `matched` and `soleMatch` (the
+        revocation safeguard keys on the second).
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UsageQueryParams" }
+      responses:
+        "200": { $ref: "#/components/responses/RowUsageResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getRevokeUsage:
+    post:
+      operationId: getRevokeUsage
+      tags: [metrics]
+      summary: >-
+        Per-revoke usage — how many checks each revoke suppressed. Deleting
+        a revoke widens access; this warning points the opposite direction.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UsageQueryParams" }
+      responses:
+        "200": { $ref: "#/components/responses/RowUsageResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getRoleUsage:
+    post:
+      operationId: getRoleUsage
+      tags: [metrics]
+      summary: Per-role usage, for role-edit and role-delete safeguards.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UsageQueryParams" }
+      responses:
+        "200": { $ref: "#/components/responses/RowUsageResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getPermissionUsage:
+    post:
+      operationId: getPermissionUsage
+      tags: [metrics]
+      summary: Per-permission counts, split by gate versus visibility traffic.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UsageQueryParams" }
+      responses:
+        "200": { $ref: "#/components/responses/PermissionUsageResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/getScopeTypeUsage:
+    post:
+      operationId: getScopeTypeUsage
+      tags: [metrics]
+      summary: The same rollup keyed by scope type.
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/UsageQueryParams" }
+      responses:
+        "200": { $ref: "#/components/responses/PermissionUsageResult" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org.exportSnapshot:
+    post:
+      operationId: orgExportSnapshot
+      tags: [org-snapshot]
+      summary: Export the org-domain dataset for promotion, demotion, or sync.
+      requestBody: { $ref: "#/components/requestBodies/Empty" }
+      responses:
+        "200":
+          description: The snapshot.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [snapshot]
+                properties:
+                  snapshot: { $ref: "#/components/schemas/OrgSnapshot" }
+        default: { $ref: "#/components/responses/Error" }
+
+  /v1/org.applySnapshot:
+    post:
+      operationId: orgApplySnapshot
+      tags: [org-snapshot]
+      summary: >-
+        Replace the org-domain dataset with the snapshot. `authority: true`
+        transfers the org-root role to the receiver; `false` is read-model
+        sync. Local instance-scoped rows are untouched.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [snapshot, authority, source]
+              properties:
+                snapshot: { $ref: "#/components/schemas/OrgSnapshot" }
+                authority: { type: boolean }
+                source:
+                  type: string
+                  description: Audited provenance source, e.g. "demotion:org_abc".
+      responses:
+        "200":
+          description: Applied.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [applied]
+                properties:
+                  applied: { const: true }
+        default: { $ref: "#/components/responses/Error" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: The token minted at link time; opaque to this contract.
+
+  requestBodies:
+    Empty:
+      description: No parameters. Send `{}` (or an empty body).
+      content:
+        application/json:
+          schema:
+            type: object
+
+  responses:
+    Error:
+      description: >-
+        Any failure. The envelope is normative; the status is a hint
+        (401 unauthorized, 400 malformed body, 403 not_org_root,
+        404 not_found / unknown op, 409 conflict / graph_cycle,
+        422 validation, 501 unsupported, 500 otherwise).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    EmptyResult:
+      description: Done. Void operations return the empty object.
+      content:
+        application/json:
+          schema:
+            type: object
+    CleanupResult:
+      description: How many rows the cleanup removed.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [deletedGrants, deletedRevokes]
+            properties:
+              deletedGrants: { type: integer }
+              deletedRevokes: { type: integer }
+    VersionResult:
+      description: The monotonically increased publish version.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [version]
+            properties:
+              version: { type: integer }
+    RequestResult:
+      description: The request, in its post-operation state.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [request]
+            properties:
+              request: { $ref: "#/components/schemas/AccessRequest" }
+    RequestListResult:
+      description: The matching requests.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [requests]
+            properties:
+              requests:
+                type: array
+                items: { $ref: "#/components/schemas/AccessRequest" }
+    RoleResult:
+      description: The role, post-write.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [role]
+            properties:
+              role: { $ref: "#/components/schemas/RoleRecord" }
+    GroupResult:
+      description: The group, post-write.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [group]
+            properties:
+              group: { $ref: "#/components/schemas/UserGroup" }
+    RowUsageResult:
+      description: Aggregated per-row usage over the window.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [usage]
+            properties:
+              usage:
+                type: array
+                items: { $ref: "#/components/schemas/RowUsage" }
+    PermissionUsageResult:
+      description: Aggregated per-key usage over the window.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [usage]
+            properties:
+              usage:
+                type: array
+                items: { $ref: "#/components/schemas/PermissionUsage" }
+
+  schemas:
+    # -- identifiers ---------------------------------------------------------
+    SubjectId:
+      type: string
+      description: >-
+        A subject reference: `user:<id>`, `group:<id>`, `org:<id>`,
+        `directs:<userId>`, `orgof:<userId>`, `service:<id>`, or `everyone`.
+    ScopeId:
+      type: string
+      description: A scope instance (`<scopeType>:<id>`) or `*`, the global scope.
+    PermissionKey:
+      type: string
+      description: A concrete dotted permission key, e.g. `docs.files.read`.
+    PermissionPattern:
+      type: string
+      description: >-
+        A concrete key or a forward-inclusive subtree wildcard
+        (`docs.files.*`, `docs.*`, `*`).
+    EpochMs:
+      type: integer
+      description: Milliseconds since the Unix epoch.
+
+    # -- errors --------------------------------------------------------------
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: "#/components/schemas/WireError" }
+    WireError:
+      type: object
+      description: >-
+        A typed error, re-thrown intact on the consuming side.
+        `ProviderWriteRejectedError` carries `code` (not_org_root |
+        graph_cycle | validation | not_found | conflict | unsupported);
+        `GraphCycleError` carries `detail.path`; `CatalogError` carries
+        `detail.issues`; `ProviderApiError` marks protocol-level failures.
+      required: [name, message]
+      properties:
+        name: { type: string }
+        message: { type: string }
+        code: { type: string }
+        detail: {}
+
+    # -- transport -----------------------------------------------------------
+    PingResult:
+      type: object
+      required: [api, application, orgRoot, hasEpoch, auditOptIn]
+      properties:
+        api:
+          type: integer
+          description: The Provider API version the serving side speaks.
+        application: { type: string }
+        orgRoot: { type: boolean }
+        hasEpoch: { type: boolean }
+        auditOptIn: { type: boolean }
+
+    # -- capability discovery ------------------------------------------------
+    ProviderCapabilities:
+      type: object
+      description: >-
+        Progressive disclosure over the wire — machinery a deployment has
+        not opted into is invisible, and components render accordingly.
+      required: [orgRoot, requests, reporting, audit, multiParent, metrics, imports]
+      properties:
+        orgRoot:
+          type: boolean
+          description: >-
+            Whether this provider is currently the single authoritative
+            writer of organizational-domain data. Non-root providers serve
+            the same data as a synced read model and reject writes to it.
+        requests: { type: boolean }
+        reporting: { type: boolean }
+        audit: { type: boolean }
+        multiParent: { type: boolean }
+        metrics: { type: boolean }
+        imports: { type: boolean }
+
+    # -- closure supply ------------------------------------------------------
+    PrincipalRef:
+      description: Who is being evaluated — a person or a machine subject.
+      oneOf:
+        - type: object
+          required: [userId]
+          properties:
+            userId: { type: string }
+        - type: object
+          required: [serviceId]
+          properties:
+            serviceId: { type: string }
+    SubjectAccessData:
+      type: object
+      description: >-
+        Everything a Client needs to evaluate a principal. Diagnostics are
+        surfaced, never silently dropped.
+      required:
+        [userId, closure, grants, revokes, roles, managerChain, unresolvedRoleIds, active]
+      properties:
+        userId:
+          oneOf:
+            - { type: string }
+            - type: "null"
+          description: Null for machine subjects.
+        closure:
+          type: array
+          items: { $ref: "#/components/schemas/SubjectId" }
+        grants:
+          type: array
+          items: { $ref: "#/components/schemas/GrantRow" }
+          description: Unfiltered rows for closure members, at every scope.
+        revokes:
+          type: array
+          items: { $ref: "#/components/schemas/RevokeRow" }
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/RoleDef" }
+          description: Definitions for every role referenced by `grants`.
+        managerChain:
+          type: array
+          items: { type: string }
+          description: The principal's manager chain, nearest-first.
+        unresolvedRoleIds:
+          type: array
+          items: { type: string }
+          description: Role ids referenced by grants but not found — a data-integrity signal.
+        active:
+          type: boolean
+          description: Inactive principals evaluate to no access.
+
+    # -- invalidation --------------------------------------------------------
+    InvalidationEvent:
+      description: One closure-bust notification, replayed by consumers' caches.
+      oneOf:
+        - type: object
+          required: [type, userId]
+          properties:
+            type: { const: user }
+            userId: { type: string }
+        - type: object
+          required: [type, subject]
+          properties:
+            type: { const: subject }
+            subject: { $ref: "#/components/schemas/SubjectId" }
+        - type: object
+          required: [type, scope]
+          properties:
+            type: { const: scope }
+            scope: { $ref: "#/components/schemas/ScopeId" }
+        - type: object
+          required: [type, roleId]
+          properties:
+            type: { const: role }
+            roleId: { type: string }
+        - type: object
+          required: [type]
+          properties:
+            type: { const: catalog }
+        - type: object
+          required: [type]
+          properties:
+            type: { const: all }
+    EpochEventsPage:
+      oneOf:
+        - type: object
+          required: [upTo, events]
+          properties:
+            upTo: { type: integer }
+            events:
+              type: array
+              items: { $ref: "#/components/schemas/InvalidationEvent" }
+        - type: object
+          required: [gap]
+          properties:
+            gap: { const: true }
+
+    # -- provenance ----------------------------------------------------------
+    Provenance:
+      description: Who or what created a row. Every write carries it; validated before any row is written.
+      oneOf:
+        - type: object
+          required: [kind, actorUserId]
+          properties:
+            kind: { const: admin }
+            actorUserId: { type: string }
+        - type: object
+          required: [kind, requestId]
+          properties:
+            kind: { const: request }
+            requestId: { type: string }
+            approvedBy: { type: string }
+        - type: object
+          required: [kind, virtualParentId, originalGrantId]
+          properties:
+            kind: { const: dissolution }
+            virtualParentId: { type: string }
+            originalGrantId: { type: string }
+        - type: object
+          required: [kind, source]
+          properties:
+            kind: { const: merge }
+            source: { type: string }
+        - type: object
+          required: [kind, source]
+          properties:
+            kind: { const: import }
+            source: { type: string }
+        - type: object
+          required: [kind, integrationId]
+          properties:
+            kind: { const: reconciler }
+            integrationId: { type: string }
+        - type: object
+          required: [kind]
+          properties:
+            kind: { const: system }
+            note: { type: string }
+
+    # -- rows ----------------------------------------------------------------
+    GrantRow:
+      type: object
+      description: >-
+        The atomic grant tuple. Exactly one of `roleId` / `pattern` is set.
+      required: [id, subject, scope, provenance, createdAt]
+      properties:
+        id: { type: string }
+        subject: { $ref: "#/components/schemas/SubjectId" }
+        roleId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        expiresAt:
+          $ref: "#/components/schemas/EpochMs"
+          description: >-
+            An expired grant stops matching exactly as a deleted one would,
+            but remains for audit.
+        provenance: { $ref: "#/components/schemas/Provenance" }
+        createdAt: { $ref: "#/components/schemas/EpochMs" }
+    GrantInput:
+      type: object
+      description: Exactly one of `roleId` / `pattern`. Omitted scope means the global scope.
+      required: [subject, provenance]
+      properties:
+        subject: { $ref: "#/components/schemas/SubjectId" }
+        roleId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        expiresAt: { $ref: "#/components/schemas/EpochMs" }
+        provenance: { $ref: "#/components/schemas/Provenance" }
+    GrantInputWithoutProvenance:
+      type: object
+      description: A bulk-write element; the batch carries one shared provenance.
+      required: [subject]
+      properties:
+        subject: { $ref: "#/components/schemas/SubjectId" }
+        roleId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        expiresAt: { $ref: "#/components/schemas/EpochMs" }
+    GrantQuery:
+      type: object
+      properties:
+        subject: { $ref: "#/components/schemas/SubjectId" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        roleId:
+          type: string
+          description: Grants conferring a given role — role-holder queries without a scan.
+    RevokeRow:
+      type: object
+      description: Personal-only — the single negative layer, and it always wins.
+      required: [id, userId, pattern, scope, provenance, createdAt]
+      properties:
+        id: { type: string }
+        userId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        provenance: { $ref: "#/components/schemas/Provenance" }
+        createdAt: { $ref: "#/components/schemas/EpochMs" }
+    RevokeInput:
+      type: object
+      required: [userId, pattern, provenance]
+      properties:
+        userId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        provenance: { $ref: "#/components/schemas/Provenance" }
+
+    # -- roles ---------------------------------------------------------------
+    RoleDef:
+      type: object
+      description: >-
+        A named bundle of positive permission patterns. Identity is the
+        opaque id — renaming never breaks assignments.
+      required: [id, name, patterns]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        patterns:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionPattern" }
+    RoleRecord:
+      allOf:
+        - { $ref: "#/components/schemas/RoleDef" }
+        - type: object
+          properties:
+            requestable: { $ref: "#/components/schemas/RoleRequestability" }
+    RoleRequestability:
+      type: object
+      description: Nothing is requestable by default.
+      required: [stages]
+      properties:
+        prompts:
+          type: array
+          items: { $ref: "#/components/schemas/RequestPrompt" }
+        maxDurationMs: { type: integer }
+        requireExpiry: { type: boolean }
+        stages:
+          type: array
+          items: { $ref: "#/components/schemas/ApprovalStage" }
+    RoleInput:
+      type: object
+      required: [name, patterns]
+      properties:
+        id:
+          type: string
+          description: >-
+            Caller-supplied id for externally referenced roles (migrations,
+            infra-as-code). Creating an id that already exists is a
+            conflict, never an overwrite.
+        name: { type: string }
+        description: { type: string }
+        patterns:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionPattern" }
+        requestable: { $ref: "#/components/schemas/RoleRequestability" }
+    RoleUpdate:
+      type: object
+      description: Partial role input; only provided fields change.
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        patterns:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionPattern" }
+        requestable: { $ref: "#/components/schemas/RoleRequestability" }
+
+    # -- requests ------------------------------------------------------------
+    RequestPrompt:
+      type: object
+      required: [id, label]
+      properties:
+        id: { type: string }
+        label: { type: string }
+        kind:
+          type: string
+          enum: [text, select]
+        options:
+          type: array
+          items: { type: string }
+          description: For `select` prompts.
+        required: { type: boolean }
+    AutoApprovalPredicate:
+      description: >-
+        A condition on the requester evaluated against their subject
+        closure — the same evaluation machinery as `can()`.
+      oneOf:
+        - type: object
+          required: [type, groupId]
+          properties:
+            type: { const: in_group }
+            groupId: { type: string }
+        - type: object
+          required: [type, orgId]
+          properties:
+            type: { const: in_org }
+            orgId: { type: string }
+        - type: object
+          required: [type, subject]
+          properties:
+            type: { const: member_of }
+            subject: { $ref: "#/components/schemas/SubjectId" }
+        - type: object
+          required: [type, pattern]
+          properties:
+            type: { const: holds_pattern }
+            pattern: { $ref: "#/components/schemas/PermissionPattern" }
+    ApprovalStage:
+      description: >-
+        Stages reference layers and roles, never people, so they survive
+        hierarchy changes and org-root promotion; they resolve at
+        evaluation.
+      oneOf:
+        - type: object
+          required: [kind, predicate]
+          properties:
+            kind: { const: auto }
+            predicate: { $ref: "#/components/schemas/AutoApprovalPredicate" }
+        - type: object
+          required: [kind, roleId]
+          properties:
+            kind: { const: named_approvers }
+            roleId: { type: string }
+        - type: object
+          required: [kind]
+          properties:
+            kind: { const: management }
+            layers:
+              type: integer
+              description: Transitive layers upward; 1 = direct manager.
+    RequestState:
+      type: string
+      enum: [pending, approved, denied, cancelled]
+    RequestDecision:
+      type: object
+      required: [stageIndex, decidedBy, decision, at]
+      properties:
+        stageIndex: { type: integer }
+        decidedBy:
+          type: string
+          description: A user id, or `auto` for a passed auto-approval stage.
+        decision:
+          type: string
+          enum: [approved, denied]
+        at: { $ref: "#/components/schemas/EpochMs" }
+        note: { type: string }
+    AccessRequest:
+      type: object
+      description: A proposed grant tuple plus justification and workflow state.
+      required:
+        [id, requesterUserId, scope, justification, state, stageIndex, stages, decisions, createdAt]
+      properties:
+        id: { type: string }
+        requesterUserId: { type: string }
+        roleId:
+          type: string
+          description: Exactly one of `roleId` / `pattern` — the same rule as the grant row.
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        proposedExpiresAt: { $ref: "#/components/schemas/EpochMs" }
+        justification:
+          type: object
+          additionalProperties: { type: string }
+          description: Prompt id → answer.
+        state: { $ref: "#/components/schemas/RequestState" }
+        stageIndex:
+          type: integer
+          description: Index of the stage currently awaiting a decision (while pending).
+        stages:
+          type: array
+          items: { $ref: "#/components/schemas/ApprovalStage" }
+        decisions:
+          type: array
+          items: { $ref: "#/components/schemas/RequestDecision" }
+        createdAt: { $ref: "#/components/schemas/EpochMs" }
+        decidedAt: { $ref: "#/components/schemas/EpochMs" }
+    RequestInput:
+      type: object
+      required: [requesterUserId]
+      properties:
+        requesterUserId: { type: string }
+        roleId: { type: string }
+        pattern: { $ref: "#/components/schemas/PermissionPattern" }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        proposedExpiresAt: { $ref: "#/components/schemas/EpochMs" }
+        justification:
+          type: object
+          additionalProperties: { type: string }
+    RequestFilter:
+      type: object
+      properties:
+        state: { $ref: "#/components/schemas/RequestState" }
+        requesterUserId: { type: string }
+    DecisionInput:
+      type: object
+      required: [deciderUserId, decision]
+      properties:
+        deciderUserId: { type: string }
+        decision:
+          type: string
+          enum: [approved, denied]
+        note: { type: string }
+
+    # -- groups & users ------------------------------------------------------
+    UserGroup:
+      type: object
+      required: [id, name, parents]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        description: { type: string }
+        parents:
+          type: array
+          items: { type: string }
+          description: Parent group ids (the DAG; enforced provider-side).
+        virtual:
+          type: boolean
+          description: True for virtual parents created by condensation or sync.
+
+    # -- audit ---------------------------------------------------------------
+    AuditEvent:
+      type: object
+      required: [id, at, actor, action, target]
+      properties:
+        id: { type: string }
+        at: { $ref: "#/components/schemas/EpochMs" }
+        actor:
+          type: string
+          description: A user id, `service:<id>`, `system`, or an `import:`/`merge:` source.
+        action: { type: string }
+        target:
+          type: string
+          description: The entity acted on (row id, group id, request id, …).
+        detail: {}
+
+    # -- catalog -------------------------------------------------------------
+    CatalogDocument:
+      type: object
+      description: >-
+        The stable wire shape of a catalog publish — owned vocabulary only;
+        what an application consumes publishes separately as the
+        ImportManifest.
+      required: [formatVersion, namespace, namespaces, leaves, groups, scopeTypes, navigation]
+      properties:
+        formatVersion: { const: 1 }
+        namespace: { type: string }
+        namespaces:
+          type: array
+          items: { type: string }
+        leaves:
+          type: array
+          items: { $ref: "#/components/schemas/LeafMeta" }
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/GroupMeta" }
+        scopeTypes:
+          type: array
+          items: { $ref: "#/components/schemas/ScopeTypeMeta" }
+        navigation:
+          type: array
+          items: { $ref: "#/components/schemas/NavItem" }
+        conventions:
+          type: object
+          required: [depth]
+          properties:
+            depth:
+              oneOf:
+                - { type: integer }
+                - { const: any }
+    LeafMeta:
+      type: object
+      required: [key, groupPath, name, kind, destructive, scopes, impliedOnAncestors]
+      properties:
+        key: { $ref: "#/components/schemas/PermissionKey" }
+        groupPath: { type: string }
+        name: { type: string }
+        label: { type: string }
+        description: { type: string }
+        kind:
+          type: string
+          enum: [read, action]
+        destructive: { type: boolean }
+        scopes:
+          type: array
+          items: { type: string }
+          description: Scope types this leaf is grantable at, beyond the global scope.
+        impliedOnAncestors: { type: boolean }
+        origin:
+          type: string
+          enum: [owned, imported]
+          description: Absent means owned.
+        importedFrom: { type: string }
+    GroupMeta:
+      type: object
+      required: [path, groups, permissions]
+      properties:
+        path: { type: string }
+        label: { type: string }
+        description: { type: string }
+        groups:
+          type: array
+          items: { type: string }
+          description: Immediate child group paths.
+        permissions:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionKey" }
+          description: Immediate leaf keys.
+        origin:
+          type: string
+          enum: [owned, imported]
+        importedFrom: { type: string }
+    ScopeTypeMeta:
+      type: object
+      required: [type, parent, multiParent]
+      properties:
+        type: { type: string }
+        description: { type: string }
+        parent:
+          oneOf:
+            - { type: string }
+            - type: "null"
+        multiParent: { type: boolean }
+        requestable:
+          type: object
+          required: [policy]
+          properties:
+            prompts:
+              type: array
+              items: { $ref: "#/components/schemas/RequestPrompt" }
+            maxDurationMs: { type: integer }
+            requireExpiry: { type: boolean }
+            policy:
+              type: object
+              required: [stages]
+              properties:
+                stages:
+                  type: array
+                  items: { $ref: "#/components/schemas/ApprovalStage" }
+    NavItem:
+      type: object
+      required: [label, permission, children]
+      properties:
+        label: { type: string }
+        href: { type: string }
+        permission:
+          oneOf:
+            - { $ref: "#/components/schemas/PermissionPattern" }
+            - type: array
+              items: { $ref: "#/components/schemas/PermissionKey" }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/NavItem" }
+    PublishedCatalog:
+      type: object
+      required: [version, document]
+      properties:
+        version: { type: integer }
+        document: { $ref: "#/components/schemas/CatalogDocument" }
+    ImportManifest:
+      type: object
+      description: What an application CONSUMES — a dependency others can warn about.
+      required: [formatVersion, namespace, imports]
+      properties:
+        formatVersion: { const: 1 }
+        namespace: { type: string }
+        imports:
+          type: array
+          items: { $ref: "#/components/schemas/ImportManifestEntry" }
+    ImportManifestEntry:
+      type: object
+      required: [namespace, enumerated, entries, keys, regions]
+      properties:
+        namespace: { type: string }
+        from: { type: string }
+        enumerated:
+          type: boolean
+          description: A document was attached, so this namespace is fully enumerable.
+        entries:
+          type: array
+          items:
+            type: object
+            required: [pattern, scopes]
+            properties:
+              pattern: { $ref: "#/components/schemas/PermissionPattern" }
+              scopes:
+                type: array
+                items: { type: string }
+        keys:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionKey" }
+        regions:
+          type: array
+          items: { $ref: "#/components/schemas/PermissionPattern" }
+          description: Declared wildcards that could not be enumerated.
+    PublishedImports:
+      type: object
+      required: [version, manifest]
+      properties:
+        version: { type: integer }
+        manifest: { $ref: "#/components/schemas/ImportManifest" }
+
+    # -- metrics -------------------------------------------------------------
+    MetricsBatch:
+      type: object
+      description: >-
+        One flush window's counters. Monotonic within the window and tagged
+        with the instance id and window bounds, so many app servers' batches
+        merge wherever they land.
+      required:
+        [instanceId, windowStart, windowEnd, checks, grants, revokes, roles, principals, dropped]
+      properties:
+        instanceId: { type: string }
+        windowStart: { $ref: "#/components/schemas/EpochMs" }
+        windowEnd: { $ref: "#/components/schemas/EpochMs" }
+        checks:
+          type: array
+          items: { $ref: "#/components/schemas/CheckCounter" }
+        grants:
+          type: array
+          items: { $ref: "#/components/schemas/RowUsageCounter" }
+        revokes:
+          type: array
+          items: { $ref: "#/components/schemas/RowUsageCounter" }
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/RowUsageCounter" }
+        principals:
+          type: object
+          required: [distinct, overflowed]
+          properties:
+            distinct: { type: integer }
+            overflowed: { type: boolean }
+        dropped:
+          type: integer
+          description: Observations a cardinality cap refused to key. Never silently zero.
+    CheckCounter:
+      type: object
+      required: [permission, decision, shape, gate, scopeType, observed, estimated]
+      properties:
+        permission: { type: string }
+        decision:
+          type: string
+          enum: [allow, deny]
+        shape:
+          type: string
+          enum: [can, require, canAny, requireAny, holds, heldKeys]
+        gate: { type: boolean }
+        scopeType: { type: string }
+        scope: { $ref: "#/components/schemas/ScopeId" }
+        observed: { type: integer }
+        estimated:
+          type: number
+          description: "`observed` corrected for sampling."
+    RowUsageCounter:
+      type: object
+      required: [rowId, matched, soleMatch, estimatedMatched, estimatedSoleMatch, recentPrincipals]
+      properties:
+        rowId: { type: string }
+        matched: { type: integer }
+        soleMatch:
+          type: integer
+          description: Was the ONLY row allowing — revoking it would have denied.
+        estimatedMatched: { type: number }
+        estimatedSoleMatch: { type: number }
+        recentPrincipals:
+          type: array
+          items: { type: string }
+    UsageQueryParams:
+      type: object
+      properties:
+        query: { $ref: "#/components/schemas/UsageQuery" }
+    UsageQuery:
+      type: object
+      properties:
+        ids:
+          type: array
+          items: { type: string }
+        since: { $ref: "#/components/schemas/EpochMs" }
+        until: { $ref: "#/components/schemas/EpochMs" }
+    RowUsage:
+      type: object
+      required: [rowId, matched, soleMatch, windowStart, windowEnd, buckets]
+      properties:
+        rowId: { type: string }
+        matched: { type: number }
+        soleMatch: { type: number }
+        windowStart: { $ref: "#/components/schemas/EpochMs" }
+        windowEnd: { $ref: "#/components/schemas/EpochMs" }
+        buckets:
+          type: array
+          items:
+            type: object
+            required: [bucket, matched, soleMatch]
+            properties:
+              bucket: { $ref: "#/components/schemas/EpochMs" }
+              matched: { type: number }
+              soleMatch: { type: number }
+    PermissionUsage:
+      type: object
+      required:
+        [permission, gateAllow, gateDeny, visibilityAllow, visibilityDeny, windowStart, windowEnd, buckets]
+      properties:
+        permission: { type: string }
+        gateAllow: { type: number }
+        gateDeny: { type: number }
+        visibilityAllow: { type: number }
+        visibilityDeny: { type: number }
+        windowStart: { $ref: "#/components/schemas/EpochMs" }
+        windowEnd: { $ref: "#/components/schemas/EpochMs" }
+        buckets:
+          type: array
+          items:
+            type: object
+            required: [bucket, gateAllow, gateDeny, visibilityAllow, visibilityDeny]
+            properties:
+              bucket: { $ref: "#/components/schemas/EpochMs" }
+              gateAllow: { type: number }
+              gateDeny: { type: number }
+              visibilityAllow: { type: number }
+              visibilityDeny: { type: number }
+
+    # -- org snapshots -------------------------------------------------------
+    OrgSnapshot:
+      type: object
+      description: >-
+        The org dataset as it crosses the wire during promotion, demotion,
+        and read-model sync — the audited-handoff payload.
+      required:
+        [groups, roles, globalGrants, globalRevokes, users, pendingGlobalRequests, catalog]
+      properties:
+        groups:
+          type: array
+          items: { $ref: "#/components/schemas/UserGroup" }
+        roles:
+          type: array
+          items: { $ref: "#/components/schemas/RoleRecord" }
+        globalGrants:
+          type: array
+          items: { $ref: "#/components/schemas/GrantRow" }
+        globalRevokes:
+          type: array
+          items: { $ref: "#/components/schemas/RevokeRow" }
+        users:
+          type: array
+          items:
+            type: object
+            required: [userId, active, groupIds, orgIds, managerUserId]
+            properties:
+              userId: { type: string }
+              active: { type: boolean }
+              groupIds:
+                type: array
+                items: { type: string }
+              orgIds:
+                type: array
+                items: { type: string }
+              managerUserId:
+                oneOf:
+                  - { type: string }
+                  - type: "null"
+        pendingGlobalRequests:
+          type: array
+          items: { $ref: "#/components/schemas/AccessRequest" }
+        catalog:
+          oneOf:
+            - { $ref: "#/components/schemas/PublishedCatalog" }
+            - type: "null"

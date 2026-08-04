@@ -13,6 +13,18 @@ owns everything in between: **who may do what, where, and why**.
 | **Application** | `@alfiz/application` (+ `@alfiz/prisma`) | The local provider: the same contract implemented against **your** database through a storage seam. Standalone, it is the **org root** — the complete system for one organization, with the full feature set and no external dependency. |
 | **Alfiz Cloud** | `alfiz.dev` | The managed provider speaking the *same contract*: the hosted Dashboard (administration by relay) and Federation (catalog registry, cross-application composition, the centralized org root). Nothing in this repo depends on it, by design. |
 
+The Client/Provider split is enforced in code, not convention. The provider
+contract has three normative artifacts, held in exact correspondence by the
+type system and the test suite: the `AlfizProvider` interface, the
+`AlfizProviderBase` abstract class every provider extends, and the **Alfiz
+Provider API** — an [OpenAPI document](packages/core/openapi/alfiz-provider.v1.yaml)
+fixing the contract's wire form. Exactly two kinds of implementation exist:
+the **local** provider (`@alfiz/application`, your database) and the
+**hosted** provider (`@alfiz/hosted`, an API connection to the same contract
+served elsewhere — the seam the Dashboard and Federation ride on). Because
+the wire form is a language-agnostic document rather than a TypeScript
+export, a provider can be implemented — and consumed — from any language.
+
 Runtime checks never leave your application in any topology: every `can()`
 runs in-process against your catalog, your rows, and your resolver.
 
@@ -295,8 +307,13 @@ design; they are numbers, not audit.
 
 ## Packages
 
-- [`@alfiz/core`](packages/core) — the Client.
-- [`@alfiz/application`](packages/application) — the local provider + storage seam.
+- [`@alfiz/core`](packages/core) — the Client, the provider contract
+  (interface + abstract class), and the contract's wire form (the
+  [Alfiz Provider API OpenAPI document](packages/core/openapi/alfiz-provider.v1.yaml)).
+- [`@alfiz/application`](packages/application) — the local provider + storage
+  seam, and the handler that serves the Provider API from an Application.
+- [`@alfiz/hosted`](packages/hosted) — the hosted provider: the same contract
+  with its far side reached over the Provider API. Fetch-only.
 - [`@alfiz/prisma`](packages/prisma) — the Prisma storage driver + schema fragment.
 - [`@alfiz/verify`](packages/verify) — static verification (`alfiz-verify`).
 
@@ -311,7 +328,7 @@ crux, bulk import, deletion wiring, and the per-request snapshot pattern.
 ```
 npm install
 npm test          # vitest, all packages
-npx tsc -b packages/core packages/application packages/prisma packages/verify
+npx tsc -b packages/core packages/application packages/hosted packages/prisma packages/verify
 ```
 
 Alfiz's own administration permissions live under `alfiz_internal.*` — a

@@ -1,29 +1,29 @@
 /**
- * The relay seam, wired in-process: the RelayProvider's fetchImpl IS the
- * createRelayHandler function, so every assertion crosses the real wire
- * format — the JSON `{ op, args }` body, the `{ ok, result }` / `{ ok,
- * error }` envelope, the bearer check, and the typed error mapping — with
- * no HTTP server involved.
+ * Both ends of the Alfiz Provider API, wired in-process: the
+ * HostedProvider's fetchImpl IS the Application's createProviderHandler,
+ * so every assertion crosses the real wire format — `POST {base}/v1/{op}`,
+ * the named-field JSON bodies, the object results, the typed-error
+ * envelope with its status mapping, and the bearer check — with no HTTP
+ * server involved.
  */
 import { describe, expect, it } from "vitest";
-import type { AlfizProvider } from "@alfiz/core";
-import { GraphCycleError, ProviderWriteRejectedError } from "@alfiz/core";
+import type { AlfizProvider, InvalidationEvent, ProviderOp } from "@alfiz/core";
+import {
+  AlfizProviderBase,
+  GraphCycleError,
+  PROVIDER_API_VERSION,
+  ProviderWriteRejectedError,
+} from "@alfiz/core";
 import type {
   ApplicationOptions,
-  RelayHandlerOptions,
-  RelayOp,
-  RelayResponse,
+  ProviderHandlerOptions,
 } from "@alfiz/application";
-import {
-  RELAY_PROTOCOL_VERSION,
-  RelayTransportError,
-  createRelayHandler,
-  createRelayProvider,
-} from "@alfiz/application";
-import { admin, makeApp } from "./fixtures.js";
+import { createProviderHandler } from "@alfiz/application";
+import { HostedProvider, ProviderTransportError, createHostedProvider } from "@alfiz/hosted";
+import { admin, makeApp } from "../../application/test/fixtures.js";
 
-const SECRET = "relay-secret-from-the-link-step";
-const URL = "https://app.example/internal/alfiz-relay";
+const SECRET = "provider-secret-from-the-link-step";
+const URL_BASE = "https://app.example/internal/alfiz";
 
 const overWire =
   (handler: (request: Request) => Promise<Response>): typeof fetch =>
@@ -32,18 +32,18 @@ const overWire =
 
 function linked(
   appOverrides: Partial<ApplicationOptions> = {},
-  handlerOverrides: Partial<RelayHandlerOptions> = {},
+  handlerOverrides: Partial<ProviderHandlerOptions> = {},
 ) {
   const made = makeApp(appOverrides);
-  const handler = createRelayHandler({
+  const handler = createProviderHandler({
     application: made.app,
     storage: made.storage,
     secret: SECRET,
     applicationId: "docs",
     ...handlerOverrides,
   });
-  const provider = createRelayProvider({
-    url: URL,
+  const provider = createHostedProvider({
+    url: URL_BASE,
     secret: SECRET,
     fetchImpl: overWire(handler),
   });
@@ -53,11 +53,12 @@ function linked(
 /** A raw wire exchange, for asserting on the envelope itself. */
 async function rawCall(
   handler: (request: Request) => Promise<Response>,
-  body: unknown,
+  op: string,
+  body: unknown = {},
   secret = SECRET,
-): Promise<{ status: number; body: RelayResponse }> {
+): Promise<{ status: number; body: Record<string, unknown> }> {
   const response = await handler(
-    new Request(URL, {
+    new Request(`${URL_BASE}/v1/${op}`, {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -66,16 +67,39 @@ async function rawCall(
       body: JSON.stringify(body),
     }),
   );
-  return { status: response.status, body: (await response.json()) as RelayResponse };
+  return {
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
 }
 
-describe("relay round trips", () => {
+describe("the abstract provider base", () => {
+  it("both implementations extend AlfizProviderBase — the split, enforced in code", () => {
+    const { app, provider } = linked();
+    expect(app).toBeInstanceOf(AlfizProviderBase);
+    expect(provider).toBeInstanceOf(HostedProvider);
+    expect(provider).toBeInstanceOf(AlfizProviderBase);
+  });
+
+  it("ingestEvents fans foreign events into the hosted provider's listener stream", () => {
+    const { provider } = linked();
+    const seen: InvalidationEvent[] = [];
+    const unsubscribe = provider.onInvalidate((e) => seen.push(e));
+    provider.ingestEvents([{ type: "user", userId: "u1" }, { type: "all" }]);
+    expect(seen).toEqual([{ type: "user", userId: "u1" }, { type: "all" }]);
+    unsubscribe();
+    provider.ingestEvents([{ type: "catalog" }]);
+    expect(seen).toHaveLength(2);
+  });
+});
+
+describe("provider API round trips", () => {
   it("ping, capabilities, grants, and closure supply cross the wire", async () => {
     const { provider } = linked();
 
     const pong = await provider.ping();
     expect(pong).toEqual({
-      protocol: RELAY_PROTOCOL_VERSION,
+      api: PROVIDER_API_VERSION,
       application: "docs",
       orgRoot: true,
       hasEpoch: false,
@@ -91,8 +115,9 @@ describe("relay round trips", () => {
     expect(row.subject).toBe("user:u1");
     const listed = await provider.listGrants({ subject: "user:u1" });
     expect(listed).toEqual([row]);
+    expect(await provider.countGrants({ subject: "user:u1" })).toBe(1);
 
-    // The relayed write landed in the same provider methods local code
+    // The remote write landed in the same provider methods local code
     // calls: closure supply sees it, with the audit trail attached.
     const access = await provider.getSubjectAccess({ userId: "u1" });
     expect(access.userId).toBe("u1");
@@ -102,20 +127,33 @@ describe("relay round trips", () => {
     expect(audit.map((e) => e.action)).toEqual(["grant.create"]);
   });
 
-  it("getReportingEdges crosses as a plain record and returns as a Map", async () => {
-    const { app, handler, provider } = linked();
+  it("named-field bodies and object results are the wire shape", async () => {
+    const { app, handler } = linked();
     await app.setReportingEdge("u1", "boss", admin);
 
-    const raw = await rawCall(handler, { op: "getReportingEdges", args: [] });
-    expect(raw.body).toEqual({ ok: true, result: { u1: "boss" } });
+    // getReportingEdges crosses as a plain object…
+    const raw = await rawCall(handler, "getReportingEdges");
+    expect(raw).toEqual({ status: 200, body: { edges: { u1: "boss" } } });
 
+    // …scalar results are wrapped, never bare…
+    const count = await rawCall(handler, "countGrants", { filter: {} });
+    expect(count.body).toEqual({ count: 0 });
+
+    // …and list results are named fields of an object.
+    const ancestors = await rawCall(handler, "resolveAncestors", {
+      scope: "docs.doc:1",
+    });
+    expect(ancestors.body).toEqual({
+      ancestors: ["docs.folder:9", "docs.folder:2", "*"],
+    });
+  });
+
+  it("getReportingEdges returns as a Map; resolveAncestors is a function property", async () => {
+    const { app, provider } = linked();
+    await app.setReportingEdge("u1", "boss", admin);
     const edges = await provider.getReportingEdges();
     expect(edges).toBeInstanceOf(Map);
     expect(edges.get("u1")).toBe("boss");
-  });
-
-  it("resolveAncestors is an op on the wire, a function property in-process", async () => {
-    const { provider } = linked();
     expect(await provider.resolveAncestors("docs.doc:1")).toEqual([
       "docs.folder:9",
       "docs.folder:2",
@@ -125,14 +163,34 @@ describe("relay round trips", () => {
 });
 
 describe("typed error survival", () => {
-  it("a not_org_root rejection re-throws as ProviderWriteRejectedError", async () => {
-    const { provider } = linked({ orgRoot: false });
+  it("a not_org_root rejection re-throws as ProviderWriteRejectedError, under a 403", async () => {
+    const { handler, provider } = linked({ orgRoot: false });
     const write = provider.createRole(
       { name: "Reader", patterns: ["docs.files.read"] },
       admin,
     );
     await expect(write).rejects.toBeInstanceOf(ProviderWriteRejectedError);
     await expect(write).rejects.toMatchObject({ code: "not_org_root" });
+
+    const raw = await rawCall(handler, "createRole", {
+      input: { name: "Reader", patterns: ["docs.files.read"] },
+      provenance: admin,
+    });
+    expect(raw.status).toBe(403);
+    expect(raw.body).toMatchObject({
+      error: { name: "ProviderWriteRejectedError", code: "not_org_root" },
+    });
+  });
+
+  it("a validation rejection travels under a 422", async () => {
+    const { handler } = linked();
+    const raw = await rawCall(handler, "createGrant", {
+      input: { subject: "user:u1", pattern: "docs.nope.read", provenance: admin },
+    });
+    expect(raw.status).toBe(422);
+    expect(raw.body).toMatchObject({
+      error: { name: "ProviderWriteRejectedError", code: "validation" },
+    });
   });
 
   it("a group-parent cycle rejection keeps its code and named path", async () => {
@@ -157,13 +215,13 @@ describe("typed error survival", () => {
         throw new GraphCycleError(["eng", "web", "eng"]);
       },
     } as unknown as AlfizProvider;
-    const handler = createRelayHandler({
+    const handler = createProviderHandler({
       application,
       secret: SECRET,
       applicationId: "docs",
     });
-    const provider = createRelayProvider({
-      url: URL,
+    const provider = createHostedProvider({
+      url: URL_BASE,
       secret: SECRET,
       fetchImpl: overWire(handler),
     });
@@ -193,13 +251,12 @@ describe("epoch over the wire", () => {
     expect(since.events).toContainEqual({ type: "subject", subject: "user:u1" });
   });
 
-  it("epoch ops error with code unsupported when events.persist is off", async () => {
+  it("epoch ops error with code unsupported (501) when events.persist is off", async () => {
     const { handler, provider } = linked();
-    const raw = await rawCall(handler, { op: "epoch.head", args: [] });
-    expect(raw.status).toBe(200);
+    const raw = await rawCall(handler, "epoch.head");
+    expect(raw.status).toBe(501);
     expect(raw.body).toMatchObject({
-      ok: false,
-      error: { name: "RelayProtocolError", code: "unsupported" },
+      error: { name: "ProviderWriteRejectedError", code: "unsupported" },
     });
     await expect(provider.epoch.head()).rejects.toThrow(
       /does not persist events/,
@@ -271,54 +328,94 @@ describe("org snapshot ops", () => {
 
   it("snapshot ops error with code unsupported without the storage option", async () => {
     const { app } = makeApp();
-    const handler = createRelayHandler({
+    const handler = createProviderHandler({
       application: app,
       secret: SECRET,
       applicationId: "docs",
     });
-    const raw = await rawCall(handler, { op: "org.exportSnapshot", args: [] });
+    const raw = await rawCall(handler, "org.exportSnapshot");
+    expect(raw.status).toBe(501);
     expect(raw.body).toMatchObject({
-      ok: false,
-      error: { name: "RelayProtocolError", code: "unsupported" },
+      error: { name: "ProviderWriteRejectedError", code: "unsupported" },
     });
   });
 });
 
 describe("transport edges", () => {
-  it("a wrong secret is a 401, surfaced as RelayTransportError with the status", async () => {
+  it("a wrong secret is a 401, surfaced as ProviderTransportError with the status", async () => {
     const { handler } = linked();
-    const raw = await rawCall(handler, { op: "ping", args: [] }, "wrong");
+    const raw = await rawCall(handler, "ping", {}, "wrong");
     expect(raw.status).toBe(401);
-    expect(raw.body).toMatchObject({ ok: false });
+    expect(raw.body).toMatchObject({ error: { name: "ProviderApiError" } });
 
-    const provider = createRelayProvider({
-      url: URL,
+    const provider = createHostedProvider({
+      url: URL_BASE,
       secret: "wrong",
       fetchImpl: overWire(handler),
     });
     const call = provider.ping();
-    await expect(call).rejects.toBeInstanceOf(RelayTransportError);
+    await expect(call).rejects.toBeInstanceOf(ProviderTransportError);
     await expect(call).rejects.toMatchObject({ status: 401 });
   });
 
   it("non-POST methods are a 405", async () => {
     const { handler } = linked();
-    const response = await handler(new Request(URL, { method: "GET" }));
+    const response = await handler(
+      new Request(`${URL_BASE}/v1/ping`, { method: "GET" }),
+    );
     expect(response.status).toBe(405);
   });
 
-  it("an unknown op is a protocol error, not a crash", async () => {
+  it("an unknown op is a 404 protocol error, not a crash", async () => {
     const { handler, provider } = linked();
-    const raw = await rawCall(handler, { op: "org.selfDestruct", args: [] });
-    expect(raw.status).toBe(200);
+    const raw = await rawCall(handler, "org.selfDestruct");
+    expect(raw.status).toBe(404);
     expect(raw.body).toMatchObject({
-      ok: false,
-      error: { name: "RelayProtocolError" },
+      error: { name: "ProviderApiError", code: "unknown_op" },
     });
-    if (raw.body.ok) throw new Error("expected an error envelope");
-    expect(raw.body.error.message).toContain('unknown op "org.selfDestruct"');
+    expect((raw.body.error as { message: string }).message).toContain(
+      'unknown operation "org.selfDestruct"',
+    );
     await expect(
-      provider.call("org.selfDestruct" as RelayOp, []),
-    ).rejects.toThrow(/unknown op/);
+      provider.call("org.selfDestruct" as ProviderOp, {}),
+    ).rejects.toThrow(/unknown operation/);
+  });
+
+  it("a non-object body is a 400", async () => {
+    const { handler } = linked();
+    const response = await handler(
+      new Request(`${URL_BASE}/v1/ping`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${SECRET}` },
+        body: JSON.stringify([1, 2, 3]),
+      }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it("an empty body reads as the empty parameter object", async () => {
+    const { handler } = linked();
+    const response = await handler(
+      new Request(`${URL_BASE}/v1/ping`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${SECRET}` },
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect((await response.json()) as { api: number }).toMatchObject({
+      api: PROVIDER_API_VERSION,
+    });
+  });
+
+  it("a path without /v1/ is a 404", async () => {
+    const { handler } = linked();
+    const response = await handler(
+      new Request("https://app.example/internal/alfiz", {
+        method: "POST",
+        headers: { authorization: `Bearer ${SECRET}` },
+        body: "{}",
+      }),
+    );
+    expect(response.status).toBe(404);
   });
 });

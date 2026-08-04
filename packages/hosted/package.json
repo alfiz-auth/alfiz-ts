@@ -1,14 +1,11 @@
 {
-  "name": "@alfiz/verify",
+  "name": "@alfiz/hosted",
   "version": "0.6.0",
-  "description": "Static verification for Alfiz deployments: call-site keys checked against the catalog, gate-shape linting, coverage linting, catalog linting, and the client-reach guard for service keys. The four-point checklist enforced by tooling, not discipline.",
+  "description": "The Alfiz hosted provider: the same provider contract as @alfiz/application, with its far side reached over the Alfiz Provider API — the Dashboard and Federation seam. An API connection wrapped in the contract's abstract class; fetch-only, no Node dependency.",
   "license": "UNLICENSED",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
-  "bin": {
-    "alfiz-verify": "./dist/cli.js"
-  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -26,7 +23,7 @@
   "dependencies": {
     "@alfiz/core": "^0.6.0"
   },
-  "peerDependencies": {
-    "typescript": ">=5.5"
+  "devDependencies": {
+    "@alfiz/application": "^0.6.0"
   }
 }

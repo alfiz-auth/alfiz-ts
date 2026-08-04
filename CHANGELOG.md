@@ -1,5 +1,98 @@
 # Changelog
 
+## 0.6.0 — the provider seam, made explicit
+
+> **Breaking.** The relay module is replaced by the Alfiz Provider API and
+> the `@alfiz/hosted` package. If you mounted `createRelayHandler` or
+> called `createRelayProvider`, read the Breaking section — the rename is
+> mechanical, but the wire format underneath changed shape.
+
+The provider contract has always been the system's single load-bearing
+interface, implemented identically by the Application and the Service. What
+it lacked was enforcement: the contract lived only as a TypeScript
+interface, and its wire form lived only as an implementation detail — a
+single `{ op, args }` RPC endpoint with positional arguments, describable
+to another language by reading the source. This release makes the
+Client/Provider split explicit, in code, in three artifacts that cannot
+drift:
+
+**The abstract class.** `AlfizProviderBase` (`@alfiz/core`) is the
+contract as an implementation root. Exactly two kinds of provider extend
+it, by design:
+
+- `AlfizApplication` (`@alfiz/application`) — the **local** provider,
+  against your own database. Standalone, the org root; unchanged in what
+  it does.
+- `HostedProvider` (`@alfiz/hosted`, new package) — the **hosted**
+  provider: an API connection wrapped in the abstract class, the seam the
+  hosted Dashboard, data-plane-less consumers, and Federation attach
+  through. Fetch-only, depends on nothing but `@alfiz/core`.
+
+The base class carries only what is invariant across every implementation:
+the abstract statement of the contract (checked against the `AlfizProvider`
+interface by its `implements` clause), the invalidation-listener plumbing
+both implementations shared verbatim, `ingestEvents` for epoch replay, and
+the uniform rejection helper. A Client still attaches to the interface and
+still cannot observe which implementation it got.
+
+**The operation manifest.** `PROVIDER_OPERATIONS` (`@alfiz/core`,
+protocol.ts) names every wire-crossing operation with its read/write kind
+and capability gate. A compile-time assertion holds it in exact
+correspondence with the interface: add a contract method without a manifest
+entry — or a manifest entry naming nothing — and the build fails, naming
+the drifted method.
+
+**The OpenAPI document.** The Alfiz Provider API
+(`packages/core/openapi/alfiz-provider.v1.yaml`, shipped in the
+`@alfiz/core` package) fixes the contract's wire form, and the test suite
+holds it to the manifest: one `POST {base}/v1/{op}` per operation,
+named-field JSON bodies, object results, and a typed-error envelope under
+correct HTTP statuses. The document is normative and language-agnostic —
+the reason it exists. A provider (or consumer) in Go, Python, or anything
+else is "the abstract class's surface, served over this API"; nothing about
+the wire is discoverable only by reading TypeScript.
+
+The wire conventions the document encodes, stated once: every operation is
+a POST with a JSON object body of named parameters (`{}` when there are
+none); every success is a 200 with a JSON *object* — never a bare array,
+primitive, or null — so any response can grow a field without a wire
+break; every failure carries the typed envelope, with the status as a
+transport hint (403 `not_org_root`, 409 `conflict`/`graph_cycle`, 422
+`validation`, 404 `not_found`, 501 `unsupported`). `ProviderWriteRejectedError`
+codes and `GraphCycleError` paths survive the wire and re-throw intact, so
+a dashboard renders "cycle: a → b → a" identically for local and remote
+writes. The live `onInvalidate` stream still never crosses: the epoch
+operations remain the cross-process invalidation transport.
+
+### Breaking
+
+- `createRelayHandler` → `createProviderHandler` (`@alfiz/application`).
+  Mount it under a catch-all so `POST {base}/v1/{op}` reaches it; the old
+  single-endpoint mount no longer matches anything.
+- `createRelayProvider` / `RelayProvider` → `createHostedProvider` /
+  `HostedProvider`, moved to the new `@alfiz/hosted` package. The
+  constructor target is unchanged (`url`, `secret`, `timeoutMs`,
+  `fetchImpl`) — `url` is now the base URL below which `/v1/{op}` paths
+  are appended.
+- The wire format changed from `{ op, args }` positional RPC at one URL to
+  per-operation paths with named-field bodies, per the OpenAPI document.
+  Both ends of a link must upgrade together.
+- `RelayTransportError` → `ProviderTransportError`; protocol-level
+  rejections (bad credentials, unknown op, malformed body) surface as
+  `ProviderTransportError` with the status, while provider-domain errors
+  re-throw typed exactly as before. `RelayWireError` → `ProviderWireError`;
+  `toWireError` → `toProviderWireError`; `RELAY_PROTOCOL_VERSION` →
+  `PROVIDER_API_VERSION` (now `1`, carried in the path prefix and the
+  `ping` result's `api` field). `RelayPingResult` → `ProviderPingResult`.
+- `OrgSnapshot` and `ApplyOrgSnapshotInput` moved to `@alfiz/core` — they
+  are wire-contract types now, alongside `ProviderWireError` and the
+  operation manifest. `@alfiz/application` still re-exports them, so
+  existing imports keep compiling.
+- Capability-gated absences (epoch off, no metrics store, no storage for
+  snapshot ops) now answer with `ProviderWriteRejectedError` code
+  `unsupported` under a 501, where the relay answered with a
+  `RelayProtocolError` inside a 200.
+
 ## 0.5.2 — imported permissions
 
 > **A patch number carrying two breaking changes.** Read the Breaking
