@@ -267,10 +267,13 @@ export function applyDecision(
 
 /**
  * Runs consecutive auto stages from the request's current stage: each passing
- * predicate records an `auto` approval and advances; the first failing
- * predicate simply falls through to the next stage (auto stages gate nothing
- * — they accelerate). Returns the settled request (possibly fully approved
- * with a grant plan).
+ * predicate records an `auto` approval and advances; a failing predicate
+ * falls through to the next stage (auto stages accelerate — they never gate
+ * a later human stage). The single exception is a failing FINAL auto stage,
+ * which auto-DENIES: with nothing to fall through to, the alternative is a
+ * request pending forever at a stage no human can decide, and a recorded
+ * denial the requester can act on beats an undecidable limbo. Returns the
+ * settled request (possibly fully approved with a grant plan).
  */
 export function runAutoStages(
   request: AccessRequest,
@@ -306,10 +309,20 @@ export function runAutoStages(
       // Predicate not met: the auto stage abstains; move to the next stage
       // without recording a decision.
       if (current.stageIndex + 1 >= current.stages.length) {
-        // Nothing after the failed auto stage can approve this request; it
-        // stays pending at a stage no one can decide unless a later stage
-        // exists. Guard: a policy whose stages are exhausted without approval
-        // remains pending for explicit administrative decision.
+        // A failing FINAL auto stage has nothing to fall through to. Before
+        // 0.7.0 the request stayed pending at a stage no human can decide —
+        // permanently undecidable except by admin override. Fail closed
+        // instead: the request is DENIED, decided by `auto`, with the
+        // outcome recorded and requestable again the moment circumstances
+        // change. This is the one place an auto stage decides negatively,
+        // and only because the alternative is no decision at all.
+        const denied = applyDecision(current, {
+          decidedBy: "auto",
+          decision: "denied",
+          at: now,
+          note: "auto-denied: the final auto stage's predicate was not met and no later stage can decide",
+        });
+        current = denied.request;
         break;
       }
       current = { ...current, stageIndex: current.stageIndex + 1 };

@@ -208,11 +208,28 @@ describe("runAutoStages", () => {
     expect(result.request.decisions.length).toBe(1);
   });
 
-  it("a failing sole auto stage leaves the request pending for admin decision", () => {
+  it("a failing FINAL auto stage auto-denies instead of stranding the request", () => {
     const req = request([{ kind: "auto", predicate: { type: "in_group", groupId: "admins" } }]);
     const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
+    // Pre-0.7.0 this stayed pending at a stage no human could decide —
+    // undecidable except by admin override. Now it fails closed with a
+    // recorded decision the requester can see and re-request against.
+    expect(result.request.state).toBe("denied");
+    expect(result.grantPlan).toBeUndefined();
+    const decision = result.request.decisions.at(-1)!;
+    expect(decision.decidedBy).toBe("auto");
+    expect(decision.decision).toBe("denied");
+  });
+
+  it("a failing NON-final auto stage still abstains and falls through", () => {
+    const req = request([
+      { kind: "auto", predicate: { type: "in_group", groupId: "admins" } },
+      { kind: "named_approvers", roleId: "owners" },
+    ]);
+    const result = runAutoStages(req, teacherCtx, NOW, CATALOG_KEYS);
     expect(result.request.state).toBe("pending");
-    expect(result.request.stageIndex).toBe(0);
+    expect(result.request.stageIndex).toBe(1);
+    expect(result.request.decisions).toHaveLength(0);
   });
 });
 

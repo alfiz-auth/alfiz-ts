@@ -69,7 +69,11 @@ import {
 } from "./metrics.js";
 import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
-import { AccessDeniedError, UnknownPermissionError } from "./errors.js";
+import {
+  AccessDeniedError,
+  MissingConditionError,
+  UnknownPermissionError,
+} from "./errors.js";
 import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { namespaceOf, patternMatchesKey } from "./grammar.js";
 import type {
@@ -117,11 +121,26 @@ export interface AlfizClientOptions {
    * refetch, stale data is never served past its window on error).
    *
    * Requires a provider exposing `epoch` (the Application's
-   * `events.persist`); silently inert otherwise. 5 000 is a good default
-   * for most deployments. Off (undefined) by default — TTL-only caching,
-   * exactly the pre-epoch behavior.
+   * `events.persist`); inert otherwise.
+   *
+   * **On by default when the provider exposes an epoch** (window 5 000 ms)
+   * — since 0.7.0 the safe configuration is the default one, and the
+   * cross-process revocation bound is the revalidation window rather than
+   * the blind TTL wherever the deployment can support it. Pass a number to
+   * choose the window, or `false` to opt out and return to TTL-only
+   * caching. Against a provider with no epoch this setting is inert and
+   * TTL-only caching is what remains.
    */
-  revalidateAfterMs?: number;
+  revalidateAfterMs?: number | false;
+  /**
+   * The incident switch: `true` makes EVERY check on every surface bypass
+   * both cache tiers — fresh closure supply, fresh ancestry, per check —
+   * exactly as if each call were `can.fresh`. Propagation bounds collapse
+   * to zero; every check pays provider round-trips. Meant to be wired to
+   * an environment variable and flipped during a security incident
+   * ("revocations must land NOW"), then flipped back. Default false.
+   */
+  strict?: boolean;
   /**
    * Optional shared cache tier (L2) between the in-process maps and the
    * provider — see {@link CacheStore}. Read order is L1 → L2 → provider;
@@ -351,6 +370,8 @@ export class AlfizClient<
    * pre-epoch contract — instead of being renewed indefinitely.
    */
   private readonly revalidateAfter: number | undefined;
+  /** The incident switch — see {@link AlfizClientOptions.strict}. */
+  private readonly strict: boolean;
   private knownSeq: number | null = null;
   private lastValidatedAt = 0;
   private validationGen = 0;
@@ -379,12 +400,21 @@ export class AlfizClient<
     this.objectTtl = options.objectCacheTtlMs ?? 60_000;
     this.maxSubjects = options.maxSubjectCacheEntries ?? 10_000;
     this.maxObjects = options.maxObjectCacheEntries ?? 10_000;
-    this.revalidateAfter = options.revalidateAfterMs;
+    this.strict = options.strict ?? false;
+    // Safe-by-default: a provider that CAN prove freshness (it exposes the
+    // persisted event log) is revalidated against by default; TTL-only
+    // caching is the explicit opt-out (`revalidateAfterMs: false`), not the
+    // silent default.
+    this.revalidateAfter =
+      options.revalidateAfterMs === false
+        ? undefined
+        : (options.revalidateAfterMs ??
+          (options.provider.epoch !== undefined ? 5_000 : undefined));
     this.cacheStore = options.cacheStore;
     this.cachePrefix = options.cacheKeyPrefix ?? "alfiz:v1:";
     this.cacheStoreTtl =
       options.cacheStoreTtlMs ??
-      (options.revalidateAfterMs !== undefined
+      (this.revalidateAfter !== undefined
         ? 600_000
         : Math.max(
             options.subjectCacheTtlMs ?? 30_000,
@@ -765,6 +795,7 @@ export class AlfizClient<
     principal: PrincipalRef,
     fresh: boolean,
   ): Promise<SubjectAccessData> {
+    if (this.strict) fresh = true;
     const key = principalKey(principal);
     if (!fresh) {
       const gate = this.maybeValidate();
@@ -816,6 +847,7 @@ export class AlfizClient<
     scope: ScopeId | undefined,
     fresh: boolean,
   ): Promise<ScopeId[]> {
+    if (this.strict) fresh = true;
     if (scope === undefined || scope === GLOBAL_SCOPE) return [GLOBAL_SCOPE];
     if (!fresh) {
       const gate = this.maybeValidate();
@@ -1005,6 +1037,18 @@ export class AlfizClient<
       ? (key as readonly string[])
       : [key as string];
     this.assertKeys(keys, shape);
+    // The condition seam, verified BEFORE evaluation exactly like unknown
+    // keys: a missing predicate is a programming error to raise, never a
+    // denial to answer. See CheckOptions.condition.
+    const condition = options?.condition;
+    if (condition === undefined) {
+      const needing = keys.find(
+        (k) => this.catalog.leaf(k)?.requiresCondition === true,
+      );
+      if (needing !== undefined) {
+        throw new MissingConditionError(needing, shape);
+      }
+    }
     // Sampled BEFORE the work, so an unsampled check never pays for
     // attribution — and so the decision is one comparison, not a branch per
     // matched row further down.
@@ -1049,6 +1093,14 @@ export class AlfizClient<
     for (const k of keys) {
       const explanation = explainKey(ctx, k, closure);
       if (explanation.allowed) {
+        // The condition is the FINAL AND: rows first (cheap, cached), then
+        // the application's predicate — a false observes as a deny, with
+        // the matched rows kept so attribution can still say which grant
+        // WOULD have allowed.
+        if (condition !== undefined && !(await condition())) {
+          observe("deny", k, { grants: explanation.matchedGrants });
+          return false;
+        }
         observe("allow", k, { grants: explanation.matchedGrants });
         return true;
       }
@@ -1063,6 +1115,10 @@ export class AlfizClient<
         if (!this.catalog.leaf(k)?.impliedOnAncestors) continue;
         const implying = await this.checkImplied(ctx, k, scope, fresh);
         if (implying !== null) {
+          if (condition !== undefined && !(await condition())) {
+            observe("deny", k, { grants: implying, implied: true });
+            return false;
+          }
           observe("allow", k, { grants: implying, implied: true });
           return true;
         }

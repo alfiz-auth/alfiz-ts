@@ -4,7 +4,7 @@ import {
   driverContractCases,
   eventLogContractCases,
   metricsContractCases,
-} from "./driver-suite.js";
+} from "../src/driver-suite.js";
 
 describe("memoryDriver passes the storage contract", () => {
   for (const testCase of [

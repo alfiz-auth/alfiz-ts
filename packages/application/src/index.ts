@@ -9,6 +9,7 @@
  */
 
 export * from "./storage.js";
+export * from "./audit-chain.js";
 export * from "./memory.js";
 export * from "./application.js";
 export * from "./events.js";

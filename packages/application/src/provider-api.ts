@@ -49,9 +49,11 @@ import {
   PROVIDER_API_VERSION,
   PROVIDER_OPERATIONS,
   ProviderWriteRejectedError,
+  createAlfizClient,
   providerErrorStatus,
   toProviderWireError,
 } from "@alfiz/core";
+import type { AlfizClient } from "@alfiz/core";
 import type { AlfizApplication } from "./application.js";
 import type { StorageDriver } from "./storage.js";
 
@@ -98,6 +100,36 @@ function secretMatches(header: string | null, secret: string): boolean {
 const KNOWN_OPS: ReadonlySet<string> = new Set(
   PROVIDER_OPERATIONS.map((o) => o.op),
 );
+
+/**
+ * The evaluator behind the `check` operation: one client per handler,
+ * created on first use, over the application's own catalog and provider
+ * surface — the same closure caches and safe defaults every in-process
+ * client gets, so repeated remote checks for one principal cost one
+ * closure supply, not one per call.
+ */
+const checkClients = new WeakMap<
+  ProviderHandlerOptions,
+  AlfizClient<string, string, string>
+>();
+function checkClientFor(
+  options: ProviderHandlerOptions,
+  app: AlfizProvider,
+): AlfizClient<string, string, string> {
+  let client = checkClients.get(options);
+  if (client === undefined) {
+    const catalog = (app as AlfizApplication).catalog;
+    if (catalog === undefined) {
+      throw new ProviderWriteRejectedError(
+        "the check operation needs an Application (a provider with a catalog) on the serving side",
+        "unsupported",
+      );
+    }
+    client = createAlfizClient({ catalog, provider: app });
+    checkClients.set(options, client);
+  }
+  return client;
+}
 
 /** A protocol-level failure: not an error the provider threw, one the API did. */
 function apiError(
@@ -240,6 +272,15 @@ export async function handleProviderOp(
           return { ...(await app.getSubjectAccess(b.principal)) };
         case "resolveAncestors":
           return { ancestors: await app.resolveAncestors(b.scope) };
+
+        // -- evaluation (the non-JS check path) ------------------------------
+        case "check": {
+          const client = checkClientFor(options, app);
+          const allowed = b.fresh
+            ? await client.can.fresh(b.principal, b.key, b.scope)
+            : await client.can(b.principal, b.key, b.scope);
+          return { allowed };
+        }
 
         // -- invalidation ----------------------------------------------------
         case "epoch.head": {

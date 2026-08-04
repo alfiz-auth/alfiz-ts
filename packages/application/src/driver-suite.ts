@@ -2,10 +2,21 @@
  * The storage-driver contract suite: every driver — memory, Prisma, or
  * yours — must pass these cases unchanged. Framework-free: cases are
  * (name, run) pairs using node:assert, so any test runner can host them.
+ *
+ * Published as `@alfiz/application/driver-suite` so a custom driver is held
+ * to the same contract the bundled drivers are — including the
+ * `runExclusive` serialization case that keeps graph-cycle detection sound
+ * under concurrency. A driver package's test file is three lines:
+ *
+ * ```ts
+ * import { driverContractCases, eventLogContractCases, metricsContractCases }
+ *   from "@alfiz/application/driver-suite";
+ * for (const c of driverContractCases) test(c.name, () => c.run(makeDriver()));
+ * ```
  */
 
 import assert from "node:assert/strict";
-import type { StorageDriver } from "@alfiz/application";
+import type { StorageDriver } from "./storage.js";
 import type { AccessRequest, GrantRow, RevokeRow } from "@alfiz/core";
 
 export interface DriverCase {
@@ -244,6 +255,36 @@ export const driverContractCases: DriverCase[] = [
     },
   },
   {
+    name: "catalog: history retained per version when supported",
+    async run(driver) {
+      const doc = (marker: string) =>
+        ({
+          formatVersion: 1,
+          namespace: "docs",
+          namespaces: ["docs"],
+          leaves: [],
+          groups: [],
+          scopeTypes: [],
+          navigation: [],
+          conventions: { depth: 3 },
+          // Distinguish versions through an ignored-but-stored field shape.
+          ...(marker ? {} : {}),
+        }) as Parameters<StorageDriver["putCatalog"]>[1];
+      if (!driver.getCatalogVersion || !driver.listCatalogVersions) return;
+      await driver.putCatalog(1, doc("a"), 100);
+      await driver.putCatalog(2, doc("b"), 200);
+      const head = await driver.getCatalog();
+      assert.equal(head!.version, 2);
+      const v1 = await driver.getCatalogVersion(1);
+      assert.equal(v1!.publishedAt, 100);
+      assert.deepEqual(
+        (await driver.listCatalogVersions()).map((v) => v.version),
+        [1, 2],
+      );
+      assert.equal(await driver.getCatalogVersion(99), null);
+    },
+  },
+  {
     name: "audit: append-only with target filter and limit",
     async run(driver) {
       for (let i = 0; i < 5; i++) {
@@ -262,6 +303,75 @@ export const driverContractCases: DriverCase[] = [
         limited.map((e) => e.id),
         ["a3", "a4"],
       );
+    },
+  },
+  {
+    name: "audit: actor/action/time-range filters and (at, id) cursor paging",
+    async run(driver) {
+      for (let i = 0; i < 6; i++) {
+        await driver.appendAudit({
+          id: `a${i}`,
+          at: Math.floor(i / 2), // two events per millisecond: a0/a1 at 0, …
+          actor: i < 3 ? "root" : "ops",
+          action: i % 2 === 0 ? "grant.create" : "grant.delete",
+          target: "t",
+        });
+      }
+      assert.equal((await driver.listAudit({ actor: "ops" })).length, 3);
+      assert.equal(
+        (await driver.listAudit({ action: "grant.create" })).length,
+        3,
+      );
+      // from is inclusive, to exclusive.
+      assert.deepEqual(
+        (await driver.listAudit({ from: 1, to: 2 })).map((e) => e.id),
+        ["a2", "a3"],
+      );
+      // Cursor paging: ascending (at, id), exclusive, stable across ties.
+      const page1 = await driver.listAudit({
+        cursor: { at: 0, id: "a0" },
+        limit: 2,
+      });
+      assert.deepEqual(
+        page1.map((e) => e.id),
+        ["a1", "a2"],
+      );
+      const last1 = page1[page1.length - 1]!;
+      const page2 = await driver.listAudit({
+        cursor: { at: last1.at, id: last1.id },
+        limit: 10,
+      });
+      assert.deepEqual(
+        page2.map((e) => e.id),
+        ["a3", "a4", "a5"],
+      );
+    },
+  },
+  {
+    name: "audit: hash fields round-trip when present",
+    async run(driver) {
+      await driver.appendAudit({
+        id: "h1",
+        at: 1,
+        actor: "root",
+        action: "grant.create",
+        target: "t",
+        hash: "abc",
+      });
+      await driver.appendAudit({
+        id: "h2",
+        at: 2,
+        actor: "root",
+        action: "grant.create",
+        target: "t",
+        prevHash: "abc",
+        hash: "def",
+      });
+      const [e1, e2] = await driver.listAudit();
+      assert.equal(e1!.hash, "abc");
+      assert.equal(e1!.prevHash, undefined);
+      assert.equal(e2!.prevHash, "abc");
+      assert.equal(e2!.hash, "def");
     },
   },
   {

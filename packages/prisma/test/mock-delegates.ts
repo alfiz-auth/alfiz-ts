@@ -17,6 +17,8 @@
 
 import type {
   AlfizAuditRecord,
+  AlfizAuditWhere,
+  AlfizCatalogVersionRecord,
   AlfizCatalogRecord,
   AlfizGrantRecord,
   AlfizGrantWhere,
@@ -55,6 +57,7 @@ export function mockDelegates(): AlfizPrismaDelegates {
   const epochs = new Map<number, AlfizEpochRecord>();
   const events: AlfizEventRecord[] = [];
   const audits: AlfizAuditRecord[] = [];
+  const catalogVersions = new Map<number, AlfizCatalogVersionRecord>();
   const metrics = new Map<string, AlfizMetricRecord>();
 
   const matchingGrants = (where?: AlfizGrantWhere): AlfizGrantRecord[] =>
@@ -323,6 +326,41 @@ export function mockDelegates(): AlfizPrismaDelegates {
       },
     },
 
+    alfizCatalogVersion: {
+      async upsert({ where, create, update }) {
+        const existing = catalogVersions.get(where.version);
+        const row: AlfizCatalogVersionRecord =
+          existing === undefined
+            ? clone({
+                version: create.version,
+                document: create.document,
+                publishedAt: BigInt(create.publishedAt),
+              })
+            : clone({
+                ...existing,
+                ...(update.document !== undefined
+                  ? { document: update.document }
+                  : {}),
+                ...(update.publishedAt !== undefined
+                  ? { publishedAt: BigInt(update.publishedAt) }
+                  : {}),
+              });
+        catalogVersions.set(where.version, row);
+        return clone(row);
+      },
+      async findUnique({ where }) {
+        const row = catalogVersions.get(where.version);
+        return row === undefined ? null : clone(row);
+      },
+      async findMany(args) {
+        const rows = [...catalogVersions.values()];
+        if (args?.orderBy !== undefined) {
+          rows.sort((a, b) => a.version - b.version);
+        }
+        return rows.map(clone);
+      },
+    },
+
     alfizAudit: {
       async create({ data }) {
         if (audits.some((a) => a.id === data.id)) {
@@ -336,18 +374,49 @@ export function mockDelegates(): AlfizPrismaDelegates {
           target: data.target,
           // Omitted optional Json column → SQL NULL.
           detail: data.detail ?? null,
+          prevHash: data.prevHash ?? null,
+          hash: data.hash ?? null,
         });
         audits.push(row);
         return clone(row);
       },
       async findMany(args) {
+        const matches = (row: AlfizAuditRecord, where: AlfizAuditWhere): boolean => {
+          if (where.target !== undefined && row.target !== where.target) return false;
+          if (where.actor !== undefined && row.actor !== where.actor) return false;
+          if (where.action !== undefined && row.action !== where.action) return false;
+          if (where.at !== undefined) {
+            if (typeof where.at === "bigint") {
+              if (row.at !== where.at) return false;
+            } else {
+              if (where.at.gte !== undefined && row.at < where.at.gte) return false;
+              if (where.at.lt !== undefined && row.at >= where.at.lt) return false;
+              if (where.at.gt !== undefined && row.at <= where.at.gt) return false;
+            }
+          }
+          if (where.id?.gt !== undefined && row.id <= where.id.gt) return false;
+          if (where.OR !== undefined && !where.OR.some((w) => matches(row, w))) {
+            return false;
+          }
+          return true;
+        };
         let rows = [...audits];
-        const target = args?.where?.target;
-        if (target !== undefined) rows = rows.filter((r) => r.target === target);
+        if (args?.where !== undefined) {
+          rows = rows.filter((r) => matches(r, args.where!));
+        }
         if (args?.orderBy !== undefined) {
-          // Stable sort: ties keep insertion order, as a DB with a secondary
-          // key would.
-          rows.sort((a, b) => (a.at < b.at ? -1 : a.at > b.at ? 1 : 0));
+          // (at, id) — as the compound index would order.
+          rows.sort((a, b) =>
+            a.at !== b.at
+              ? a.at < b.at
+                ? -1
+                : 1
+              : a.id < b.id
+                ? -1
+                : a.id > b.id
+                  ? 1
+                  : 0,
+          );
         }
         const take = args?.take;
         if (take !== undefined) {

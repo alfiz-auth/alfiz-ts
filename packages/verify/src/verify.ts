@@ -29,6 +29,7 @@ export interface VerifyIssue {
     | "unknown-import"
     | "implicit-import"
     | "visibility-as-gate"
+    | "missing-condition"
     | "ungated-action"
     | "unreferenced-leaf"
     | "client-reachable-secret"
@@ -501,6 +502,8 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
         if (name !== null && (gates.has(name) || visibility.has(name))) {
           for (const fn of enclosingFunctions(node)) gatedFunctions.add(fn);
 
+          /** Keys in this call declared `requiresCondition: true`. */
+          const conditionKeys: string[] = [];
           for (const arg of node.arguments) {
             for (const literal of literalsIn(arg)) {
               const text = literal.text;
@@ -530,6 +533,12 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
 
               if (catalog.hasKey(text)) {
                 referencedKeys.add(text);
+                if (
+                  gates.has(name) &&
+                  catalog.leaf(text)?.requiresCondition === true
+                ) {
+                  conditionKeys.push(text);
+                }
               } else if (!catalog.isKnownPattern(text)) {
                 // The near-miss a newcomer hits first: a GROUP path where a
                 // pattern belongs. `"admin"` is a valid shape and a declared
@@ -571,6 +580,47 @@ export function verifyProject(options: VerifyOptions): VerifyReport {
               line: lineOf(source, node),
               message: `${name}() is a visibility affordance, never a gate — server actions and route handlers gate on a concrete permission (can/require*)`,
             });
+          }
+
+          // The condition seam's static half: a gate for a
+          // `requiresCondition` key must visibly carry a `condition`. The
+          // check is syntax-level and honest about it: an options object
+          // built elsewhere (an identifier, a call, a spread) is accepted
+          // here and caught at runtime instead — what this rule exists to
+          // catch is the common literal call site with no predicate at all.
+          if (conditionKeys.length > 0) {
+            const last = node.arguments[node.arguments.length - 1];
+            const carriesCondition = (() => {
+              if (last === undefined) return false;
+              if (ts.isObjectLiteralExpression(last)) {
+                return last.properties.some(
+                  (prop) =>
+                    ts.isSpreadAssignment(prop) ||
+                    (prop.name !== undefined &&
+                      ts.isIdentifier(prop.name) &&
+                      prop.name.text === "condition"),
+                );
+              }
+              // A literal key/pattern, array, or template as the last
+              // argument cannot be an options object; anything opaque might.
+              return !(
+                ts.isStringLiteralLike(last) ||
+                ts.isArrayLiteralExpression(last) ||
+                ts.isNumericLiteral(last)
+              );
+            })();
+            if (!carriesCondition) {
+              report({
+                severity: "error",
+                rule: "missing-condition",
+                file,
+                line: lineOf(source, node),
+                message:
+                  `${formatAlternatives(conditionKeys)} ${conditionKeys.length > 1 ? "are" : "is"} declared \`requiresCondition: true\` — ` +
+                  `the gate must pass \`{ condition: () => … }\` evaluating the resource predicate; ` +
+                  `without it the check throws MissingConditionError at runtime`,
+              });
+            }
           }
         }
       }

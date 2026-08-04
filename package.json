@@ -3,6 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "description": "Alfiz — the authorization layer. Client, Application provider, and tooling.",
+  "license": "MIT",
   "type": "module",
   "workspaces": [
     "packages/*"
@@ -12,6 +13,7 @@
     "build:all": "npm run build",
     "publish:all": "npm run build && npm --workspace=packages/core publish && npm --workspace=packages/application publish && npm --workspace=packages/verify publish && npm --workspace=packages/prisma publish",
     "test": "vitest run",
+    "bench": "npm run build && node scripts/bench.mjs",
     "test:watch": "vitest",
     "typecheck": "npm run build"
   },

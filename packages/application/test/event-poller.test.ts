@@ -39,6 +39,7 @@ describe("startEventPoller", () => {
     const app = createApplication({
       catalog: testCatalog(),
       storage: memoryDriver(),
+      events: { persist: false },
     });
     expect(() => startEventPoller(app)).toThrow(/events\.persist/);
   });

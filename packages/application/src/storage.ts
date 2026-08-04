@@ -59,8 +59,22 @@ export interface RequestStorageFilter {
   requesterUserId?: string | undefined;
 }
 
+/**
+ * The audit read filter — `AuditQuery` from the contract, restated at the
+ * storage seam. Ordering is (`at`, then `id`); without `cursor` the driver
+ * returns the LAST `limit` matching events in that order, with `cursor` the
+ * first `limit` strictly after it (export paging).
+ */
 export interface AuditFilter {
   target?: string | undefined;
+  actor?: string | undefined;
+  action?: string | undefined;
+  /** Inclusive lower bound on `at` (epoch ms). */
+  from?: number | undefined;
+  /** Exclusive upper bound on `at` (epoch ms). */
+  to?: number | undefined;
+  /** Resume after this position (exclusive). */
+  cursor?: { at: number; id: string } | undefined;
   limit?: number | undefined;
 }
 
@@ -117,8 +131,24 @@ export interface StorageDriver {
   listRequests(filter?: RequestStorageFilter): Promise<AccessRequest[]>;
 
   // -- catalog --------------------------------------------------------------
-  putCatalog(version: number, document: CatalogDocument): Promise<void>;
+  /**
+   * Stores the new head AND, when the driver supports history, retains the
+   * version row (`publishedAt` epoch ms, supplied by the Application). The
+   * wildcard-drift report reads history; a driver without the optional
+   * history methods keeps only the head, and drift is answered
+   * `unsupported` rather than wrongly.
+   */
+  putCatalog(
+    version: number,
+    document: CatalogDocument,
+    publishedAt?: number,
+  ): Promise<void>;
   getCatalog(): Promise<{ version: number; document: CatalogDocument } | null>;
+  /** OPTIONAL — catalog history: one retained document per published version. */
+  getCatalogVersion?(
+    version: number,
+  ): Promise<{ version: number; document: CatalogDocument; publishedAt: number } | null>;
+  listCatalogVersions?(): Promise<Array<{ version: number; publishedAt: number }>>;
 
   // -- imports (OPTIONAL) ---------------------------------------------------
   // What the application CONSUMES, stored separately from what it publishes.

@@ -106,7 +106,8 @@ describe("provider API round trips", () => {
       api: PROVIDER_API_VERSION,
       application: "docs",
       orgRoot: true,
-      hasEpoch: false,
+      // 0.7.0: event persistence defaults ON with a capable driver.
+      hasEpoch: true,
       auditOptIn: false,
     });
     expect((await provider.capabilities()).requests).toBe(true);
@@ -256,7 +257,7 @@ describe("epoch over the wire", () => {
   });
 
   it("epoch ops error with code unsupported (501) when events.persist is off", async () => {
-    const { handler, provider } = linked();
+    const { handler, provider } = linked({ events: { persist: false } });
     const raw = await rawCall(handler, "epoch.head");
     expect(raw.status).toBe(501);
     expect(raw.body).toMatchObject({
@@ -421,5 +422,70 @@ describe("transport edges", () => {
       }),
     );
     expect(response.status).toBe(404);
+  });
+});
+
+describe("the check operation (the non-JS check path)", () => {
+  it("evaluates a gate on the serving side, any-of and scoped forms included", async () => {
+    const { app, handler } = linked();
+    await app.createGrant({
+      subject: "user:u1",
+      pattern: "docs.files.read",
+      scope: "docs.folder:9",
+      provenance: admin,
+    });
+
+    const scoped = await rawCall(handler, "check", {
+      principal: { userId: "u1" },
+      key: "docs.files.read",
+      scope: "docs.doc:1", // child of folder:9 in the fixture ancestry
+    });
+    expect(scoped).toEqual({ status: 200, body: { allowed: true } });
+
+    const denied = await rawCall(handler, "check", {
+      principal: { userId: "u1" },
+      key: "docs.files.read",
+      scope: "docs.folder:77",
+    });
+    expect(denied.body).toEqual({ allowed: false });
+
+    const anyOf = await rawCall(handler, "check", {
+      principal: { userId: "u1" },
+      key: ["docs.admin.manage_settings", "docs.files.read"],
+      scope: "docs.folder:9",
+    });
+    expect(anyOf.body).toEqual({ allowed: true });
+  });
+
+  it("fresh: true sees a revocation immediately", async () => {
+    const { app, handler } = linked();
+    const row = await app.createGrant({
+      subject: "user:u2",
+      pattern: "docs.files.read",
+      provenance: admin,
+    });
+    expect(
+      (await rawCall(handler, "check", { principal: { userId: "u2" }, key: "docs.files.read" }))
+        .body,
+    ).toEqual({ allowed: true });
+    await app.deleteGrant(row.id, admin);
+    const after = await rawCall(handler, "check", {
+      principal: { userId: "u2" },
+      key: "docs.files.read",
+      fresh: true,
+    });
+    expect(after.body).toEqual({ allowed: false });
+  });
+
+  it("an unknown key answers with the typed error envelope, never a decision", async () => {
+    const { handler } = linked();
+    const raw = await rawCall(handler, "check", {
+      principal: { userId: "u1" },
+      key: "docs.files.raed",
+    });
+    expect(raw.status).toBeGreaterThanOrEqual(400);
+    expect((raw.body as { error: { name: string } }).error.name).toBe(
+      "UnknownPermissionError",
+    );
   });
 });

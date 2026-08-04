@@ -33,6 +33,7 @@ import type {
   AlfizProvider,
   ApplyOrgSnapshotInput,
   AuditEvent,
+  AuditQuery,
   CatalogDocument,
   EpochSource,
   GrantInput,
@@ -433,10 +434,7 @@ export class HostedProvider extends AlfizProviderBase {
   }
 
   // -- audit -----------------------------------------------------------------
-  async listAuditEvents(filter?: {
-    target?: string | undefined;
-    limit?: number | undefined;
-  }): Promise<AuditEvent[]> {
+  async listAuditEvents(filter?: AuditQuery): Promise<AuditEvent[]> {
     return (
       await this.call<{ events: AuditEvent[] }>("listAuditEvents", { filter })
     ).events;

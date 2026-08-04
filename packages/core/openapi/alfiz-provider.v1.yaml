@@ -161,6 +161,49 @@ paths:
                     items: { $ref: "#/components/schemas/ScopeId" }
         default: { $ref: "#/components/responses/Error" }
 
+  /v1/check:
+    post:
+      operationId: check
+      tags: [evaluation]
+      summary: >-
+        The non-JS check path: the serving APPLICATION evaluates the gate
+        in-process against its own catalog, rows, and resolver — the same
+        evaluator every local check uses. Serve this from your own
+        infrastructure; nothing Alfiz operates is ever on the path. An
+        array key is any-of, exactly as `can`. Keys declared
+        `requiresCondition: true` answer with an error envelope
+        (`MissingConditionError`): conditions are in-process predicates by
+        design and cannot cross a wire.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [principal, key]
+              properties:
+                principal: { $ref: "#/components/schemas/PrincipalRef" }
+                key:
+                  oneOf:
+                    - { $ref: "#/components/schemas/PermissionKey" }
+                    - type: array
+                      items: { $ref: "#/components/schemas/PermissionKey" }
+                scope: { $ref: "#/components/schemas/ScopeId" }
+                fresh:
+                  type: boolean
+                  description: Bypass the serving side's closure caches for this check.
+      responses:
+        "200":
+          description: The decision.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed]
+                properties:
+                  allowed: { type: boolean }
+        default: { $ref: "#/components/responses/Error" }
+
   /v1/epoch.head:
     post:
       operationId: epochHead
@@ -978,6 +1021,24 @@ paths:
                   type: object
                   properties:
                     target: { type: string }
+                    actor: { type: string }
+                    action: { type: string }
+                    from:
+                      allOf: [{ $ref: "#/components/schemas/EpochMs" }]
+                      description: Inclusive lower bound on `at`.
+                    to:
+                      allOf: [{ $ref: "#/components/schemas/EpochMs" }]
+                      description: Exclusive upper bound on `at`.
+                    cursor:
+                      type: object
+                      required: [at, id]
+                      description: >-
+                        Export paging: resume strictly after this (at, id)
+                        position, ascending; without it the LAST `limit`
+                        events return in log order.
+                      properties:
+                        at: { $ref: "#/components/schemas/EpochMs" }
+                        id: { type: string }
                     limit: { type: integer }
       responses:
         "200":
@@ -1757,6 +1818,17 @@ components:
           type: string
           description: The entity acted on (row id, group id, request id, …).
         detail: {}
+        prevHash:
+          type: string
+          description: >-
+            Present when the writing Application chains audit hashes
+            (`audit: { hashChain: true }`): the previous entry's `hash`.
+        hash:
+          type: string
+          description: >-
+            SHA-256 over the entry's canonical serialization plus
+            `prevHash`; verify a log or an export window with
+            `verifyAuditChain`.
 
     # -- catalog -------------------------------------------------------------
     CatalogDocument:

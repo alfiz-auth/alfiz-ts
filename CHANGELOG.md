@@ -1,5 +1,146 @@
 # Changelog
 
+## 0.7.0 — the enterprise release: safe by default, reviewable by construction
+
+> **Breaking.** Two defaults flip to their safe settings (event persistence
+> on the Application, epoch revalidation on the Client), and a failing
+> final `auto` approval stage now DENIES instead of stranding the request.
+> Read the Breaking section — each change has a one-line opt-out restoring
+> the old behavior.
+
+This release answers an external enterprise-readiness review. The theme
+throughout: things that were possible are now *declared*, things that were
+the integrator's silent obligation are now *detected*, and the safe
+configuration is now the *default* one.
+
+**Licensing, finally coherent.** Every package now ships `"license": "MIT"`
+and a `LICENSE` file. The previous `UNLICENSED` marker in published
+packages contradicted the pricing page's "MIT, forever" — the marker was
+the error, not the pricing page. A `SECURITY.md` with a disclosure contact
+and a support-window statement ships in the repository root.
+
+**Safe caching by default.** With a storage driver that can persist events
+(both bundled drivers can), the Application now persists them by default,
+and a Client attached to an epoch-bearing provider now revalidates by
+default (5s window). The effective cross-process revocation bound drops
+from the blind 30s TTL to the revalidation window, on the default path,
+with no configuration. Opt-outs: `events: { persist: false }`,
+`revalidateAfterMs: false`. And there is now an incident switch —
+`strict: true` on the client makes EVERY check bypass both cache tiers,
+exactly as if each call were `can.fresh`; wire it to an environment
+variable and flip it when revocations must land immediately.
+
+**Separation of duties, detective by design.** The catalog declares
+mutual-exclusion constraints (`constraints.sod`): two or more pattern sets
+no principal may hold across. `listSodViolations()` reports every user
+whose effective access crosses a constraint — closure walked, roles
+resolved, revokes respected — with the concrete keys that put them there.
+`sod: { enforce: "reject" }` upgrades user-subject grant writes to
+preventive rejection. Evaluation stays union-only: `can()` never consults
+a constraint, nothing enters the hot path, and constraint declarations are
+validated at boot (including the pattern-in-two-sets bug, and patterns
+reaching into open import regions, both of which are declaration errors).
+
+**The condition seam.** A permission may declare
+`requiresCondition: true`: holding it is necessary but no longer
+sufficient — every gate must pass `{ condition: () => … }` evaluating the
+application's own predicate ("under $10k", "still Draft"). A gate without
+one throws `MissingConditionError` (a programming error, mapped like
+`UnknownPermissionError`), and `alfiz-verify` gains `missing-condition`,
+which fails CI on literal call sites missing the predicate. Alfiz still
+evaluates no attributes — the seam enforces that YOUR evaluation is
+present, which is what keeps `if (amount < limit)` from quietly living
+beside the gate where no tool can see it. Conditions are in-process by
+construction; visibility shapes ignore them.
+
+**Reviewability.** Three new surfaces answer the questions an access
+review asks:
+
+- `exportEntitlements()` — the per-user effective-access rollup: every
+  conferred key with `held` (revokes applied) and the conferring rows,
+  closure attached. The export an external IGA ingests; write-back is the
+  ordinary API.
+- `listWildcardDrift({ sinceVersion })` — forward-inclusive wildcards
+  absorb keys published later; this names every gained key and every live
+  wildcard grant or assigned role that absorbed one. Catalog publishes now
+  retain history per version (`AlfizCatalogVersion` model — optional; a
+  schema without it answers `unsupported` rather than wrongly).
+- `reconcileRows()` — the orphan report behind the
+  `deleteSubject`/`deleteScope` discipline: rows referencing users, orgs,
+  or scopes the host deleted (existence supplied by host predicates),
+  group rows with no group, role grants with no role. `sweep: true`
+  deletes through the audited paths; dangling role grants are reported,
+  never swept.
+
+**Audit, specified.** `listAuditEvents` grows the export surface: `actor`,
+`action`, `from`/`to` time range, and (`at`, `id`) cursor paging. Optional
+tamper-evidence: `audit: { hashChain: true }` chains every entry with
+SHA-256 over a canonical serialization (stable across JSON column key
+reordering); `verifyAuditChain` verifies a full log or an export window
+against a carried hash. The chain is evidence, not proof — anchor the head
+hash externally — and enabling it serializes appends through
+`runExclusive("audit", …)`.
+
+**Directory sync can now deprovision.** `importDirectory` was an additive
+upsert: a user who vanished from the directory kept `active: true`, their
+memberships, and their reporting edge, forever. With
+`{ authoritative: true }` each dataset the snapshot carries becomes
+authoritative: absent users are DEACTIVATED (never deleted), memberships
+in directory-managed groups are swept for users the map no longer lists
+(locally-authored groups untouched), and unasserted reporting edges are
+cleared. Every deprovisioning action is audited and counted in the result.
+
+**The non-JS check path.** The Provider API gains `POST /v1/check`: a Go,
+Python, or Java service posts a principal, key (any-of array supported),
+and scope, and the serving APPLICATION evaluates in-process — same
+catalog, same rows, same resolver, same closure caches. "Runtime checks
+never leave the application" survives intact: the serving side is the
+application, in your infrastructure; the caller pays a network hop, which
+is the honest cost of not being in the process. `requiresCondition` keys
+answer with an error, not a half-checked yes.
+
+**A published performance envelope.** `npm run bench` seeds synthetic
+organizations against the memory driver and prints cold-miss and
+warm-check quantiles; representative numbers are published in the docs
+with the methodology and its caveats stated.
+
+**Driver conformance, published.** The storage contract suite is now
+`@alfiz/application/driver-suite` — the same cases the bundled drivers
+pass, including the `runExclusive` serialization case that keeps cycle
+detection sound under concurrency, plus new cases for audit filters and
+catalog history. A custom driver's test file is three lines.
+
+### Breaking
+
+- **A failing FINAL `auto` approval stage now auto-DENIES** the request
+  (decision recorded, `decidedBy: "auto"`) instead of leaving it pending
+  at a stage no human can decide. The review called such requests
+  "permanently undecidable except by admin override"; a recorded denial
+  the requester can re-raise beats an undecidable limbo. Non-final auto
+  stages still abstain and fall through — they accelerate, they never
+  gate. If you relied on the stranded-pending state as an ersatz admin
+  queue, add an explicit `named_approvers` stage last.
+- **`events.persist` defaults on** when the driver implements the event
+  methods. Opt out with `events: { persist: false }`. An explicit
+  `persist: true` against an incapable driver still throws; the auto
+  default degrades honestly instead.
+- **`revalidateAfterMs` defaults to 5 000** against a provider exposing
+  `epoch`, and its type widens to `number | false` — `false` restores
+  TTL-only caching. Deployments that pinned staleness tests to the blind
+  TTL need the explicit `false`.
+- **Log order is now (`at`, `id`)** for audit reads, in every driver.
+  Same-millisecond events previously kept memory-driver insertion order;
+  they now order by id, identically everywhere, which is what makes cursor
+  paging stable. (`AlfizAudit` gains `prevHash`/`hash` columns and an
+  `@@index([at, id])`; `AlfizCatalogVersion` is a new optional model —
+  merge the updated schema fragment and migrate.)
+- `putCatalog` on the storage seam takes an optional third `publishedAt`
+  parameter, and two optional history methods join the driver interface.
+  Existing drivers compile unchanged; without the history methods the
+  drift report answers `unsupported`.
+- `AuditEvent` gains optional `prevHash`/`hash`; `listAuditEvents` takes
+  the widened `AuditQuery`. Additive on the wire.
+
 ## 0.6.0 — the provider seam, made explicit
 
 > **Breaking.** The relay module is replaced by the Alfiz Provider API.

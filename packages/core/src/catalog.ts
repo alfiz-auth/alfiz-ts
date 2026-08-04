@@ -58,6 +58,8 @@ import {
   validatePattern,
 } from "./grammar.js";
 import type { ScopeId, ScopeType } from "./scopes.js";
+import type { SodConstraint } from "./sod.js";
+import { validateSodConstraints } from "./sod.js";
 import { GLOBAL_SCOPE, scopeTypeOf } from "./scopes.js";
 import type { ApprovalPolicyInput, RequestPromptInput } from "./requests.js";
 
@@ -99,6 +101,20 @@ export interface PermissionLeafInput {
    * its containing folder" behavior). Off by default.
    */
   impliedOnAncestors?: boolean;
+  /**
+   * The condition seam: `true` declares that holding this permission is
+   * NECESSARY but not SUFFICIENT — every gate must also pass an
+   * application-supplied predicate ("approve expenses under $10k", "only
+   * while status is Draft"). A gate for this key without a `condition` in
+   * its options throws `MissingConditionError` at runtime and fails
+   * `alfiz-verify` (`missing-condition`) in CI, which is what keeps the
+   * predicate from silently living beside the check where no tool can see
+   * it. The predicate itself stays application code — Alfiz never
+   * evaluates attributes, it enforces that YOUR evaluation is present.
+   * Off by default. Visibility shapes (`canAny`, `holds`) are unaffected:
+   * a button may exist because authority exists; the gate still decides.
+   */
+  requiresCondition?: boolean;
 }
 
 export type LeafInput = true | PermissionLeafInput;
@@ -395,6 +411,18 @@ export interface CatalogInput {
    * default; set false for catalogs that render no Alfiz admin surface.
    */
   includeAlfizInternal?: boolean;
+  /**
+   * Declarative access constraints, evaluated DETECTIVELY off the hot path.
+   * `sod` declares separation-of-duty exclusions — two or more pattern
+   * sets no one principal may hold across ("no one holds both Vendor Admin
+   * and Payment Approver"). Validated at boot against the declared
+   * vocabulary; reported by the Application's `listSodViolations`;
+   * optionally enforced at grant time (`sod: { enforce: "reject" }` on the
+   * Application). Never consulted by `can()` — evaluation stays union-only.
+   */
+  constraints?: {
+    sod?: readonly SodConstraint[];
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +666,8 @@ export interface LeafMeta {
    */
   scopes: readonly ScopeType[];
   impliedOnAncestors: boolean;
+  /** The condition seam — additive since 0.7.0; absent reads as false. */
+  requiresCondition?: boolean;
   /**
    * Absent means owned — additive, so documents written before imports
    * existed read back as owned, exactly as `conventions` did in 0.4.0.
@@ -765,6 +795,11 @@ export interface CatalogDocument {
    * documents written before it read back as the default depth.
    */
   conventions?: CatalogConventions;
+  /**
+   * Declared access constraints. Additive since 0.7.0 — documents written
+   * before it read back with none.
+   */
+  constraints?: { sod: readonly SodConstraint[] };
 }
 
 export class CatalogError extends Error {
@@ -800,6 +835,8 @@ export interface AnyCatalog {
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
   readonly conventions: CatalogConventions;
+  /** Declared separation-of-duty constraints (empty when none). */
+  readonly sodConstraints: readonly SodConstraint[];
   /** What this catalog imports, keyed by foreign namespace. */
   readonly imports: ReadonlyMap<string, ImportManifestEntry>;
   /** Imported wildcards this catalog cannot enumerate, keyed by pattern. */
@@ -853,6 +890,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
   readonly scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
   readonly navigation: readonly NavItem[];
   readonly conventions: CatalogConventions;
+  readonly sodConstraints: readonly SodConstraint[];
   readonly imports: ReadonlyMap<string, ImportManifestEntry>;
   readonly openRegions: ReadonlyMap<PermissionPattern, ImportedRegion>;
 
@@ -869,6 +907,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     scopeTypes: ReadonlyMap<ScopeType, ScopeTypeMeta>;
     navigation: readonly NavItem[];
     conventions?: CatalogConventions;
+    sodConstraints?: readonly SodConstraint[];
     imports?: ReadonlyMap<string, ImportManifestEntry>;
     openRegions?: ReadonlyMap<PermissionPattern, ImportedRegion>;
   }) {
@@ -879,6 +918,7 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
     this.scopeTypes = built.scopeTypes;
     this.navigation = built.navigation;
     this.conventions = built.conventions ?? { depth: DEFAULT_KEY_DEPTH };
+    this.sodConstraints = built.sodConstraints ?? [];
     this.imports = built.imports ?? new Map();
     this.openRegions = built.openRegions ?? new Map();
   }
@@ -1113,6 +1153,9 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
       scopeTypes: [...this.scopeTypes.values()],
       navigation: [...this.navigation],
       conventions: { ...this.conventions },
+      ...(this.sodConstraints.length > 0
+        ? { constraints: { sod: [...this.sodConstraints] } }
+        : {}),
     };
   }
 
@@ -1532,6 +1575,7 @@ export function defineCatalog<const C extends CatalogInput>(
       destructive: leaf.destructive ?? inferDestructive(name),
       scopes,
       impliedOnAncestors: leaf.impliedOnAncestors ?? false,
+      ...(leaf.requiresCondition ? { requiresCondition: true } : {}),
       origin: "owned",
     });
   }
@@ -1650,7 +1694,7 @@ export function defineCatalog<const C extends CatalogInput>(
     [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)),
   );
 
-  return new Catalog<C>({
+  const catalog = new Catalog<C>({
     namespace: primaryNamespace,
     // Imported namespaces are listed too: `namespaces` answers "does this
     // catalog speak this prefix at all", which every did-you-mean hint and
@@ -1668,9 +1712,26 @@ export function defineCatalog<const C extends CatalogInput>(
     scopeTypes,
     navigation: buildNav(input.navigation ?? []),
     conventions: { depth },
+    sodConstraints: input.constraints?.sod ?? [],
     imports: importEntries,
     openRegions,
   });
+
+  // Constraints validate against the BUILT catalog (they need pattern
+  // expansion), so their problems surface as one CatalogError with the rest.
+  if (catalog.sodConstraints.length > 0) {
+    const problems = validateSodConstraints(catalog, catalog.sodConstraints);
+    if (problems.length > 0) {
+      throw new CatalogError(
+        problems.map((message) => ({
+          severity: "error" as const,
+          path: "(constraints)",
+          message,
+        })),
+      );
+    }
+  }
+  return catalog;
 }
 
 /**
@@ -1989,6 +2050,7 @@ export function catalogFromDocument<
     scopeTypes: new Map(document.scopeTypes.map((s) => [s.type, s])),
     navigation: document.navigation,
     conventions: document.conventions ?? { depth: DEFAULT_KEY_DEPTH },
+    sodConstraints: document.constraints?.sod ?? [],
     imports,
     openRegions,
   });

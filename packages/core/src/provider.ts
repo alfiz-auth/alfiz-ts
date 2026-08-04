@@ -255,6 +255,39 @@ export interface AuditEvent {
   /** The entity acted on (row id, group id, request id, …). */
   target: string;
   detail?: unknown;
+  /**
+   * Tamper-evidence, present when the writing Application has
+   * `audit: { hashChain: true }`: `hash` covers this event's canonical
+   * serialization plus `prevHash`, so any edited, deleted, or reordered
+   * entry breaks every hash after it. Verify with `verifyAuditChain`
+   * (`@alfiz/application`).
+   */
+  prevHash?: string | undefined;
+  hash?: string | undefined;
+}
+
+/**
+ * The audit read filter, shared by the storage seam, the provider contract,
+ * and the wire. Two paging modes, chosen by `cursor`:
+ *
+ * - **Without `cursor`** — the LAST `limit` matching events, in log order
+ *   (ascending `at`): the shape an admin page's "recent activity" wants.
+ * - **With `cursor`** — the first `limit` matching events strictly AFTER the
+ *   cursor position, ascending: the shape an exporter wants. Events are
+ *   ordered by (`at`, `id`); pass the last event you received as the next
+ *   cursor and repeat until fewer than `limit` rows come back.
+ */
+export interface AuditQuery {
+  target?: string | undefined;
+  actor?: string | undefined;
+  action?: string | undefined;
+  /** Inclusive lower bound on `at` (epoch ms). */
+  from?: number | undefined;
+  /** Exclusive upper bound on `at` (epoch ms). */
+  to?: number | undefined;
+  /** Resume after this position (exclusive). Ordering is (`at`, then `id`). */
+  cursor?: { at: number; id: string } | undefined;
+  limit?: number | undefined;
 }
 
 // ---------------------------------------------------------------------------
@@ -479,10 +512,7 @@ export interface AlfizProvider {
   dissolveVirtualParent(groupId: string, provenance: Provenance): Promise<void>;
 
   // -- Audit ----------------------------------------------------------------
-  listAuditEvents(filter?: {
-    target?: string | undefined;
-    limit?: number | undefined;
-  }): Promise<AuditEvent[]>;
+  listAuditEvents(filter?: AuditQuery): Promise<AuditEvent[]>;
 
   // -- Metrics (OPTIONAL — gated by `capabilities().metrics`) ----------------
   // The delivery half of the metrics pipeline and the reads the safeguards

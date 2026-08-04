@@ -34,8 +34,10 @@ describe("events.persist", () => {
     ).toThrow(/appendEvents/);
   });
 
-  it("exposes epoch only when persistence is on", () => {
-    expect(makeApp().app.epoch).toBeUndefined();
+  it("persistence defaults ON with a capable driver; opting out removes the epoch", () => {
+    // 0.7.0: the safe configuration is the default one.
+    expect(makeApp().app.epoch).toBeDefined();
+    expect(makeApp({ events: { persist: false } }).app.epoch).toBeUndefined();
     expect(makePersistingApp().app.epoch).toBeDefined();
   });
 

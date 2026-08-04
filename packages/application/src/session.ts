@@ -21,6 +21,7 @@ import type {
   AlfizSnapshot,
   AnyCatalog,
   CheckContext,
+  CheckOptions,
   KeyOf,
   LooseKey,
   LooseScopeId,
@@ -83,14 +84,21 @@ export class AlfizSession<
   }
 
   /** Preview-narrowed check: subject allowed AND actor really allowed. */
-  async can(key: K | readonly K[], scope?: LooseScopeId<S>): Promise<boolean> {
-    if (!(await this.client.can(this.actorPrincipal, key, scope))) return false;
+  async can(
+    key: K | readonly K[],
+    scope?: LooseScopeId<S>,
+    options?: CheckOptions,
+  ): Promise<boolean> {
+    if (!(await this.client.can(this.actorPrincipal, key, scope, options))) {
+      return false;
+    }
     if (this.viewAs === null) return true;
     if (this.viewAs.kind === "user") {
       // `observe: false`: an administrator looking through someone's eyes
       // did not use that person's grants. Metrics attribution never follows
       // the preview, exactly as audit attribution never does.
       return this.client.can({ userId: this.viewAs.userId }, key, scope, {
+        ...options,
         observe: false,
       });
     }
@@ -109,8 +117,12 @@ export class AlfizSession<
     return this.rolePatternIntersects(this.viewAs.roleId, pattern);
   }
 
-  async require(key: K | readonly K[], scope?: LooseScopeId<S>): Promise<void> {
-    if (!(await this.can(key, scope))) {
+  async require(
+    key: K | readonly K[],
+    scope?: LooseScopeId<S>,
+    options?: CheckOptions,
+  ): Promise<void> {
+    if (!(await this.can(key, scope, options))) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: key as string | readonly string[],

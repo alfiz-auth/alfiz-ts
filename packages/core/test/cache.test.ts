@@ -260,3 +260,57 @@ describe("respCacheStore", () => {
     expect(await store.get("k2")).toBe("v2");
   });
 });
+
+describe("0.7.0 safe defaults and strict mode", () => {
+  it("revalidation defaults ON against an epoch-bearing provider", async () => {
+    const provider = makeProvider();
+    let now = 0;
+    const client = createAlfizClient({
+      catalog,
+      provider: provider as unknown as AlfizProvider,
+      clock: () => now,
+    });
+    await client.can({ userId: "u1" }, "docs.files.read");
+    const cold = provider.stats().fetches;
+    // Past the default 5s window but well inside the 30s subject TTL: the
+    // pre-0.7.0 default would serve pure cache; the safe default consults
+    // the epoch head, sees a write, and refetches.
+    provider.append({ type: "user", userId: "u1" });
+    now += 6_000;
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(provider.stats().fetches).toBe(cold + 1);
+    client.close();
+  });
+
+  it("revalidateAfterMs: false restores TTL-only caching", async () => {
+    const provider = makeProvider();
+    let now = 0;
+    const client = createAlfizClient({
+      catalog,
+      provider: provider as unknown as AlfizProvider,
+      clock: () => now,
+      revalidateAfterMs: false,
+    });
+    await client.can({ userId: "u1" }, "docs.files.read");
+    const cold = provider.stats().fetches;
+    provider.append({ type: "user", userId: "u1" });
+    now += 6_000; // inside the TTL, and no revalidation to notice the event
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(provider.stats().fetches).toBe(cold);
+    client.close();
+  });
+
+  it("strict: true bypasses the caches on every check", async () => {
+    const provider = makeProvider();
+    const client = createAlfizClient({
+      catalog,
+      provider: provider as unknown as AlfizProvider,
+      strict: true,
+    });
+    await client.can({ userId: "u1" }, "docs.files.read");
+    await client.can({ userId: "u1" }, "docs.files.read");
+    await client.can({ userId: "u1" }, "docs.files.read");
+    expect(provider.stats().fetches).toBe(3);
+    client.close();
+  });
+});

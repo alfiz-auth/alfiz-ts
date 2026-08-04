@@ -52,6 +52,10 @@ export function memoryDriver(): StorageDriver {
   const audit: AuditEvent[] = [];
   const metrics = new Map<string, MetricBucket>();
   let catalog: { version: number; document: CatalogDocument } | null = null;
+  const catalogVersions = new Map<
+    number,
+    { version: number; document: CatalogDocument; publishedAt: number }
+  >();
   let imports: { version: number; manifest: ImportManifest } | null = null;
   const locks = new Map<string, Promise<unknown>>();
   const events: Array<{ seq: number; event: InvalidationEvent; at: number }> =
@@ -174,11 +178,25 @@ export function memoryDriver(): StorageDriver {
       return rows.map(clone);
     },
 
-    async putCatalog(version, document) {
+    async putCatalog(version, document, publishedAt) {
       catalog = { version, document: clone(document) };
+      catalogVersions.set(version, {
+        version,
+        document: clone(document),
+        publishedAt: publishedAt ?? 0,
+      });
     },
     async getCatalog() {
       return catalog ? clone(catalog) : null;
+    },
+    async getCatalogVersion(version) {
+      const row = catalogVersions.get(version);
+      return row ? clone(row) : null;
+    },
+    async listCatalogVersions() {
+      return [...catalogVersions.values()]
+        .map(({ version, publishedAt }) => ({ version, publishedAt }))
+        .sort((a, b) => a.version - b.version);
     },
 
     async putImports(version, manifest) {
@@ -192,9 +210,32 @@ export function memoryDriver(): StorageDriver {
       audit.push(clone(event));
     },
     async listAudit(filter?: AuditFilter) {
-      let rows = audit;
+      let rows = [...audit].sort((a, b) =>
+        a.at !== b.at ? a.at - b.at : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
+      );
       if (filter?.target !== undefined) {
         rows = rows.filter((e) => e.target === filter.target);
+      }
+      if (filter?.actor !== undefined) {
+        rows = rows.filter((e) => e.actor === filter.actor);
+      }
+      if (filter?.action !== undefined) {
+        rows = rows.filter((e) => e.action === filter.action);
+      }
+      if (filter?.from !== undefined) {
+        rows = rows.filter((e) => e.at >= filter.from!);
+      }
+      if (filter?.to !== undefined) {
+        rows = rows.filter((e) => e.at < filter.to!);
+      }
+      const cursor = filter?.cursor;
+      if (cursor !== undefined) {
+        // Export paging: ascending from the cursor (exclusive), first `limit`.
+        rows = rows.filter(
+          (e) => e.at > cursor.at || (e.at === cursor.at && e.id > cursor.id),
+        );
+        const limit = filter?.limit ?? rows.length;
+        return rows.slice(0, limit).map(clone);
       }
       const limit = filter?.limit ?? rows.length;
       return rows.slice(-limit).map(clone);

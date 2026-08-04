@@ -8,6 +8,11 @@ export default defineConfig({
   resolve: {
     alias: {
       "@alfiz/core": pkg("core"),
+      // Subpath aliases must precede the bare package alias, or the prefix
+      // rewrite mangles them into `src/index.ts/<subpath>`.
+      "@alfiz/application/driver-suite": fileURLToPath(
+        new URL("packages/application/src/driver-suite.ts", import.meta.url),
+      ),
       "@alfiz/application": pkg("application"),
     },
   },
