@@ -8,10 +8,9 @@
 > Read the Breaking section — each change has a one-line opt-out restoring
 > the old behavior.
 
-This release answers an external enterprise-readiness review. The theme
-throughout: things that were possible are now *declared*, things that were
-the integrator's silent obligation are now *detected*, and the safe
-configuration is now the *default* one.
+The theme throughout this release: things that were possible are now
+*declared*, things that were the integrator's silent obligation are now
+*detected*, and the safe configuration is now the *default* one.
 
 **Licensing, finally coherent.** Every package now ships `"license": "MIT"`
 and a `LICENSE` file. The previous `UNLICENSED` marker in published
@@ -114,9 +113,9 @@ catalog history. A custom driver's test file is three lines.
 
 - **A failing FINAL `auto` approval stage now auto-DENIES** the request
   (decision recorded, `decidedBy: "auto"`) instead of leaving it pending
-  at a stage no human can decide. The review called such requests
-  "permanently undecidable except by admin override"; a recorded denial
-  the requester can re-raise beats an undecidable limbo. Non-final auto
+  at a stage no human can decide — permanently undecidable except by
+  admin override. A recorded denial the requester can re-raise beats an
+  undecidable limbo. Non-final auto
   stages still abstain and fall through — they accelerate, they never
   gate. If you relied on the stranded-pending state as an ersatz admin
   queue, add an explicit `named_approvers` stage last.
