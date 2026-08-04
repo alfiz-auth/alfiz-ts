@@ -624,3 +624,69 @@ describe("catalogFromDocument round-trip", () => {
     expect(rebuilt.keysMatching("docs.*").length).toBe(3);
   });
 });
+
+describe("missing-condition", () => {
+  const condCatalog = defineCatalog({
+    namespaces: ["exp"],
+    includeAlfizInternal: false,
+    permissions: {
+      "exp.claims.read": true,
+      "exp.claims.approve_claim": { requiresCondition: true },
+    },
+  });
+  const runCond = (sources: Record<string, string>) =>
+    run(sources, { catalog: condCatalog });
+
+  it("errors on a gate with no options at all", () => {
+    const report = runCond({
+      "app/actions.ts": `
+        "use server";
+        export async function approve() {
+          await client.require(user, "exp.claims.approve_claim");
+        }
+      `,
+    });
+    const found = byRule(report.issues, "missing-condition");
+    expect(found.length).toBe(1);
+    expect(found[0]!.message).toContain("requiresCondition");
+  });
+
+  it("errors when the last argument is a scope literal, not options", () => {
+    const report = runCond({
+      "app/page.ts": `await client.can(user, "exp.claims.approve_claim", "exp.claim:9");`,
+    });
+    expect(byRule(report.issues, "missing-condition").length).toBe(1);
+  });
+
+  it("passes a call site carrying a condition property", () => {
+    const report = runCond({
+      "app/page.ts": `
+        await client.can(user, "exp.claims.approve_claim", scope, {
+          condition: () => claim.amount < limit,
+        });
+      `,
+    });
+    expect(byRule(report.issues, "missing-condition")).toEqual([]);
+  });
+
+  it("accepts an opaque options argument (runtime catches it instead)", () => {
+    const report = runCond({
+      "app/page.ts": `await client.can(user, "exp.claims.approve_claim", scope, opts);`,
+    });
+    expect(byRule(report.issues, "missing-condition")).toEqual([]);
+  });
+
+  it("keys without the declaration never trigger the rule", () => {
+    const report = runCond({
+      "app/page.ts": `await client.can(user, "exp.claims.read");`,
+    });
+    expect(byRule(report.issues, "missing-condition")).toEqual([]);
+  });
+
+  it("visibility shapes never trigger the rule", () => {
+    const report = runCond({
+      "app/page.ts": `const show = await client.holds(user, "exp.claims.approve_claim");`,
+    });
+    expect(byRule(report.issues, "missing-condition")).toEqual([]);
+  });
+});

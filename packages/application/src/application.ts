@@ -15,6 +15,7 @@ import type {
   AnyCatalog,
   ApprovalStage,
   AuditEvent,
+  AuditQuery,
   CatalogDocument,
   CheckContext,
   EpochSource,
@@ -75,8 +76,15 @@ import {
   validatePattern,
   validateScopeId,
 } from "@alfiz/core";
-import type { AncestryResolver, LooseScopeId } from "@alfiz/core";
+import type {
+  AncestryResolver,
+  LooseScopeId,
+  PrincipalEntitlements,
+  SodViolation,
+} from "@alfiz/core";
+import { checkSodConstraints, entitlementsOf, wildcardDrift } from "@alfiz/core";
 import { randomUUID } from "node:crypto";
+import { computeAuditHash } from "./audit-chain.js";
 import type { StorageDriver, StoredUser } from "./storage.js";
 
 export interface ApplicationOptions {
@@ -119,7 +127,14 @@ export interface ApplicationOptions {
    */
   events?:
     | {
-        persist: true;
+        /**
+         * Since 0.7.0, persistence defaults to ON whenever the storage
+         * driver implements the event methods — the safe configuration is
+         * the default one. Pass `false` to opt out, or `true` to demand it
+         * (construction then throws if the driver cannot, rather than
+         * silently degrading the freshness guarantee).
+         */
+        persist?: boolean | undefined;
         /**
          * Event retention: entries older than `maxAgeMs` (default 7 days)
          * or beyond the newest `maxRows` (default 100 000) are pruned
@@ -161,6 +176,28 @@ export interface ApplicationOptions {
         retentionMs?: number | undefined;
       }
     | undefined;
+  /**
+   * Separation-of-duty posture. Constraints come from the CATALOG
+   * (`constraints.sod`); this option only chooses what a violating write
+   * does. `"off"` (default): constraints are detective only — read the
+   * report with `listSodViolations`. `"reject"`: a `createGrant` /
+   * `createGrants` whose USER-subject row would create a NEW violation is
+   * rejected with code `conflict`. Group- and role-shaped writes are never
+   * rejected — every member would need evaluating on a write path — and
+   * remain the report's job; that boundary is documented, not hidden.
+   */
+  sod?: { enforce?: "off" | "reject" | undefined } | undefined;
+  /**
+   * Audit-log posture. `hashChain: true` makes every audit entry carry a
+   * SHA-256 hash over its canonical serialization plus the previous entry's
+   * hash, so edits, deletions, and reordering are detectable
+   * (`verifyAuditChain`). Appends are serialized through
+   * `runExclusive("audit", …)` while chaining — an ordering cost paid only
+   * by deployments that opt in; multi-node deployments need a real
+   * cross-process lock on the driver (the Prisma driver's `options.lock`)
+   * for the chain to stay linear. Off by default.
+   */
+  audit?: { hashChain?: boolean | undefined } | undefined;
   clock?: (() => number) | undefined;
   ids?: (() => string) | undefined;
 }
@@ -210,6 +247,35 @@ export interface DirectorySnapshot {
 export interface DirectoryImportResult {
   warnings: string[];
   virtualParents: Array<{ id: string; members: string[] }>;
+  /** Populated by authoritative imports: what deprovisioning did. */
+  deactivatedUsers?: string[];
+  removedMemberships?: number;
+  clearedReportingEdges?: number;
+}
+
+export interface DirectoryImportOptions {
+  /**
+   * Treat the snapshot as the AUTHORITATIVE state of every dataset it
+   * carries, not an additive overlay. The default (false) is upsert-only —
+   * and upsert-only means OFFBOARDING NEVER PROPAGATES: a user who
+   * disappears from the directory keeps `active: true`, their memberships,
+   * and their reporting edge until someone notices. Authoritative mode
+   * closes that, per dataset, touching only datasets the snapshot carries:
+   *
+   * - `users` present → users known to this store but absent from the
+   *   snapshot are DEACTIVATED (never deleted — grants stay for audit,
+   *   `deleteSubject` remains the id-retirement path);
+   * - `memberships` present → stored memberships in imported (virtual
+   *   included) groups absent from the snapshot are removed; memberships in
+   *   locally-authored groups are never touched;
+   * - `reportingEdges` present → stored edges absent from the snapshot are
+   *   cleared.
+   *
+   * Groups themselves are never deleted here: a directory group that
+   * disappears may still be referenced by grants, and deleting it silently
+   * would strand them — that is `reconcileRows`' finding to surface.
+   */
+  authoritative?: boolean | undefined;
 }
 
 /**
@@ -260,6 +326,14 @@ export class AlfizApplication<
   private readonly metricsBucketMs: number;
   private readonly metricsRetentionMs: number;
   private reportsSinceMetricPrune = 0;
+  private readonly sodEnforce: "off" | "reject";
+  private readonly auditHashChain: boolean;
+  /**
+   * The newest chained entry's hash. `undefined` before the first chained
+   * append seeds it from storage; `null` when the chain is empty. Guarded by
+   * `runExclusive("audit", …)` — reads and writes happen only inside it.
+   */
+  private auditHead: string | null | undefined;
 
   constructor(options: ApplicationOptions) {
     super();
@@ -270,7 +344,19 @@ export class AlfizApplication<
     this.newId = options.ids ?? randomUUID;
     this.resolveAncestors = options.ancestry ?? (() => []);
     this.groupTopologyTtl = options.groupTopologyTtlMs ?? 30_000;
-    this.persistEvents = options.events?.persist ?? false;
+    this.sodEnforce = options.sod?.enforce ?? "off";
+    this.auditHashChain = options.audit?.hashChain ?? false;
+    const driverPersists =
+      this.storage.appendEvents !== undefined &&
+      this.storage.headSeq !== undefined &&
+      this.storage.eventsSince !== undefined &&
+      this.storage.pruneEvents !== undefined;
+    // Safe-by-default: a driver that CAN persist events does, making the
+    // epoch available to every process; `events: { persist: false }` is the
+    // explicit opt-out. Only an explicit `true` against an incapable driver
+    // is an error — the auto default degrades honestly to the pre-epoch
+    // contract instead.
+    this.persistEvents = options.events?.persist ?? driverPersists;
     this.eventRetention = {
       maxAgeMs: options.events?.retention?.maxAgeMs ?? 7 * 24 * 3600_000,
       maxRows: options.events?.retention?.maxRows ?? 100_000,
@@ -408,7 +494,29 @@ export class AlfizApplication<
       target,
       ...(detail === undefined ? {} : { detail }),
     };
-    await this.storage.appendAudit(event);
+    if (!this.auditHashChain) {
+      await this.storage.appendAudit(event);
+      return;
+    }
+    // Chained appends serialize: the hash covers the predecessor, so two
+    // concurrent appends reading the same head would fork the chain. The
+    // head seeds lazily from the newest stored entry — enabling the chain
+    // on an existing log starts it there, leaving earlier entries unhashed
+    // before the chain rather than invalidated by it.
+    await this.storage.runExclusive("audit", async () => {
+      if (this.auditHead === undefined) {
+        const [newest] = await this.storage.listAudit({ limit: 1 });
+        this.auditHead = newest?.hash ?? null;
+      }
+      const prevHash = this.auditHead;
+      const hash = computeAuditHash(event, prevHash);
+      await this.storage.appendAudit({
+        ...event,
+        ...(prevHash !== null ? { prevHash } : {}),
+        hash,
+      });
+      this.auditHead = hash;
+    });
   }
 
   private requireOrgRoot(what: string): void {
@@ -740,10 +848,119 @@ export class AlfizApplication<
     return row;
   }
 
+  /**
+   * The preventive half of separation-of-duty, when opted into: would this
+   * row give a USER a violation they do not already have? Pre-existing
+   * violations never block unrelated writes — the report owns those — and
+   * non-user subjects pass through (see `ApplicationOptions.sod`).
+   */
+  private async assertSodAllows(row: GrantRow): Promise<void> {
+    if (this.sodEnforce !== "reject") return;
+    const constraints = this.catalog.sodConstraints;
+    if (constraints.length === 0) return;
+    const parsed = parseSubject(row.subject);
+    if (parsed?.kind !== "user") return;
+    const { ctx } = await this.contextFor({ userId: parsed.id });
+    const before = checkSodConstraints(ctx, this.catalog, constraints);
+    const after = checkSodConstraints(
+      { ...ctx, rows: { ...ctx.rows, grants: [...ctx.rows.grants, row] } },
+      this.catalog,
+      constraints,
+    );
+    const had = new Set(before.map((v) => v.constraintId));
+    const created = after.find((v) => !had.has(v.constraintId));
+    if (created) {
+      throw new ProviderWriteRejectedError(
+        `grant violates separation-of-duty constraint ${JSON.stringify(created.constraintId)}: the subject would hold ${created.sets
+          .map((s) => `[${s.keys.join(", ")}]`)
+          .join(" and ")}`,
+        "conflict",
+      );
+    }
+  }
+
+  /**
+   * The detective separation-of-duty report: every user whose effective
+   * access crosses a constraint's sets, with the concrete keys that put
+   * them there. Evaluation is `checkSodConstraints` over the same closure
+   * supply every check uses — revokes suppress, expiry filters, and a
+   * violation names only access the user genuinely holds right now.
+   */
+  async listSodViolations(options?: {
+    userIds?: readonly string[] | undefined;
+  }): Promise<Array<{ userId: string; violations: SodViolation[] }>> {
+    const constraints = this.catalog.sodConstraints;
+    if (constraints.length === 0) return [];
+    let userIds = options?.userIds;
+    if (userIds === undefined) {
+      // Candidates are every user the system can NAME: stored user records
+      // plus user-subject grant rows (a grant to `user:x` does not create a
+      // record). Access arriving purely through `everyone` or an org
+      // subject reaches users this store never heard of; those are the
+      // host's to enumerate via `options.userIds`.
+      const named = new Set(
+        (await this.storage.listUsers()).map((u) => u.userId),
+      );
+      for (const grant of await this.storage.listGrants()) {
+        const parsed = parseSubject(grant.subject);
+        if (parsed?.kind === "user") named.add(parsed.id);
+      }
+      userIds = [...named].sort();
+    }
+    const report: Array<{ userId: string; violations: SodViolation[] }> = [];
+    for (const userId of userIds) {
+      const { ctx } = await this.contextFor({ userId });
+      const violations = checkSodConstraints(ctx, this.catalog, constraints);
+      if (violations.length > 0) report.push({ userId, violations });
+    }
+    return report;
+  }
+
+  /**
+   * The entitlement export: the per-user effective-access rollup an access
+   * review signs and an external IGA ingests. Answers arrive computed —
+   * closure walked, roles resolved, expiry filtered, revokes applied — so
+   * a reviewer reads capability, not raw rows; each entitlement still
+   * names its conferring rows, which is the write-back path (revoke the
+   * grant, end-date it, or write a personal revoke, all ordinary API).
+   * Same candidate rule as `listSodViolations`: stored users plus
+   * user-subject grant rows, with `userIds` for hosts whose users this
+   * store cannot enumerate.
+   */
+  async exportEntitlements(options?: {
+    userIds?: readonly string[] | undefined;
+  }): Promise<PrincipalEntitlements[]> {
+    let userIds = options?.userIds;
+    if (userIds === undefined) {
+      const named = new Set(
+        (await this.storage.listUsers()).map((u) => u.userId),
+      );
+      for (const grant of await this.storage.listGrants()) {
+        const parsed = parseSubject(grant.subject);
+        if (parsed?.kind === "user") named.add(parsed.id);
+      }
+      userIds = [...named].sort();
+    }
+    const out: PrincipalEntitlements[] = [];
+    for (const userId of userIds) {
+      const { data, ctx } = await this.contextFor({ userId });
+      const { entitlements, revokes } = entitlementsOf(ctx, this.catalog);
+      out.push({
+        userId,
+        active: data.active,
+        closure: data.closure,
+        entitlements,
+        revokes,
+      });
+    }
+    return out;
+  }
+
   async createGrant(input: GrantInput<P, S>): Promise<GrantRow> {
     this.assertProvenance(input.provenance);
     await this.assertGrantWritable(input);
     const row = this.buildGrantRow(input, input.provenance);
+    await this.assertSodAllows(row);
     await this.storage.insertGrant(row);
     await this.audit(input.provenance, "grant.create", row.id, {
       subject: row.subject,
@@ -776,6 +993,9 @@ export class AlfizApplication<
       await this.assertGrantWritable(input);
     }
     const rows = inputs.map((input) => this.buildGrantRow(input, provenance));
+    for (const row of rows) {
+      await this.assertSodAllows(row);
+    }
     for (const row of rows) {
       await this.storage.insertGrant(row);
     }
@@ -1072,6 +1292,137 @@ export class AlfizApplication<
     }
     await this.flushEvents();
     return { deletedGrants: grants.length, deletedRevokes: revokes.length };
+  }
+
+  /**
+   * The reconciliation job behind `deleteSubject`/`deleteScope` discipline:
+   * grants and revokes reference subjects and scopes as opaque strings, so
+   * a host that missed a cleanup call strands rows silently — and a reused
+   * identifier RESURRECTS them as live access. This report finds them.
+   *
+   * The host supplies existence predicates over ITS tables (`userExists`,
+   * `scopeExists`); group- and role-referencing rows are checked against
+   * this store's own tables with no callback needed. Run it on a schedule;
+   * with `sweep: true` (and provenance) the orphans are deleted through the
+   * same audited paths as any other removal. Detection without a sweep is
+   * free of write risk and is the recommended first deployment.
+   */
+  async reconcileRows(input: {
+    /** Does this user id exist in the host's user store? */
+    userExists?: ((userId: string) => boolean | Promise<boolean>) | undefined;
+    /** Does this org id still exist? Unchecked when omitted. */
+    orgExists?: ((orgId: string) => boolean | Promise<boolean>) | undefined;
+    /** Does this scope instance still resolve to a resource? Unchecked when omitted. */
+    scopeExists?: ((scope: string) => boolean | Promise<boolean>) | undefined;
+    /** Delete what was found, through the audited delete paths. */
+    sweep?: boolean | undefined;
+    /** Required with `sweep` — the audit actor of the deletions. */
+    provenance?: Provenance | undefined;
+  }): Promise<{
+    orphanedGrants: GrantRow[];
+    orphanedRevokes: RevokeRow[];
+    /** Grants naming a role this store no longer defines. */
+    danglingRoleGrants: GrantRow[];
+    swept: boolean;
+  }> {
+    if (input.sweep) {
+      if (!input.provenance) {
+        throw new ProviderWriteRejectedError(
+          "reconcileRows with sweep: true requires provenance for the audited deletions",
+          "validation",
+        );
+      }
+      this.assertProvenance(input.provenance);
+    }
+    const knownGroups = new Set(
+      (await this.storage.listGroups()).map((g) => g.id),
+    );
+    const knownRoles = new Set(
+      (await this.storage.listRoles()).map((r) => r.id),
+    );
+    const userExists = async (userId: string): Promise<boolean> =>
+      input.userExists === undefined ? true : await input.userExists(userId);
+    const subjectOrphaned = async (subject: SubjectId): Promise<boolean> => {
+      const parsed = parseSubject(subject);
+      if (parsed === null) return false; // malformed is a different finding
+      switch (parsed.kind) {
+        case "user":
+          return !(await userExists(parsed.id));
+        case "group":
+          return !knownGroups.has(parsed.id);
+        case "directs":
+        case "orgof":
+          return !(await userExists(parsed.id));
+        case "org":
+          return input.orgExists === undefined
+            ? false
+            : !(await input.orgExists(parsed.id));
+        default:
+          return false; // everyone / service subjects have no host table
+      }
+    };
+    const scopeOrphaned = async (scope: string): Promise<boolean> =>
+      input.scopeExists !== undefined &&
+      !isGlobalScope(scope) &&
+      !(await input.scopeExists(scope));
+
+    const orphanedGrants: GrantRow[] = [];
+    const danglingRoleGrants: GrantRow[] = [];
+    for (const grant of await this.storage.listGrants()) {
+      if (
+        (await subjectOrphaned(grant.subject)) ||
+        (await scopeOrphaned(grant.scope))
+      ) {
+        orphanedGrants.push(grant);
+      } else if (grant.roleId !== undefined && !knownRoles.has(grant.roleId)) {
+        danglingRoleGrants.push(grant);
+      }
+    }
+    const orphanedRevokes: RevokeRow[] = [];
+    for (const revoke of await this.storage.listRevokes()) {
+      if (
+        !(await userExists(revoke.userId)) ||
+        (await scopeOrphaned(revoke.scope))
+      ) {
+        orphanedRevokes.push(revoke);
+      }
+    }
+
+    if (input.sweep && input.provenance) {
+      const provenance = input.provenance;
+      for (const grant of orphanedGrants) {
+        await this.storage.deleteGrant(grant.id);
+        await this.audit(provenance, "grant.delete", grant.id, {
+          subject: grant.subject,
+          scope: grant.scope,
+          reason: "reconciliation: orphaned",
+        });
+        this.emitSubject(grant.subject);
+      }
+      for (const revoke of orphanedRevokes) {
+        await this.storage.deleteRevoke(revoke.id);
+        await this.audit(provenance, "revoke.delete", revoke.id, {
+          userId: revoke.userId,
+          reason: "reconciliation: orphaned",
+        });
+        this.emit({ type: "user", userId: revoke.userId });
+      }
+      // Dangling role grants are NOT swept: the row's subject and scope are
+      // real, and deleting the row on a missing role definition could mask a
+      // role-sync bug. They stay a finding for a human.
+      await this.audit(provenance, "reconcile.sweep", "rows", {
+        grants: orphanedGrants.length,
+        revokes: orphanedRevokes.length,
+      });
+      await this.flushEvents();
+    }
+
+    return {
+      orphanedGrants,
+      orphanedRevokes,
+      danglingRoleGrants,
+      swept: input.sweep === true,
+    };
   }
 
   // -- requests -------------------------------------------------------------
@@ -1474,7 +1825,7 @@ export class AlfizApplication<
     }
     const current = await this.storage.getCatalog();
     const version = (current?.version ?? 0) + 1;
-    await this.storage.putCatalog(version, document);
+    await this.storage.putCatalog(version, document, this.now());
     await this.audit(provenance, "catalog.publish", document.namespace, {
       version,
     });
@@ -1485,6 +1836,68 @@ export class AlfizApplication<
 
   async getPublishedCatalog() {
     return this.storage.getCatalog();
+  }
+
+  /** Published versions with their publish instants, oldest first. */
+  async listCatalogVersions(): Promise<
+    Array<{ version: number; publishedAt: number }>
+  > {
+    if (!this.storage.listCatalogVersions) {
+      throw new ProviderWriteRejectedError(
+        "this storage driver retains no catalog history (implement listCatalogVersions/getCatalogVersion)",
+        "unsupported",
+      );
+    }
+    return this.storage.listCatalogVersions();
+  }
+
+  /**
+   * The wildcard-drift report: which keys the catalog gained since a
+   * published version, and which live wildcard grants and assigned roles
+   * silently absorbed them (forward inclusion working exactly as
+   * documented — this report is what makes it reviewable). An access
+   * review that certified version N runs this against N before signing the
+   * next cycle; a finding means a grant now confers more than what was
+   * certified.
+   */
+  async listWildcardDrift(input: { sinceVersion: number }): Promise<
+    import("@alfiz/core").WildcardDriftReport & {
+      fromVersion: number;
+      toVersion: number;
+    }
+  > {
+    if (!this.storage.getCatalogVersion) {
+      throw new ProviderWriteRejectedError(
+        "this storage driver retains no catalog history (implement listCatalogVersions/getCatalogVersion)",
+        "unsupported",
+      );
+    }
+    const from = await this.storage.getCatalogVersion(input.sinceVersion);
+    if (!from) {
+      throw new ProviderWriteRejectedError(
+        `catalog version ${input.sinceVersion} is not retained`,
+        "not_found",
+      );
+    }
+    const head = await this.storage.getCatalog();
+    if (!head) {
+      throw new ProviderWriteRejectedError(
+        "no catalog has been published",
+        "not_found",
+      );
+    }
+    const report = wildcardDrift({
+      from: from.document,
+      to: head.document,
+      grants: await this.storage.listGrants(),
+      roles: await this.storage.listRoles(),
+      now: this.now(),
+    });
+    return {
+      ...report,
+      fromVersion: from.version,
+      toVersion: head.version,
+    };
   }
 
   /**
@@ -2043,10 +2456,7 @@ export class AlfizApplication<
 
   // -- audit ----------------------------------------------------------------
 
-  async listAuditEvents(filter?: {
-    target?: string | undefined;
-    limit?: number | undefined;
-  }): Promise<AuditEvent[]> {
+  async listAuditEvents(filter?: AuditQuery): Promise<AuditEvent[]> {
     return this.storage.listAudit(filter);
   }
 
@@ -2315,11 +2725,16 @@ export class AlfizApplication<
   async importDirectory(
     snapshot: DirectorySnapshot,
     source: string,
+    options?: DirectoryImportOptions,
   ): Promise<DirectoryImportResult> {
     this.requireOrgRoot("directory ingestion");
+    const authoritative = options?.authoritative ?? false;
     const provenance: Provenance = { kind: "import", source };
     const warnings: string[] = [];
     const virtualParents: Array<{ id: string; members: string[] }> = [];
+    const deactivatedUsers: string[] = [];
+    let removedMemberships = 0;
+    let clearedReportingEdges = 0;
 
     await this.storage.runExclusive("groups", async () => {
       if (snapshot.groups) {
@@ -2379,6 +2794,21 @@ export class AlfizApplication<
         active: spec.active ?? user.active,
       });
     }
+    if (authoritative && snapshot.users) {
+      // The half upsert-only cannot do: a user the directory no longer
+      // lists is deactivated — every check answers no within the staleness
+      // bound — never deleted; rows stay for audit and `deleteSubject`
+      // remains the deliberate id-retirement path.
+      const listed = new Set(snapshot.users.map((u) => u.userId));
+      for (const user of await this.storage.listUsers()) {
+        if (listed.has(user.userId) || !user.active) continue;
+        await this.storage.upsertUser({ ...user, active: false });
+        deactivatedUsers.push(user.userId);
+        await this.audit(provenance, "user.deactivate", user.userId, {
+          reason: "authoritative directory import: absent from snapshot",
+        });
+      }
+    }
 
     for (const [userId, groupIds] of Object.entries(
       snapshot.memberships ?? {},
@@ -2394,6 +2824,33 @@ export class AlfizApplication<
         ...user,
         groupIds: [...new Set(groupIds)],
       });
+    }
+    if (authoritative && snapshot.memberships) {
+      // Sweep memberships in DIRECTORY-MANAGED groups (the snapshot's own
+      // `groups` section, plus parents condensation minted) for users the
+      // membership map no longer lists. Locally-authored groups are never
+      // touched: the directory is authoritative only over what it owns.
+      const directoryGroups = new Set([
+        ...(snapshot.groups ?? []).map((g) => g.id),
+        ...virtualParents.map((vp) => vp.id),
+      ]);
+      if (directoryGroups.size === 0) {
+        warnings.push(
+          "authoritative memberships skipped: the snapshot carries no `groups` section, so directory-managed groups cannot be told apart from locally-authored ones",
+        );
+      } else {
+        const listed = snapshot.memberships;
+        for (const user of await this.storage.listUsers()) {
+          const keep = new Set(listed[user.userId] ?? []);
+          const next = user.groupIds.filter(
+            (g) => !directoryGroups.has(g) || keep.has(g),
+          );
+          if (next.length !== user.groupIds.length) {
+            removedMemberships += user.groupIds.length - next.length;
+            await this.storage.upsertUser({ ...user, groupIds: next });
+          }
+        }
+      }
     }
 
     for (const [userId, orgIds] of Object.entries(snapshot.orgs ?? {})) {
@@ -2453,15 +2910,43 @@ export class AlfizApplication<
           };
           await this.storage.upsertUser({ ...user, managerUserId });
         }
+        if (authoritative) {
+          // An edge the directory no longer asserts is cleared: a stale
+          // edge silently routes approvals to someone who left, which is
+          // worse than an unpopulated one (that at least fails loudly at
+          // policy creation).
+          const asserted = new Set(Object.keys(snapshot.reportingEdges!));
+          for (const user of await this.storage.listUsers()) {
+            if (user.managerUserId === null || asserted.has(user.userId)) {
+              continue;
+            }
+            await this.storage.upsertUser({ ...user, managerUserId: null });
+            clearedReportingEdges++;
+          }
+        }
       });
     }
 
     await this.audit(provenance, "directory.import", source, {
       warnings: warnings.length,
+      ...(authoritative
+        ? {
+            authoritative: true,
+            deactivatedUsers: deactivatedUsers.length,
+            removedMemberships,
+            clearedReportingEdges,
+          }
+        : {}),
     });
     this.emit({ type: "all" });
     await this.flushEvents();
-    return { warnings, virtualParents };
+    return {
+      warnings,
+      virtualParents,
+      ...(authoritative
+        ? { deactivatedUsers, removedMemberships, clearedReportingEdges }
+        : {}),
+    };
   }
 }
 

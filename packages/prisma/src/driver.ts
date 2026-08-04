@@ -44,6 +44,7 @@ import type {
 import type {
   AlfizAuditCreateData,
   AlfizAuditRecord,
+  AlfizAuditWhere,
   AlfizEpochDelegate,
   AlfizEventDelegate,
   AlfizGrantCreateData,
@@ -212,6 +213,8 @@ const auditToDb = (event: AuditEvent): AlfizAuditCreateData => ({
   ...(event.detail === undefined || event.detail === null
     ? {}
     : { detail: toJson(event.detail) }),
+  ...(event.prevHash !== undefined ? { prevHash: event.prevHash } : {}),
+  ...(event.hash !== undefined ? { hash: event.hash } : {}),
 });
 
 const auditFromDb = (row: AlfizAuditRecord): AuditEvent => ({
@@ -223,6 +226,10 @@ const auditFromDb = (row: AlfizAuditRecord): AuditEvent => ({
   ...(row.detail === null || row.detail === undefined
     ? {}
     : { detail: row.detail }),
+  ...(row.prevHash === null || row.prevHash === undefined
+    ? {}
+    : { prevHash: row.prevHash }),
+  ...(row.hash === null || row.hash === undefined ? {} : { hash: row.hash }),
 });
 
 // ---------------------------------------------------------------------------
@@ -536,12 +543,28 @@ export function prismaDriver(
     },
 
     // -- catalog --------------------------------------------------------------
-    async putCatalog(version, document) {
+    async putCatalog(version, document, publishedAt) {
       await db.alfizCatalog.upsert({
         where: { id: 1 },
         create: { id: 1, version, document: toJson(document) },
         update: { version, document: toJson(document) },
       });
+      // History rides along when the schema carries the model; the head
+      // stays a cheap singleton read either way.
+      if (db.alfizCatalogVersion !== undefined) {
+        await db.alfizCatalogVersion.upsert({
+          where: { version },
+          create: {
+            version,
+            document: toJson(document),
+            publishedAt: toBig(publishedAt ?? 0),
+          },
+          update: {
+            document: toJson(document),
+            publishedAt: toBig(publishedAt ?? 0),
+          },
+        });
+      }
     },
     async getCatalog() {
       const row = await db.alfizCatalog.findUnique({ where: { id: 1 } });
@@ -551,6 +574,30 @@ export function prismaDriver(
         document: fromJson<CatalogDocument>(row.document),
       };
     },
+    ...(db.alfizCatalogVersion !== undefined
+      ? {
+          async getCatalogVersion(version: number) {
+            const row = await db.alfizCatalogVersion!.findUnique({
+              where: { version },
+            });
+            if (row === null) return null;
+            return {
+              version: row.version,
+              document: fromJson<CatalogDocument>(row.document),
+              publishedAt: Number(row.publishedAt),
+            };
+          },
+          async listCatalogVersions() {
+            const rows = await db.alfizCatalogVersion!.findMany({
+              orderBy: { version: "asc" },
+            });
+            return rows.map((r) => ({
+              version: r.version,
+              publishedAt: Number(r.publishedAt),
+            }));
+          },
+        }
+      : {}),
 
     // -- audit ----------------------------------------------------------------
     async appendAudit(event) {
@@ -559,13 +606,35 @@ export function prismaDriver(
     async listAudit(filter?: AuditFilter) {
       const limit = filter?.limit;
       if (limit !== undefined && limit <= 0) return [];
-      // The contract wants the LAST `limit` events in log order: ascending by
-      // `at`, taking from the end (Prisma's negative-take convention).
+      const where: AlfizAuditWhere = {};
+      if (filter?.target !== undefined) where.target = filter.target;
+      if (filter?.actor !== undefined) where.actor = filter.actor;
+      if (filter?.action !== undefined) where.action = filter.action;
+      if (filter?.from !== undefined || filter?.to !== undefined) {
+        where.at = {
+          ...(filter.from !== undefined ? { gte: toBig(filter.from) } : {}),
+          ...(filter.to !== undefined ? { lt: toBig(filter.to) } : {}),
+        };
+      }
+      const cursor = filter?.cursor;
+      if (cursor !== undefined) {
+        // Export paging: strictly after (at, id), ascending, first `limit`.
+        where.OR = [
+          { at: { gt: toBig(cursor.at) } },
+          { at: toBig(cursor.at), id: { gt: cursor.id } },
+        ];
+        const rows = await db.alfizAudit.findMany({
+          where,
+          orderBy: [{ at: "asc" }, { id: "asc" }],
+          ...(limit !== undefined ? { take: limit } : {}),
+        });
+        return rows.map(auditFromDb);
+      }
+      // Without a cursor: the LAST `limit` events in log order — ascending by
+      // (`at`, `id`), taking from the end (Prisma's negative-take convention).
       const rows = await db.alfizAudit.findMany({
-        ...(filter?.target !== undefined
-          ? { where: { target: filter.target } }
-          : {}),
-        orderBy: { at: "asc" },
+        ...(Object.keys(where).length > 0 ? { where } : {}),
+        orderBy: [{ at: "asc" }, { id: "asc" }],
         ...(limit !== undefined ? { take: -limit } : {}),
       });
       return rows.map(auditFromDb);

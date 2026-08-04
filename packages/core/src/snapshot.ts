@@ -59,6 +59,7 @@ import {
 import type {
   CheckDecision,
   CheckObservation,
+  CheckOptions,
   CheckShape,
   MetricsRecorder,
 } from "./metrics.js";
@@ -67,6 +68,7 @@ import type { AnyCatalog, KeyOf, PatternOf, ScopeOf } from "./catalog.js";
 import { unknownPermissionContext } from "./catalog.js";
 import {
   AccessDeniedError,
+  MissingConditionError,
   UnknownPermissionError,
   UnresolvedScopeError,
 } from "./errors.js";
@@ -332,19 +334,57 @@ export class AlfizSnapshot<
   }
 
   /** Synchronous `can`: agrees with `client.can` for every resolvable scope. */
-  can(key: K | readonly K[], scope?: LooseScopeId<S>): boolean {
-    return this.gate(key, scope, "can");
+  can(
+    key: K | readonly K[],
+    scope?: LooseScopeId<S>,
+    options?: CheckOptions,
+  ): boolean {
+    return this.gate(key, scope, "can", options);
+  }
+
+  /**
+   * The condition seam on the SYNCHRONOUS surface: same contract as the
+   * client's, except the predicate must return a plain boolean — a Promise
+   * here is a programming error, because a snapshot answer cannot wait.
+   */
+  private conditionOf(
+    keys: readonly PermissionKey[],
+    shape: string,
+    options: CheckOptions | undefined,
+  ): (() => boolean) | undefined {
+    const condition = options?.condition;
+    if (condition === undefined) {
+      const needing = keys.find(
+        (k) => this.catalog.leaf(k)?.requiresCondition === true,
+      );
+      if (needing !== undefined) {
+        throw new MissingConditionError(needing, `snapshot ${shape}`);
+      }
+      return undefined;
+    }
+    return () => {
+      const result = condition();
+      if (typeof result !== "boolean") {
+        throw new MissingConditionError(
+          keys[0]!,
+          `snapshot ${shape} (the condition returned a Promise; snapshot checks are synchronous — resolve it before the check or use client.can)`,
+        );
+      }
+      return result;
+    };
   }
 
   private gate(
     key: K | readonly K[],
     scope: LooseScopeId<S> | undefined,
     shape: "can" | "require",
+    options?: CheckOptions,
   ): boolean {
     const keys: readonly PermissionKey[] = Array.isArray(key)
       ? (key as readonly string[])
       : [key as string];
     this.assertKeys(keys);
+    const condition = this.conditionOf(keys, shape, options);
     const sampleRate = this.sampled(shape);
     const observe = (
       decision: CheckDecision,
@@ -377,6 +417,10 @@ export class AlfizSnapshot<
     for (const k of keys) {
       const explanation = explainKey(this.ctx, k, closure);
       if (explanation.allowed) {
+        if (condition !== undefined && !condition()) {
+          observe("deny", k, { grants: explanation.matchedGrants });
+          return false;
+        }
         observe("allow", k, { grants: explanation.matchedGrants });
         return true;
       }
@@ -386,6 +430,10 @@ export class AlfizSnapshot<
       for (const k of keys) {
         const implying = this.impliedAt(k, scope);
         if (implying !== null) {
+          if (condition !== undefined && !condition()) {
+            observe("deny", k, { grants: implying, implied: true });
+            return false;
+          }
           observe("allow", k, { grants: implying, implied: true });
           return true;
         }
@@ -432,7 +480,11 @@ export class AlfizSnapshot<
   }
 
   /** Throwing form of `can`. */
-  require(key: K | readonly K[], scope?: LooseScopeId<S>): void {
+  require(
+    key: K | readonly K[],
+    scope?: LooseScopeId<S>,
+    options?: CheckOptions,
+  ): void {
     const keys = (Array.isArray(key) ? key : [key]) as readonly PermissionKey[];
     this.assertKeys(keys);
     if (!this.active) {
@@ -454,7 +506,7 @@ export class AlfizSnapshot<
         principal: this.principal,
       });
     }
-    if (!this.gate(key, scope, "require")) {
+    if (!this.gate(key, scope, "require", options)) {
       throw new AccessDeniedError({
         reason: "forbidden",
         permission: key as PermissionKey | readonly PermissionKey[],

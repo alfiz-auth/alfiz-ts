@@ -1,8 +1,8 @@
 {
   "name": "@alfiz/application",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "The Alfiz Application: a library-embedded provider implementing the Alfiz contract against your own database, with no external dependency. Standalone, it is the org root and the complete system for one organization.",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -10,9 +10,14 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./driver-suite": {
+      "types": "./dist/driver-suite.d.ts",
+      "default": "./dist/driver-suite.js"
     }
   },
   "files": [
+    "LICENSE",
     "dist",
     "README.md"
   ],
@@ -21,6 +26,6 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
-    "@alfiz/core": "^0.6.0"
+    "@alfiz/core": "^0.7.0"
   }
 }

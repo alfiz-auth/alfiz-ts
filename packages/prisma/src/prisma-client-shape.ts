@@ -492,6 +492,29 @@ interface P7CatalogDelegate {
   }): Promise<P7CatalogPayload | null>;
 }
 
+interface P7CatalogVersionPayload {
+  version: number;
+  document: P7JsonValue;
+  publishedAt: bigint;
+}
+
+interface P7CatalogVersionDelegate {
+  upsert(args: {
+    where: { version: number };
+    create: { version: number; document: P7InputJsonValue; publishedAt: bigint | number };
+    update: { document?: P7InputJsonValue; publishedAt?: bigint | number };
+    select?: unknown;
+  }): Promise<P7CatalogVersionPayload>;
+  findUnique(args: {
+    where: { version: number };
+    select?: unknown;
+  }): Promise<P7CatalogVersionPayload | null>;
+  findMany(args?: {
+    orderBy?: { version?: P7SortOrder };
+    take?: number;
+  }): Promise<P7CatalogVersionPayload[]>;
+}
+
 interface P7AuditPayload {
   id: string;
   at: bigint;
@@ -499,6 +522,8 @@ interface P7AuditPayload {
   action: string;
   target: string;
   detail: P7JsonValue | null;
+  prevHash: string | null;
+  hash: string | null;
 }
 
 interface P7AuditCreateInput {
@@ -508,11 +533,15 @@ interface P7AuditCreateInput {
   action: string;
   target: string;
   detail?: P7NullableJsonNullValueInput | P7InputJsonValue;
+  prevHash?: string | null;
+  hash?: string | null;
 }
 
 type P7AuditWhereInput = P7Where<{
+  id?: P7StringFilter | string;
   target?: P7StringFilter | string;
   actor?: P7StringFilter | string;
+  action?: P7StringFilter | string;
   at?: P7BigIntFilter | bigint | number;
 }>;
 
@@ -523,7 +552,9 @@ interface P7AuditDelegate {
   }): Promise<P7AuditPayload>;
   findMany(args?: {
     where?: P7AuditWhereInput;
-    orderBy?: { at?: P7SortOrder } | { at?: P7SortOrder }[];
+    orderBy?:
+      | { at?: P7SortOrder; id?: P7SortOrder }
+      | { at?: P7SortOrder; id?: P7SortOrder }[];
     take?: number;
     skip?: number;
   }): Promise<P7AuditPayload[]>;
@@ -692,6 +723,7 @@ interface P7GeneratedClient {
   alfizMembership: P7MembershipDelegate;
   alfizRequest: P7RequestDelegate;
   alfizCatalog: P7CatalogDelegate;
+  alfizCatalogVersion: P7CatalogVersionDelegate;
   alfizAudit: P7AuditDelegate;
   alfizEpoch: P7EpochDelegate;
   alfizEvent: P7EventDelegate;
@@ -725,6 +757,12 @@ type _MembershipDelegateOk = Assert<
 >;
 type _RequestDelegateOk = Assert<IsAssignable<P7RequestDelegate, AlfizPrismaDelegates["alfizRequest"]>>;
 type _CatalogDelegateOk = Assert<IsAssignable<P7CatalogDelegate, AlfizPrismaDelegates["alfizCatalog"]>>;
+type _CatalogVersionDelegateOk = Assert<
+  IsAssignable<
+    P7CatalogVersionDelegate,
+    NonNullable<AlfizPrismaDelegates["alfizCatalogVersion"]>
+  >
+>;
 type _AuditDelegateOk = Assert<IsAssignable<P7AuditDelegate, AlfizPrismaDelegates["alfizAudit"]>>;
 type _EpochDelegateOk = Assert<
   IsAssignable<P7EpochDelegate, NonNullable<AlfizPrismaDelegates["alfizEpoch"]>>
@@ -738,7 +776,10 @@ type _MetricDelegateOk = Assert<
 /** A client generated WITHOUT the optional models must keep satisfying the bundle. */
 type _PreLogClientStillOk = Assert<
   IsAssignable<
-    Omit<P7GeneratedClient, "alfizEpoch" | "alfizEvent" | "alfizMetric">,
+    Omit<
+      P7GeneratedClient,
+      "alfizEpoch" | "alfizEvent" | "alfizMetric" | "alfizCatalogVersion"
+    >,
     AlfizPrismaDelegates
   >
 >;

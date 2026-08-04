@@ -129,12 +129,13 @@ describe("grant validation", () => {
   });
 
   it("audits creates and deletes with provenance actors", async () => {
-    const { app } = makeApp();
+    const { app, advance } = makeApp();
     const row = await app.createGrant({
       subject: "user:u1",
       pattern: "docs.files.read",
       provenance: admin,
     });
+    advance(1); // log order is (at, id); distinct timestamps make it exact
     await app.deleteGrant(row.id, admin);
     const audit = await app.listAuditEvents();
     expect(audit.map((e) => e.action)).toEqual(["grant.create", "grant.delete"]);

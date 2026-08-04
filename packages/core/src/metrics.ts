@@ -154,6 +154,17 @@ export interface CheckOptions {
    * never follows the preview.
    */
   observe?: boolean | undefined;
+  /**
+   * The condition seam: an application-supplied predicate over resource or
+   * request state ("amount under the approver's limit", "status is
+   * Draft"), REQUIRED when any checked key declares
+   * `requiresCondition: true` and optional otherwise. Evaluated only after
+   * the rows allow — the final AND of the decision — so a throwing or
+   * expensive predicate never runs for principals the rows already deny.
+   * On the synchronous surfaces (snapshot, session snapshot) it must
+   * return a plain boolean; a Promise there is a programming error.
+   */
+  condition?: (() => boolean | Promise<boolean>) | undefined;
 }
 
 /** Fans one observation out to several sinks; failures are isolated per sink. */

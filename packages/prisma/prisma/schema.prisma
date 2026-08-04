@@ -118,6 +118,16 @@ model AlfizCatalog {
   document Json
 }
 
+/// Catalog history: one retained document per published version. Feeds the
+/// wildcard-drift report ("which grants gained keys since version N") and
+/// point-in-time attestation. OPTIONAL: omit this model and only the head
+/// is kept — drift then answers `unsupported` rather than wrongly.
+model AlfizCatalogVersion {
+  version     Int    @id
+  document    Json
+  publishedAt BigInt
+}
+
 /// What this application CONSUMES — the import manifest, a versioned
 /// singleton (always id = 1), stored beside the catalog rather than inside
 /// it. What an application announces is owned vocabulary others may grant
@@ -172,14 +182,21 @@ model AlfizMetric {
   @@index([bucket])
 }
 
-/// Append-only audit log, ordered by `at` (epoch ms).
+/// Append-only audit log, ordered by (`at`, `id`) (epoch ms).
+/// `prevHash`/`hash` are populated when the writing Application enables
+/// `audit: { hashChain: true }` — a per-organization SHA-256 chain making
+/// edits, deletions, and reordering detectable (`verifyAuditChain`).
 model AlfizAudit {
-  id     String @id
-  at     BigInt
-  actor  String
-  action String
-  target String
-  detail Json?
+  id       String  @id
+  at       BigInt
+  actor    String
+  action   String
+  target   String
+  detail   Json?
+  prevHash String?
+  hash     String?
 
   @@index([target])
+  @@index([at, id])
+  @@index([actor])
 }

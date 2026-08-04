@@ -3,7 +3,7 @@ import {
   driverContractCases,
   eventLogContractCases,
   metricsContractCases,
-} from "../../application/test/driver-suite.js";
+} from "@alfiz/application/driver-suite";
 import { prismaDriver } from "../src/index.js";
 import { mockDelegates } from "./mock-delegates.js";
 

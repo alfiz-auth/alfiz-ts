@@ -267,5 +267,31 @@ export class UnresolvedScopeError extends Error {
   }
 }
 
+/**
+ * A gate for a permission the catalog declares `requiresCondition: true`
+ * was called without a `condition` in its options. A PROGRAMMING error, on
+ * the same footing as `UnknownPermissionError`: map it to 500, never 403 —
+ * the caller forgot the predicate, the principal was not denied. The
+ * static verifier (`missing-condition`) catches literal call sites in CI;
+ * this closes the runtime-string paths it cannot see.
+ */
+export class MissingConditionError extends Error {
+  override name = "MissingConditionError";
+  readonly permission: PermissionKey;
+
+  constructor(permission: PermissionKey, shape: string) {
+    super(
+      `${JSON.stringify(permission)} is declared \`requiresCondition: true\` — ` +
+        `every ${shape} gate for it must pass \`{ condition: () => … }\` ` +
+        `evaluating the resource predicate the catalog promises. ` +
+        `Holding the permission is necessary but not sufficient by declaration.`,
+    );
+    this.permission = permission;
+  }
+}
+
 /** Either failure a check can raise: a denial, or a malformed check. */
-export type AlfizCheckError = AccessDeniedError | UnknownPermissionError;
+export type AlfizCheckError =
+  | AccessDeniedError
+  | UnknownPermissionError
+  | MissingConditionError;

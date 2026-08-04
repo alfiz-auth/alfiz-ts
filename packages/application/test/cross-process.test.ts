@@ -163,7 +163,9 @@ describe("round-trip budget per scenario", () => {
         provider: appB,
         clock,
         subjectCacheTtlMs: 30_000,
-        ...(revalidate ? { revalidateAfterMs: 5_000 } : {}),
+        // 0.7.0: revalidation defaults ON against an epoch-bearing provider;
+        // the control arm opts out explicitly.
+        ...(revalidate ? { revalidateAfterMs: 5_000 } : { revalidateAfterMs: false as const }),
       });
       const perPhase: number[] = [];
       const phase = async (advanceMs: number, checks: number) => {

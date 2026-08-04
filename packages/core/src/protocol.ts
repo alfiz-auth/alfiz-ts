@@ -87,6 +87,19 @@ export const PROVIDER_OPERATIONS = [
   { op: "getSubjectAccess", kind: "read", method: "getSubjectAccess" },
   { op: "resolveAncestors", kind: "read", method: "resolveAncestors" },
 
+  // -- evaluation (transport-only): the non-JS check path --------------------
+  // `check` serves polyglot estates: a Go or Python service POSTs a
+  // question and the APPLICATION evaluates it, in-process, against its own
+  // catalog, rows, and resolver — the same evaluator every local check
+  // uses. This does not violate "runtime checks never leave the
+  // application": the serving side IS the application, inside the
+  // customer's infrastructure; nothing Alfiz operates is on the path. The
+  // caller pays a network hop instead of an in-process call, which is the
+  // honest cost of not being in the process. Conditions are in-process by
+  // design, so a `requiresCondition` key answers with a wire error rather
+  // than a half-checked yes.
+  { op: "check", kind: "read" },
+
   // -- invalidation (the epoch is the cross-process transport) ---------------
   { op: "epoch.head", kind: "read", requires: "epoch" },
   { op: "epoch.since", kind: "read", requires: "epoch" },

@@ -59,6 +59,9 @@ describe("scope invalidation (critical): moves propagate to cached checks", () =
       clock: () => now,
       objectCacheTtlMs: 60_000,
       subjectCacheTtlMs: 0,
+      // This test pins the TTL-ONLY contract; opt out of the 0.7.0
+      // default revalidation so the blind TTL is what bounds staleness.
+      revalidateAfterMs: false,
     });
     await app.createGrant({
       subject: "user:u1",
@@ -324,7 +327,8 @@ describe("holds_pattern end-to-end respects revokes", () => {
       requesterUserId: "requester",
       roleId: role.id,
     });
-    expect(request.state).toBe("pending"); // the auto stage abstained
+    expect(request.state).toBe("denied"); // the failing final auto stage fails closed
+    expect(request.decisions.at(-1)!.decidedBy).toBe("auto");
     expect(await app.listGrants({ subject: "user:requester", scope: "*" })).toHaveLength(1); // only the original
   });
 });

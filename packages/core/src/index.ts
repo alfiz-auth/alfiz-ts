@@ -11,6 +11,9 @@
 
 export * from "./grammar.js";
 export * from "./scopes.js";
+export * from "./sod.js";
+export * from "./drift.js";
+export * from "./entitlements.js";
 export * from "./subjects.js";
 export * from "./graph.js";
 export * from "./access.js";

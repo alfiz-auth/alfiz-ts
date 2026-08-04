@@ -308,6 +308,30 @@ export interface AlfizCatalogDelegate {
 }
 
 // ---------------------------------------------------------------------------
+// AlfizCatalogVersion (OPTIONAL) — catalog history, one row per publish
+// ---------------------------------------------------------------------------
+
+export interface AlfizCatalogVersionRecord {
+  version: number;
+  document: unknown;
+  publishedAt: bigint;
+}
+
+export interface AlfizCatalogVersionDelegate {
+  upsert(args: {
+    where: { version: number };
+    create: { version: number; document: InputJsonValue; publishedAt: bigint };
+    update: { document: InputJsonValue; publishedAt: bigint };
+  }): Promise<unknown>;
+  findUnique(args: {
+    where: { version: number };
+  }): Promise<AlfizCatalogVersionRecord | null>;
+  findMany(args?: {
+    orderBy?: { version: "asc" };
+  }): Promise<AlfizCatalogVersionRecord[]>;
+}
+
+// ---------------------------------------------------------------------------
 // AlfizImports (versioned singleton, id = 1) — what the application CONSUMES
 // ---------------------------------------------------------------------------
 
@@ -338,6 +362,9 @@ export interface AlfizAuditRecord {
   target: string;
   /** `null` when the event carries no detail. */
   detail: unknown;
+  /** `null` unless the writing Application chains audit hashes. */
+  prevHash?: string | null;
+  hash?: string | null;
 }
 
 export interface AlfizAuditCreateData {
@@ -348,17 +375,34 @@ export interface AlfizAuditCreateData {
   target: string;
   /** Omitted (not `null`) when absent — the column defaults to NULL. */
   detail?: InputJsonValue;
+  prevHash?: string;
+  hash?: string;
+}
+
+/**
+ * Exactly the `where` shapes `listAudit` emits: equality filters, an `at`
+ * range, and the compound (`at`, `id`) cursor condition expressed through
+ * `OR` — each disjunct itself one of these shapes.
+ */
+export interface AlfizAuditWhere {
+  target?: string;
+  actor?: string;
+  action?: string;
+  at?: bigint | { gte?: bigint; lt?: bigint; gt?: bigint };
+  id?: { gt?: string };
+  OR?: AlfizAuditWhere[];
 }
 
 export interface AlfizAuditDelegate {
   create(args: { data: AlfizAuditCreateData }): Promise<unknown>;
   /**
-   * The one ordered query: ascending by `at`, with Prisma's negative-`take`
-   * convention ("last N of the ordered result") for audit tail reads.
+   * Ordered reads: ascending by (`at`, `id`), with Prisma's negative-`take`
+   * convention ("last N of the ordered result") for audit tail reads and a
+   * compound (`at`, `id`) cursor condition for export paging.
    */
   findMany(args?: {
-    where?: { target?: string };
-    orderBy?: { at: "asc" };
+    where?: AlfizAuditWhere;
+    orderBy?: { at: "asc"; id?: "asc" } | Array<{ at?: "asc"; id?: "asc" }>;
     take?: number;
   }): Promise<AlfizAuditRecord[]>;
 }
@@ -485,6 +529,13 @@ export interface AlfizPrismaDelegates {
   alfizRequest: AlfizRequestDelegate;
   alfizCatalog: AlfizCatalogDelegate;
   alfizAudit: AlfizAuditDelegate;
+  /**
+   * OPTIONAL — present when the schema includes the AlfizCatalogVersion
+   * model. A client generated without it still satisfies this interface;
+   * the driver then keeps only the catalog head, and the wildcard-drift
+   * report answers `unsupported` instead of wrongly.
+   */
+  alfizCatalogVersion?: AlfizCatalogVersionDelegate;
   /**
    * OPTIONAL — present when the schema includes the AlfizImports model. A
    * client generated without it still satisfies this interface; the driver

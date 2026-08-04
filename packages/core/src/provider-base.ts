@@ -37,6 +37,7 @@ import type {
 import type {
   AlfizProvider,
   AuditEvent,
+  AuditQuery,
   EpochSource,
   GrantInput,
   GrantQuery,
@@ -240,10 +241,7 @@ export abstract class AlfizProviderBase implements AlfizProvider {
   ): Promise<void>;
 
   // -- Audit ----------------------------------------------------------------
-  abstract listAuditEvents(filter?: {
-    target?: string | undefined;
-    limit?: number | undefined;
-  }): Promise<AuditEvent[]>;
+  abstract listAuditEvents(filter?: AuditQuery): Promise<AuditEvent[]>;
 
   // -- Metrics (OPTIONAL — gated by `capabilities().metrics`) ---------------
   reportMetrics?(batch: MetricsBatch): Promise<void>;
