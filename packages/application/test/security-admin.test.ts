@@ -16,18 +16,6 @@
  * audit log, and that the delegated defence actually works.
  */
 
-/**
- * KNOWN-OPEN MARKER — `it.fails(...)` in this file.
- *
- * A test written as `it.fails` asserts the SECURE behavior and records that
- * Alfiz does not have it yet: it passes while the finding is open, and turns
- * RED the moment someone fixes the underlying issue. That is the point — the
- * failure is the signal to delete the `.fails` and promote the test, so a
- * fix can never land silently and a finding can never quietly rot.
- *
- * Every one of them is listed in the 0.7.1 changelog entry with its
- * severity. They are open findings, not accepted behavior.
- */
 import { describe, expect, it } from "vitest";
 import {
   createAlfizClient,
@@ -510,7 +498,7 @@ describe("request flow: the requester is never the approver", () => {
     );
   });
 
-  it.fails("refuses a request that proposes the unbounded global pattern", async () => {
+  it("refuses a request that proposes the unbounded global pattern", async () => {
     // A requestable scope type declares prompts, a duration cap and WHO
     // approves — never WHAT may be requested. The requester supplies the
     // pattern, so `*` at a requestable scope is a self-service ceiling-free
@@ -526,7 +514,7 @@ describe("request flow: the requester is never the approver", () => {
     ).rejects.toMatchObject({ code: "validation" });
   });
 
-  it.fails("an auto-approval stage never hands the requester a pattern nobody reviewed", async () => {
+  it("an auto-approval stage never hands the requester a pattern nobody reviewed", async () => {
     const catalog = autoRequestCatalog();
     const app = createApplication({
       catalog,
@@ -555,7 +543,7 @@ describe("request flow: the requester is never the approver", () => {
     client.close();
   });
 
-  it.fails("freezes the patterns of a role a pending request references", async () => {
+  it("freezes the patterns of a role a pending request references", async () => {
     // `deleteRole` already refuses while pending requests reference the role.
     // Rewriting its patterns is the same TOCTOU with a worse outcome: the
     // approver reviews "Reader" and the requester receives whatever the role

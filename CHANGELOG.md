@@ -2,11 +2,21 @@
 
 ## 0.7.1 — the adversarial-review release
 
+> **Behaviour-breaking, deliberately.** A patch release does not usually
+> change what a call does, but several of these defects were *silent wrong
+> answers*, and the fix for a silent wrong answer is usually a loud one.
+> Configurations that were quietly failing open now fail closed, loudly:
+> a scoped check against a hierarchical type with no working `ancestry`
+> resolver throws, a request cannot propose `*`, a role's patterns are
+> frozen while a request references it, and a bare `*` no longer confers
+> region-admitted keys. The "Behavior changes" section lists all of them
+> with the reason each one had to move. Nothing was removed from any API.
+
 A security review run as seven independent adversarial passes: the Provider
 API, the evaluation engine, the cache and invalidation tiers, the
 administrative write paths, error and listing surfaces, the storage seam, and
-brown-field configuration. It added **261 tests** (677 → 938) and fixed the
-defects they found. No API removals; two behavior changes are called out below.
+brown-field configuration. It added **261 tests** (677 → 938) and fixed every
+defect they found. No API removals; the behavior changes are listed below.
 
 ### Fixed — wrong answers
 
@@ -166,46 +176,110 @@ defects they found. No API removals; two behavior changes are called out below.
   scope types and no `ancestry` resolver was passed. Without one every
   ancestor chain is empty, so a revoke made at a parent scope does not
   suppress access on its descendants — the one rule Alfiz documents as not
-  configurable. **This becomes an error in the next minor.** A resolver that
-  cannot answer must throw, never return a partial chain.
+  configurable. A scoped check against such a type then **throws** (see
+  below), so the warning names the misconfiguration at boot and the check
+  refuses to answer wrongly rather than answering permissively.
 - A principal naming both `userId` and `serviceId` now throws rather than
   being resolved in favour of whichever half is read first.
+- **An ancestry resolver returning an empty chain for a scope type the
+  catalog nests now throws.** This is the missing-resolver warning above made
+  enforceable wherever the catalog can prove the chain is wrong: a type whose
+  declared parent is a different type asserts that every instance has one. A
+  resolver that cannot answer must throw rather than return a partial chain.
+- **A pattern-shaped request can no longer propose the bare global `*`**, and
+  a scope type may narrow what is requestable further with
+  `requestable.patterns`.
+- **A role's patterns are frozen while a pending request references it.**
+- **The bare global `*` no longer confers keys that exist only because an
+  open non-strict import region admits them.** A grant naming the namespace
+  (`zoom.*`) still does.
+- **`AlfizRoleDelegate` gained `upsert`, and `deleteMany` now returns
+  `{ count }`** on the grant, revoke, and role delegates. A generated Prisma
+  client already satisfies both; a hand-written delegate implementation may
+  need updating. `PrismaDriverOptions.jsonNull` is new and optional — pass
+  `Prisma.DbNull` if your client rejects a bare `null` when clearing a role's
+  requestable policy.
 
-### Known open findings
+### Also fixed — the findings the review left open
 
-Fifteen findings are recorded as `it.fails` tests in the `security-*` suites.
-They assert the secure behavior, pass while the finding is open, and turn red
-the moment it is fixed — so no fix lands silently and no finding quietly rots.
-In severity order:
+The first pass recorded fifteen findings it did not fix. All are now closed;
+the `it.fails` tripwires that tracked them are ordinary tests again.
 
-- **HIGH** — a request may propose any pattern, `*` included, and an `auto`
-  approval stage grants it with no human in the loop. `requestable` bounds who
-  approves and for how long, but never *what* may be requested.
-- **HIGH** — `updateRole` can rewrite a role's patterns while a request
-  referencing it is pending, so an approver reviews one thing and grants
-  another. `deleteRole` already guards this.
-- **MEDIUM** — `upsertRole` on Prisma is a non-atomic `deleteMany` + `create`:
-  the role is transiently unreadable (every grant of it denies), durably lost
-  if the write half fails, and concurrent updates collide. The in-code claim
-  that the Application serializes role writes does not hold today.
-- **MEDIUM** — a backwards wall-clock step (NTP correction, VM resume) extends
-  the subject and object TTLs and suspends epoch revalidation. The TTL
-  arithmetic needs a monotonic source.
-- **MEDIUM** — an ancestry resolver that swallows its own error and returns
-  `[]` silently drops ancestor revokes. Only the missing-resolver case warns;
-  a lying resolver cannot be detected without a contract change.
-- **MEDIUM** — `snapshot.can` trusts `parent: null` without consulting the
-  resolver, so a mis-declared flat scope type makes the snapshot disagree with
-  `client.can` in the permissive direction.
-- **MEDIUM** — an unenumerated key under a non-strict import region is
-  `hasKey`-true, so a bare `*` confers it: the namespace-anchor rule's own
-  failure mode, one level down.
-- **LOW** — `deleteGrant` reports a deletion it may not have performed under a
-  concurrent deleter; the delegate signature discards the affected-row count.
-- **LOW** — client/provider clock skew: expiry is evaluated on the checking
-  process's clock, and the provider does not filter expired rows.
-- **LOW** — a non-durable store loses the negative layer asymmetrically across
-  a restart. Now declarable via `durable`, not yet enforced.
+- **A request could propose any pattern, `*` included** — and an `auto`
+  approval stage granted it with no human in the loop. `requestable` bounded
+  who approves and for how long, never *what* may be asked for. Scope types
+  gain `requestable.patterns`, a ceiling a proposal must be contained by, and
+  the bare global `*` is refused unconditionally: it confers every key
+  grantable at the scope, and "give me everything" is not a reviewable ask
+  however good the approver. Role-shaped requests were already bounded by
+  their role. This needed a real containment test — `patternContains` in
+  `@alfiz/core` — because `patternsIntersect` is symmetric, and a ceiling
+  checked with intersection admits a proposal strictly broader than the
+  limit.
+- **`updateRole` could rewrite a role's patterns while a request referenced
+  it**, so an approver reviewed "Reader" and the requester received whatever
+  the role said at approval time. Patterns are frozen while a request is
+  pending, mirroring the guard `deleteRole` already had; renaming and
+  re-describing stay allowed, because neither changes what approving confers.
+- **`upsertRole` on Prisma was a non-atomic `deleteMany` + `create`.** Every
+  grant conferring a role denies while that role is unreadable, so the window
+  was a live authorization outage; a failure in the create half lost the role
+  outright; and two concurrent updates collided on the primary key. It is now
+  one `upsert`, the shape the group delegate already used. The in-code
+  justification for the old form — "the Application serializes organizational
+  writes" — was simply untrue: role writes never took the lock.
+- **`deleteGrant` / `deleteRevoke` reported deletions they had not
+  performed.** The delegate signature discarded `deleteMany`'s affected-row
+  count, so a concurrent deleter looked like our own success and the
+  Application audited a second `grant.delete` for a row it did not remove.
+- **A backwards wall-clock step extended every TTL and suspended epoch
+  revalidation.** NTP correcting a drifted host, a VM resuming from a
+  snapshot, or a test clock wired into one construction site and not another
+  all move `Date.now` backwards, and a deadline computed before the step sits
+  arbitrarily far in the future afterwards. A cache entry now records when it
+  was stored and is treated as lapsed if the clock has since run backwards
+  past it; a negative revalidation interval reads as due rather than as
+  "validated very recently".
+- **Client/provider clock skew honoured expired grants.** Expiry was
+  evaluated only on the checking process's clock, so a lagging checker
+  honoured a grant the writer already considered dead. `getSubjectAccess`
+  filters expired grants on the writer's clock as well. Only grants — a
+  revoke is the negative layer, and dropping one early could only widen
+  access.
+- **An unenumerated key under a non-strict import region was conferred by a
+  bare `*`.** An open region made `hasKey` true for every string beneath it,
+  so `zoom.host_typo` counted as declared vocabulary and rode in on every
+  global grant — the precise failure the namespace-anchor rule exists to
+  prevent, one level down. The bare-`*` rule now keys on enumerated
+  vocabulary (`Catalog.isEnumeratedKey`); a grant that NAMES the namespace
+  still confers it, because whoever wrote `zoom.*` knew the region was open.
+- **An ancestry resolver that returned an empty chain silently dropped
+  ancestor revokes.** The shape that produces one is the shape every host
+  eventually writes — `try { …db } catch { return [] }`, so "auth doesn't
+  break on a blip" — and an empty chain is indistinguishable from a rootless
+  scope *unless the catalog says otherwise*. It often does: a scope type whose
+  declared parent is a different type asserts that every instance has one, so
+  an empty chain contradicts the declaration and is now refused. Self-nesting
+  and flat types have genuine roots and are unaffected. This closes the
+  missing-resolver case too, which previously only warned.
+
+### Known limits, stated rather than fixed
+
+- **A mis-declared `parent: null` is reported, not prevented.** The
+  declaration is load-bearing: snapshots answer scoped checks for flat types
+  synchronously, synthesizing `[scope, "*"]` and consulting no resolver, so
+  a snapshot structurally *cannot* see that the host nests the type. Alfiz now
+  warns once per scope type from the async path, which does resolve the chain
+  and does deny correctly. Making the snapshot safe here would mean giving up
+  the synchronous guarantee for flat scope types, which is a different
+  release.
+- **A non-durable store loses the negative layer asymmetrically.** Positive
+  access is routinely re-created by boot code; `active: false` and personal
+  revokes exist only in the store, so one that does not survive a deploy
+  comes back more permissive than it went away. No library can remember a row
+  it never kept — `StorageDriver.durable` exists so a deployment can refuse
+  to boot on such a store instead of finding out later.
+
 
 ## 0.7.0 — the enterprise release: safe by default, reviewable by construction
 

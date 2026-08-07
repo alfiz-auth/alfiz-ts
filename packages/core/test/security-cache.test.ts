@@ -7,18 +7,6 @@
  * decision served past a bound the README's "Staleness, honestly" section
  * states, or a cache answering with authority that is not the principal's.
  */
-/**
- * KNOWN-OPEN MARKER — `it.fails(...)` in this file.
- *
- * A test written as `it.fails` asserts the SECURE behavior and records that
- * Alfiz does not have it yet: it passes while the finding is open, and turns
- * RED the moment someone fixes the underlying issue. That is the point — the
- * failure is the signal to delete the `.fails` and promote the test, so a
- * fix can never land silently and a finding can never quietly rot.
- *
- * Every one of them is listed in the 0.7.1 changelog entry with its
- * severity. They are open findings, not accepted behavior.
- */
 import { describe, expect, it } from "vitest";
 import type { GrantRow, RevokeRow, RoleDef } from "../src/access.js";
 import type { CacheStore } from "../src/cache.js";
@@ -543,7 +531,7 @@ describe("expiry versus the cache", () => {
 });
 
 describe("clock handling", () => {
-  it.fails("a backwards clock step does not extend the subject cache TTL", async () => {
+  it("a backwards clock step does not extend the subject cache TTL", async () => {
     // NTP steps the wall clock back (or a container resumes). The 30s bound
     // is a bound on elapsed time, not on a monotonically increasing clock
     // Alfiz merely hopes for.
@@ -567,7 +555,7 @@ describe("clock handling", () => {
     client.close();
   });
 
-  it.fails("a backwards clock step does not suspend epoch revalidation", async () => {
+  it("a backwards clock step does not suspend epoch revalidation", async () => {
     let now = 1_000_000;
     const state = { grants: [g("user:u1", "docs.files.read")] };
     const provider = fakeProvider(state);

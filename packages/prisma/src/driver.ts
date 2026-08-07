@@ -73,6 +73,18 @@ export interface PrismaDriverOptions {
    * would have rejected alone.
    */
   lock?: (<T>(key: string, fn: () => Promise<T>) => Promise<T>) | undefined;
+  /**
+   * The sentinel your Prisma client uses to write SQL NULL into a nullable
+   * `Json` column — `Prisma.DbNull`. Needed only to CLEAR a role's
+   * `requestable` policy; every other write passes a real value.
+   *
+   * It is an option rather than an import because this package deliberately
+   * keeps `@prisma/client` out of its dependency graph (see the module
+   * header). Defaults to `null`, which is correct for the bundled memory
+   * driver and for any client that accepts it; pass `Prisma.DbNull` if your
+   * client rejects a bare `null` on a Json column.
+   */
+  jsonNull?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,6 +291,7 @@ export function prismaDriver(
   options?: PrismaDriverOptions,
 ): StorageDriver {
   const externalLock = options?.lock;
+  const jsonNull = options?.jsonNull ?? null;
   const locks = new Map<string, Promise<unknown>>();
 
   const exclusive = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
@@ -347,11 +360,14 @@ export function prismaDriver(
     },
     async deleteGrant(id) {
       // Read first, then deleteMany: Prisma's `delete` throws when the row is
-      // absent, and the contract wants `null` back instead.
+      // absent, and the contract wants `null` back instead. The affected-row
+      // count decides the answer — discarding it made a concurrent deleter
+      // look like our own success, and the Application audits a second
+      // `grant.delete` for a row it did not remove.
       const existing = await db.alfizGrant.findUnique({ where: { id } });
       if (existing === null) return null;
-      await db.alfizGrant.deleteMany({ where: { id } });
-      return grantFromDb(existing);
+      const { count } = await db.alfizGrant.deleteMany({ where: { id } });
+      return count === 0 ? null : grantFromDb(existing);
     },
     async listGrants(filter?: GrantFilter) {
       const where = grantWhere(filter);
@@ -381,8 +397,8 @@ export function prismaDriver(
     async deleteRevoke(id) {
       const existing = await db.alfizRevoke.findUnique({ where: { id } });
       if (existing === null) return null;
-      await db.alfizRevoke.deleteMany({ where: { id } });
-      return revokeFromDb(existing);
+      const { count } = await db.alfizRevoke.deleteMany({ where: { id } });
+      return count === 0 ? null : revokeFromDb(existing);
     },
     async listRevokes(filter?: RevokeFilter) {
       const where: AlfizRevokeWhere = {};
@@ -394,12 +410,32 @@ export function prismaDriver(
 
     // -- roles ----------------------------------------------------------------
     async upsertRole(role) {
-      // delete + create, not upsert: clearing the nullable `requestable` Json
-      // column on downgrade would need Prisma's DbNull sentinel, which this
-      // package cannot reference without depending on @prisma/client. The
-      // Application serializes organizational writes, so the window is benign.
-      await db.alfizRole.deleteMany({ where: { id: role.id } });
-      await db.alfizRole.create({ data: roleToDb(role) });
+      // Update-then-create, never delete-then-create. The old comment
+      // claimed the delete/create window was benign because "the Application
+      // serializes organizational writes" — it does not: only `groups`,
+      // `reporting`, `request:*` and `audit` take the lock, and role writes
+      // never did. So the window was real, and while it was open every grant
+      // conferring the role denied ("unknown roles confer nothing"), a
+      // failure in the create half destroyed the role outright, and two
+      // concurrent updates collided on the primary key.
+      //
+      await db.alfizRole.upsert({
+        where: { id: role.id },
+        create: roleToDb(role),
+        update: {
+          name: role.name,
+          description: role.description ?? null,
+          patterns: toJson(role.patterns),
+          // Explicit on every update, unlike the create half: a role that
+          // LOST its requestable policy must have the column cleared, and
+          // omitting the field would silently keep the old policy alive —
+          // a de-privileging edit that did not de-privilege.
+          requestable:
+            role.requestable === undefined
+              ? toJson(jsonNull)
+              : toJson(role.requestable),
+        },
+      });
     },
     async getRole(id) {
       const row = await db.alfizRole.findUnique({ where: { id } });

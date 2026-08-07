@@ -256,6 +256,8 @@ export interface ExternalPermissionInfo {
 interface SubjectCacheEntry {
   data: SubjectAccessData;
   expiresAt: number;
+  /** When it was stored — see {@link AlfizClient.live}. */
+  fetchedAt: number;
   /** The validation generation this entry was fetched under — see `validationGen`. */
   gen: number;
 }
@@ -263,6 +265,7 @@ interface SubjectCacheEntry {
 interface ObjectCacheEntry {
   chain: ScopeId[];
   expiresAt: number;
+  fetchedAt: number;
   gen: number;
 }
 
@@ -425,6 +428,24 @@ export class AlfizClient<
    * the only bound — which is what the caching page promises for a failure.
    */
   private epochUnreadable = false;
+
+  /**
+   * Whether a cache entry is still inside its window.
+   *
+   * `expiresAt > now` is not sufficient on its own, because `now` is a WALL
+   * clock — `Date.now` by default, and injectable. NTP correcting a drifted
+   * host, a VM or container resuming from a snapshot, or a test clock wired
+   * into one construction site and not another all move it BACKWARDS, and a
+   * deadline computed before the step sits arbitrarily far in the future
+   * afterwards. The 30s/60s TTLs are bounds on *elapsed time*; an entry
+   * whose clock has since run backwards has no trustworthy deadline at all,
+   * so it is treated as lapsed. Refetching costs a query; honoring it costs
+   * an unbounded revocation window.
+   */
+  private live(entry: { expiresAt: number; fetchedAt: number }): boolean {
+    const now = this.now();
+    return now >= entry.fetchedAt && entry.expiresAt > now;
+  }
   private validationGen = 0;
   private revalidating: Promise<void> | null = null;
   private readonly cacheStore: CacheStore | undefined;
@@ -485,7 +506,11 @@ export class AlfizClient<
     this.now = options.clock ?? Date.now;
     this.grantApplies = (key, grantScope) =>
       this.catalog.appliesAt(key, grantScope);
-    this.isUndeclared = (key) => !this.catalog.hasKey(key);
+    // ENUMERATED, not merely `hasKey`: a key that exists only because an
+    // open non-strict import region admits it is not vocabulary anyone
+    // declared, so the bare-`*` rule must treat it as undeclared. A grant
+    // naming the namespace still confers it — see `isEnumeratedKey`.
+    this.isUndeclared = (key) => !this.catalog.isEnumeratedKey(key);
     this.externalPermissions = options.externalPermissions ?? "error";
     this.onExternalPermission =
       options.onExternalPermission ??
@@ -680,10 +705,13 @@ export class AlfizClient<
     if (this.revalidateAfter === undefined || epoch === undefined) {
       return undefined;
     }
-    if (
-      this.knownSeq !== null &&
-      this.now() - this.lastValidatedAt <= this.revalidateAfter
-    ) {
+    // A NEGATIVE elapsed time means the wall clock ran backwards since the
+    // last validation (see `live`). Left unguarded it reads as "validated
+    // very recently" and suspends revalidation entirely — for as long as the
+    // step was large, which is exactly when the process most needs to catch
+    // up on what it missed.
+    const elapsed = this.now() - this.lastValidatedAt;
+    if (this.knownSeq !== null && elapsed >= 0 && elapsed <= this.revalidateAfter) {
       return undefined;
     }
     if (this.revalidating) return this.revalidating;
@@ -851,6 +879,7 @@ export class AlfizClient<
       this.storeSubject(cacheKey, {
         data: envelope.data,
         expiresAt: this.now() + this.subjectTtl,
+        fetchedAt: this.now(),
         gen: this.validationGen,
       });
       return envelope.data;
@@ -876,6 +905,7 @@ export class AlfizClient<
       this.storeObject(scope, {
         chain: envelope.chain,
         expiresAt: this.now() + this.objectTtl,
+            fetchedAt: this.now(),
         gen: this.validationGen,
       });
       return envelope.chain;
@@ -915,7 +945,7 @@ export class AlfizClient<
       const gate = this.maybeValidate();
       if (gate) await gate;
       const cached = this.subjectCache.get(key);
-      if (cached && cached.expiresAt > this.now()) {
+      if (cached && this.live(cached)) {
         // Refresh recency: Map insertion order doubles as the LRU order.
         this.subjectCache.delete(key);
         this.subjectCache.set(key, cached);
@@ -935,6 +965,7 @@ export class AlfizClient<
         this.storeSubject(key, {
           data,
           expiresAt: this.now() + this.subjectTtl,
+        fetchedAt: this.now(),
           gen,
         });
         this.writeL2(`${this.cachePrefix}sub:${key}`, {
@@ -967,7 +998,7 @@ export class AlfizClient<
       const gate = this.maybeValidate();
       if (gate) await gate;
       const cached = this.objectCache.get(scope);
-      if (cached && cached.expiresAt > this.now()) {
+      if (cached && this.live(cached)) {
         this.objectCache.delete(scope);
         this.objectCache.set(scope, cached);
         return cached.chain;
@@ -987,6 +1018,7 @@ export class AlfizClient<
           this.storeObject(scope, {
             chain,
             expiresAt: this.now() + this.objectTtl,
+            fetchedAt: this.now(),
             gen,
           });
           this.writeL2(`${this.cachePrefix}obj:${scope}`, {

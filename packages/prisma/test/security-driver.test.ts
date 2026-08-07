@@ -13,18 +13,6 @@
  * finding, not a test to relax.
  */
 
-/**
- * KNOWN-OPEN MARKER — `it.fails(...)` in this file.
- *
- * A test written as `it.fails` asserts the SECURE behavior and records that
- * Alfiz does not have it yet: it passes while the finding is open, and turns
- * RED the moment someone fixes the underlying issue. That is the point — the
- * failure is the signal to delete the `.fails` and promote the test, so a
- * fix can never land silently and a finding can never quietly rot.
- *
- * Every one of them is listed in the 0.7.1 changelog entry with its
- * severity. They are open findings, not accepted behavior.
- */
 import { describe, expect, it } from "vitest";
 import {
   createApplication,
@@ -607,7 +595,7 @@ describe("uniqueness: the schema's primary keys must be enforced by every driver
     await expect(driver.insertRevoke(revoke("r1", "u2"))).rejects.toThrow();
   });
 
-  it.fails("deleteGrant returns null when the row vanished between the read and the delete", async () => {
+  it("deleteGrant returns null when the row vanished between the read and the delete", async () => {
     // The driver reads the row, then issues deleteMany — and ignores the
     // affected-row count, so a concurrent deleter makes it report a
     // deletion it did not perform (a duplicate audited `grant.delete`).
@@ -630,7 +618,7 @@ describe("uniqueness: the schema's primary keys must be enforced by every driver
 // ---------------------------------------------------------------------------
 
 describe("transactionality: partial failures must not fail open", () => {
-  it.fails("upsertRole never leaves the role transiently unreadable", async () => {
+  it("upsertRole never leaves the role transiently unreadable", async () => {
     // The Prisma driver implements upsertRole as deleteMany + create, and
     // `updateRole` is NOT wrapped in runExclusive, so a concurrent reader
     // sees the role missing. "Unknown roles confer nothing" — every grant
@@ -661,20 +649,30 @@ describe("transactionality: partial failures must not fail open", () => {
     expect(midFlight).not.toBeNull();
   });
 
-  it.fails("upsertRole does not destroy the existing role when the write half fails", async () => {
+  it("upsertRole does not destroy the existing role when the write half fails", async () => {
     const db = mockDelegates();
     const driver = prismaDriver(db);
     await driver.upsertRole({ id: "role1", name: "v1", patterns: ["docs.a"] });
+    // One atomic statement, so there is no longer a "write half" that can
+    // fail after a delete already landed — an existing role never reaches
+    // `create` at all.
     db.alfizRole.create = async () => {
+      throw new Error("create must not be reached for an existing role");
+    };
+    await driver.upsertRole({ id: "role1", name: "v2", patterns: ["docs.b"] });
+    expect(await driver.getRole("role1")).toMatchObject({ name: "v2" });
+
+    // And when the statement itself fails, the row is untouched — not lost.
+    db.alfizRole.upsert = async () => {
       throw new Error("transient database failure");
     };
     await expect(
-      driver.upsertRole({ id: "role1", name: "v2", patterns: ["docs.b"] }),
-    ).rejects.toThrow();
-    expect(await driver.getRole("role1")).not.toBeNull();
+      driver.upsertRole({ id: "role1", name: "v3", patterns: ["docs.c"] }),
+    ).rejects.toThrow(/transient/);
+    expect(await driver.getRole("role1")).toMatchObject({ name: "v2" });
   });
 
-  it.fails("concurrent upsertRole calls converge instead of raising a duplicate-key error", async () => {
+  it("concurrent upsertRole calls converge instead of raising a duplicate-key error", async () => {
     const driver = prismaDriver(mockDelegates());
     await driver.upsertRole({ id: "role1", name: "v0", patterns: [] });
     await expect(

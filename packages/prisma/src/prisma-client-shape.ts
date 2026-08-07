@@ -251,9 +251,23 @@ type P7RoleWhereInput = P7Where<{
   name?: P7StringFilter | string;
 }>;
 
+/** Prisma's update inputs make every column optional. */
+interface P7RoleUpdateInput {
+  name?: string;
+  description?: string | null;
+  patterns?: P7JsonNullValueInput | P7InputJsonValue;
+  requestable?: P7NullableJsonNullValueInput | P7InputJsonValue;
+}
+
 interface P7RoleDelegate {
   create(args: {
     data: P7RoleCreateInput;
+    select?: unknown;
+  }): Promise<P7RolePayload>;
+  upsert(args: {
+    where: P7AtLeast<{ id: string }, "id">;
+    create: P7RoleCreateInput;
+    update: P7RoleUpdateInput;
     select?: unknown;
   }): Promise<P7RolePayload>;
   findUnique(args: {

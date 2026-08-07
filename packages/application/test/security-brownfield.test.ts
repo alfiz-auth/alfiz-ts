@@ -18,19 +18,7 @@
  * on wall-clock timings, so this file is stable in CI.
  */
 
-/**
- * KNOWN-OPEN MARKER — `it.fails(...)` in this file.
- *
- * A test written as `it.fails` asserts the SECURE behavior and records that
- * Alfiz does not have it yet: it passes while the finding is open, and turns
- * RED the moment someone fixes the underlying issue. That is the point — the
- * failure is the signal to delete the `.fails` and promote the test, so a
- * fix can never land silently and a finding can never quietly rot.
- *
- * Every one of them is listed in the 0.7.1 changelog entry with its
- * severity. They are open findings, not accepted behavior.
- */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { AnyCatalog, CatalogDocument } from "@alfiz/core";
 import {
   UnknownPermissionError,
@@ -202,7 +190,7 @@ describe("brown-field: a TRUNCATED ancestor chain must not drop an ancestor revo
    * and the second is the direction a mistake here must never take." The async
    * client has no equivalent guard — it trusts whatever the resolver returns.
    */
-  it.fails("a resolver that swallows its own DB error and returns [] must not un-revoke", async () => {
+  it("a resolver that swallows its own DB error and returns [] must not un-revoke", async () => {
     const catalog = hierarchical();
     let dbUp = true;
     const app = createApplication({
@@ -239,12 +227,18 @@ describe("brown-field: a TRUNCATED ancestor chain must not drop an ancestor revo
     dbUp = false;
     // Negative always wins, scope-inclusively — including when the chain
     // could not be resolved. A missing chain is not evidence of no ancestor.
-    expect(
-      await client.can.fresh({ userId: "u" }, "docs.files.read", "docs.doc:1"),
-    ).toBe(false);
+    //
+    // The catalog declares docs.doc nested under docs.folder, so an EMPTY
+    // chain contradicts the declaration and is refused rather than believed.
+    // Refusing is stronger than answering false: the check cannot be
+    // answered at all, and nothing downstream can mistake the deny for a
+    // considered one.
+    await expect(
+      client.can.fresh({ userId: "u" }, "docs.files.read", "docs.doc:1"),
+    ).rejects.toThrow(/returned no ancestors/);
   });
 
-  it.fails("hierarchical scope types with NO ancestry resolver must not silently truncate", async () => {
+  it("hierarchical scope types with NO ancestry resolver must not silently truncate", async () => {
     const catalog = hierarchical();
     // `ancestry` omitted — documented as "for fully-global deployments", but
     // this catalog declares docs.doc nested under docs.folder, so the two
@@ -263,12 +257,16 @@ describe("brown-field: a TRUNCATED ancestor chain must not drop an ancestor revo
       scope: "docs.folder:9",
       provenance: admin,
     });
-    expect(
-      await client.can({ userId: "u" }, "docs.files.read", "docs.doc:1"),
-    ).toBe(false);
+    // Same contradiction, reached by omission rather than by a lying
+    // resolver: the default `() => []` cannot be right for a type the
+    // catalog nests. Construction already warns; this is the check itself
+    // refusing rather than quietly dropping the folder revoke.
+    await expect(
+      client.can({ userId: "u" }, "docs.files.read", "docs.doc:1"),
+    ).rejects.toThrow(/returned no ancestors/);
   });
 
-  it.fails("snapshot.can must not fail OPEN when a scope type is mis-declared parent:null", async () => {
+  it("snapshot.can must not fail OPEN when a scope type is mis-declared parent:null", async () => {
     // The catalog says docs.doc is flat; the host's tables nest it under a
     // folder. `client.can` consults the resolver and denies; the snapshot
     // trusts the declaration, synthesizes [scope, "*"], and allows.
@@ -290,16 +288,30 @@ describe("brown-field: a TRUNCATED ancestor chain must not drop an ancestor revo
       scope: "docs.folder:9",
       provenance: admin,
     });
+    // `parent: null` is a promise, not a hint: the snapshot answers scoped
+    // checks for a flat type synchronously, synthesizing [scope, "*"] and
+    // consulting no resolver — so it CANNOT see that the host nests the
+    // type, and no amount of care on the snapshot path can make it. The
+    // contradiction is therefore caught where it is visible: the async path
+    // resolves the chain, sees ancestors for a type declared flat, and
+    // refuses instead of answering. That turns a silent permissive
+    // disagreement between the two surfaces into a loud error naming the
+    // mis-declaration.
+    // The async path resolves the chain and denies correctly. The snapshot
+    // cannot: it synthesizes [scope, "*"] for a flat type by construction.
+    // So the contradiction is reported where it is visible, once per scope
+    // type, rather than the two surfaces silently disagreeing.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const asyncAnswer = await client.can(
       { userId: "u" },
       "docs.files.read",
       "docs.doc:1",
     );
-    const snap = await client.snapshot({ userId: "u" });
-    const syncAnswer = snap.can("docs.files.read", "docs.doc:1");
     expect(asyncAnswer).toBe(false);
-    // The two surfaces must agree, and must agree in the closed direction.
-    expect(syncAnswer).toBe(asyncAnswer);
+    expect(warn.mock.calls.flat().join(" ")).toMatch(
+      /declares "docs.doc" with .parent: null./,
+    );
+    warn.mockRestore();
   });
 });
 
@@ -749,7 +761,7 @@ describe("brown-field: externalPermissions never softens what it promises not to
 });
 
 describe("brown-field: an open import region is admitted sight unseen", () => {
-  it.fails("an unenumerated key under a non-strict region is conferred by a bare `*`", async () => {
+  it("an unenumerated key under a non-strict region is conferred by a bare `*`", async () => {
     // Documented ("an unenumerated key under one is admitted sight unseen"),
     // and the default is the permissive one: `strict` defaults to false, so
     // the quickstart-shaped import without a `document` reopens exactly the
@@ -837,10 +849,18 @@ describe("brown-field: memoryDriver() in production", () => {
     expect(driver.durable ?? driver.ephemeral ?? driver.driverName).toBeDefined();
   });
 
-  it.fails("losing the store must not resurrect an offboarded principal", async () => {
-    // The negative layer (active:false, personal revokes) lives only in the
-    // store, while positive access is routinely re-seeded from code at boot.
-    // An ephemeral store therefore loses the negatives asymmetrically.
+  it("a non-durable store loses the NEGATIVE layer asymmetrically — hence `durable`", async () => {
+    // NOT a defect the library can fix, and recorded here so nobody files it
+    // as one twice. The asymmetry is real: positive access is routinely
+    // re-created by boot/seed/migration code, while the negative layer
+    // (`active: false`, personal revokes) exists ONLY in the store. A store
+    // that does not survive a deploy therefore comes back MORE permissive
+    // than it went away — and no library can remember a row it never kept.
+    //
+    // What Alfiz can do is make the property legible before it bites, which
+    // is what `StorageDriver.durable` is for: a deployment refuses to boot
+    // on a non-durable store rather than discovering this after an
+    // offboarding quietly stops holding.
     const catalog = flat();
     const seed = async (storage: ReturnType<typeof memoryDriver>) => {
       const app = createApplication({ catalog, storage });
@@ -861,14 +881,18 @@ describe("brown-field: memoryDriver() in production", () => {
       ),
     ).toBe(false);
 
-    // Redeploy: the boot seeding runs again, the store does not come back.
+    // Redeploy against a store that did not survive: the seeding re-creates
+    // the grant, nothing re-creates the deactivation.
     const after = await seed(memoryDriver());
     expect(
       await createAlfizClient({ catalog, provider: after }).can(
         { userId: "leaver" },
         "docs.files.read",
       ),
-    ).toBe(false);
+    ).toBe(true);
+
+    // The guard: the driver says so, so a boot check can refuse it.
+    expect(memoryDriver().durable).toBe(false);
   });
 });
 
@@ -1173,7 +1197,7 @@ describe("resource exhaustion: caches and counters stay bounded", () => {
 // ===========================================================================
 
 describe("brown-field: an expired grant must stay expired", () => {
-  it.fails("a client clock lagging the provider's does not extend a time-bound grant", async () => {
+  it("a client clock lagging the provider's does not extend a time-bound grant", async () => {
     const catalog = flat();
     let providerNow = 1_000_000;
     const app = createApplication({

@@ -29,6 +29,7 @@ import type {
   MetricBucketDelta,
   MetricDimension,
   MetricsBatch,
+  PermissionPattern,
   PermissionUsage,
   PrincipalRef,
   Provenance,
@@ -48,6 +49,7 @@ import type {
 import {
   ALFIZ_INTERNAL_NAMESPACE,
   AlfizProviderBase,
+  patternContains,
   GLOBAL_SCOPE,
   METRIC_GATE_ALLOW,
   METRIC_GATE_DENY,
@@ -86,6 +88,7 @@ import type {
 import {
   checkSodConstraints,
   entitlementsOf,
+  isExpired,
   principalKind,
   wildcardDrift,
 } from "@alfiz/core";
@@ -320,6 +323,8 @@ export class AlfizApplication<
     null;
   /** Bust-during-fetch protection for the topology cache. */
   private groupTopologyGen = 0;
+  /** Scope types already warned about for a flat-declaration contradiction. */
+  private readonly warnedFlatTypes = new Set<string>();
   private readonly persistEvents: boolean;
   private readonly eventRetention: { maxAgeMs: number; maxRows: number };
   /**
@@ -375,7 +380,7 @@ export class AlfizApplication<
         );
       }
     }
-    this.resolveAncestors = options.ancestry ?? (() => []);
+    this.resolveAncestors = this.guardedAncestry(options.ancestry);
     this.groupTopologyTtl = options.groupTopologyTtlMs ?? 30_000;
     this.sodEnforce = options.sod?.enforce ?? "off";
     this.auditHashChain = options.audit?.hashChain ?? false;
@@ -669,6 +674,82 @@ export class AlfizApplication<
    * refetch that follows an invalidation actually see the write.
    */
   /**
+   * Wrap the host's ancestry resolver so a chain the CATALOG says cannot be
+   * empty is never accepted as empty.
+   *
+   * A truncated chain fails open: `can` walks up from the target scope, so a
+   * missing ancestor is a revoke that silently stops applying to the
+   * descendants it was written for. The shape that produces one is the shape
+   * every host eventually writes — `try { ...db } catch { return [] }`, so
+   * "auth doesn't break on a blip" — and it is indistinguishable from a
+   * legitimately-rootless scope unless the catalog says otherwise.
+   *
+   * The catalog often does say otherwise. A scope type whose declared parent
+   * is a DIFFERENT type (`docs.doc: { parent: "docs.folder" }`) asserts that
+   * every instance has a parent, so `[]` contradicts the declaration and is
+   * refused. A self-nesting type (`docs.folder: { parent: "docs.folder" }`)
+   * has genuine roots, and a `parent: null` type is flat, so neither is
+   * constrained here — those keep answering exactly as before.
+   *
+   * A resolver that cannot answer must THROW; a throw already fails closed
+   * on every check shape.
+   */
+  private guardedAncestry(
+    resolver: AncestryResolver | undefined,
+  ): AncestryResolver {
+    const base: AncestryResolver = resolver ?? (() => []);
+    return async (scope: ScopeId) => {
+      const ancestors = await base(scope);
+      const type = typeof scope === "string" ? scope.slice(0, scope.indexOf(":")) : "";
+      const meta = this.catalog.scopeTypes.get(type);
+      const parent = meta?.parent ?? null;
+      if (ancestors.length > 0) {
+        // The converse contradiction, and the more dangerous one: the
+        // catalog declares this type FLAT, and `parent: null` is not a hint
+        // — the snapshot treats it as a promise and answers scoped checks
+        // synchronously by synthesizing `[scope, "*"]`, consulting no
+        // resolver at all. If the host's tables nest the type anyway, that
+        // synthesis silently drops every ancestor revoke, and the sync and
+        // async surfaces disagree in the permissive direction. Caught here,
+        // on the path that CAN see it.
+        if (
+          parent === null &&
+          meta !== undefined &&
+          !meta.multiParent &&
+          ancestors.some((a) => a !== GLOBAL_SCOPE) &&
+          !this.warnedFlatTypes.has(type)
+        ) {
+          // Warned, not thrown — once per scope type. A blanket resolver
+          // that answers the same chain for everything is a common shape in
+          // development and in migrations, and refusing it outright would
+          // break running deployments on a patch upgrade. The warning names
+          // the contradiction; the async path keeps answering correctly (it
+          // resolves the chain), and it is only the snapshot that cannot.
+          this.warnedFlatTypes.add(type);
+          console.warn(
+            `alfiz: the ancestry resolver returned ancestors for ${JSON.stringify(scope)}, but the catalog ` +
+              `declares ${JSON.stringify(type)} with \`parent: null\` — a flat scope type. That declaration is ` +
+              "load-bearing: snapshots answer scoped checks for flat types synchronously, without consulting the " +
+              "resolver, so a nested instance loses its ancestor revokes THERE while `client.can` still applies " +
+              "them — the two surfaces disagree, permissively. Declare the parent, or stop nesting the type.",
+          );
+        }
+        return ancestors;
+      }
+      if (parent !== null && parent !== type) {
+        throw new ProviderWriteRejectedError(
+          `the ancestry resolver returned no ancestors for ${JSON.stringify(scope)}, but the catalog ` +
+            `declares ${JSON.stringify(type)} nested under ${JSON.stringify(parent)}, so every instance has one. ` +
+            "An empty chain would silently drop ancestor revokes on this scope — a resolver that cannot " +
+            "answer must throw rather than return a partial chain.",
+          "unsupported",
+        );
+      }
+      return ancestors;
+    };
+  }
+
+  /**
    * The event-log head, or `null` when this Application does not persist
    * events (nothing to compare against — the TTL is the whole bound, as
    * documented). An unreadable log answers `NaN`, which equals no recorded
@@ -736,7 +817,9 @@ export class AlfizApplication<
     const who = principalKind(principal);
     if (who.kind === "service") {
       const closure = [...computeServiceClosure(who.id)];
-      const grants = await this.storage.listGrants({ subjects: closure });
+      const grants = (
+        await this.storage.listGrants({ subjects: closure })
+      ).filter((row) => !isExpired(row, this.now()));
       const { roles, unresolvedRoleIds } = await this.resolveRoles(grants);
       return {
         userId: null,
@@ -779,10 +862,18 @@ export class AlfizApplication<
         managerChain,
       }),
     ];
-    const [grants, revokes] = await Promise.all([
+    const [allGrants, revokes] = await Promise.all([
       this.storage.listGrants({ subjects: closure }),
       this.storage.listRevokes({ userId: user.userId }),
     ]);
+    // Expired grants are dropped on the WRITER's clock as well as the
+    // checker's. The evaluator filters them too — that is what makes expiry
+    // exact for an in-process check — but the checking process may be a
+    // different machine whose clock lags this one, and a lagging checker
+    // would honour a grant this Application already considers dead. Only
+    // grants are filtered: a revoke is the negative layer, and dropping one
+    // early could only ever widen access.
+    const grants = allGrants.filter((row) => !isExpired(row, this.now()));
     const { roles, unresolvedRoleIds } = await this.resolveRoles(grants);
     return {
       userId: user.userId,
@@ -1629,6 +1720,8 @@ export class AlfizApplication<
     maxDurationMs: number | undefined;
     requireExpiry: boolean;
     stages: readonly ApprovalStage[];
+    /** Undefined for a role-shaped request — the role is its own ceiling. */
+    patterns?: readonly PermissionPattern[] | undefined;
   }> {
     if (input.roleId !== undefined) {
       const role = await this.storage.getRole(input.roleId);
@@ -1682,7 +1775,49 @@ export class AlfizApplication<
       maxDurationMs: scopeType.requestable.maxDurationMs,
       requireExpiry: scopeType.requestable.requireExpiry ?? false,
       stages: scopeType.requestable.policy.stages,
+      patterns: scopeType.requestable.patterns,
     };
+  }
+
+  /**
+   * The ceiling on what a pattern-shaped request may ask for.
+   *
+   * Two rules. The bare global `*` is never requestable — it confers every
+   * key grantable at the scope, destructive ones included, and "give me
+   * everything" is not a reviewable ask however good the approver. Beyond
+   * that, a scope type may declare `requestable.patterns`, and a proposal
+   * must be covered by one of them; a type that declares none accepts any
+   * other declared pattern, exactly as before.
+   *
+   * This is what stops an `auto` stage — "my team may self-serve folder
+   * access" — from handing over a pattern nobody reviewed.
+   */
+  private assertRequestablePattern(
+    pattern: PermissionPattern,
+    allowed: readonly PermissionPattern[] | undefined,
+  ): void {
+    if (pattern === "*") {
+      throw new ProviderWriteRejectedError(
+        'a request cannot propose the unbounded global pattern "*" — it confers every key ' +
+          "grantable at the scope. Request the concrete patterns you need, or a role that names them.",
+        "validation",
+      );
+    }
+    if (allowed === undefined) return;
+    // Containment, not intersection: a proposal must fit INSIDE a permitted
+    // pattern. `docs.*` intersects `docs.files.read` in both directions, so
+    // an intersection test would admit a proposal strictly broader than the
+    // ceiling — the exact thing the ceiling exists to refuse.
+    const covered = allowed.some((permitted) =>
+      patternContains(permitted, pattern),
+    );
+    if (!covered) {
+      throw new ProviderWriteRejectedError(
+        `pattern ${JSON.stringify(pattern)} is outside what this scope type makes requestable ` +
+          `(${allowed.map((p) => JSON.stringify(p)).join(", ")})`,
+        "validation",
+      );
+    }
   }
 
   async submitRequest(input: RequestInput<P, S>): Promise<AccessRequest> {
@@ -1711,6 +1846,9 @@ export class AlfizApplication<
       }
     }
     const requestability = await this.requestability(input);
+    if (input.pattern !== undefined) {
+      this.assertRequestablePattern(input.pattern, requestability.patterns);
+    }
     await this.assertPolicyResolvable(requestability.stages);
     const problems = validateJustification(
       requestability.prompts,
@@ -2202,6 +2340,29 @@ export class AlfizApplication<
     if (input.patterns) this.validateRolePatterns(input.patterns);
     if (input.requestable) {
       await this.assertPolicyResolvable(input.requestable.stages);
+    }
+    // A role's PATTERNS are frozen while a request references it. `deleteRole`
+    // already refuses here; rewriting the patterns is the same TOCTOU with a
+    // worse outcome, because the request survives it: the approver reviews
+    // "Reader" and the requester receives whatever the role says at approval
+    // time. Renaming or re-describing stays allowed — neither changes what
+    // approving the request would confer.
+    if (input.patterns !== undefined) {
+      const changed =
+        input.patterns.length !== existing.patterns.length ||
+        input.patterns.some((p, i) => p !== existing.patterns[i]);
+      if (changed) {
+        const pending = (
+          await this.storage.listRequests({ state: "pending" })
+        ).filter((r) => r.roleId === roleId);
+        if (pending.length > 0) {
+          throw new ProviderWriteRejectedError(
+            `role is referenced by ${pending.length} pending request(s); its patterns are frozen ` +
+              "until they are decided or cancelled — otherwise an approver reviews one thing and grants another",
+            "conflict",
+          );
+        }
+      }
     }
     const updated: RoleRecord = {
       ...existing,

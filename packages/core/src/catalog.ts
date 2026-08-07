@@ -264,6 +264,23 @@ export interface ScopeTypeInput {
     maxDurationMs?: number;
     /** Require the request to propose an expiry (just-in-time only). */
     requireExpiry?: boolean;
+    /**
+     * The ceiling on what a request may ASK for at this scope type.
+     *
+     * The rest of this declaration bounds who approves and for how long;
+     * without this, nothing bounded *what*. The requester supplies the
+     * pattern, so `{ kind: "auto" }` — "my team may self-serve folder
+     * access" — would grant a proposed `*` with no human in the loop, and
+     * `*` at a scope confers every key grantable there, destructive ones
+     * included.
+     *
+     * Each entry is a pattern a proposal must be covered by. Omitted means
+     * "any declared pattern except the unbounded global `*`", which is the
+     * floor and is not opt-out-able: a request for everything is never a
+     * reviewable ask. Role-shaped requests are bounded by the role and are
+     * unaffected.
+     */
+    patterns?: readonly PermissionPattern[];
     policy: ApprovalPolicyInput;
   };
 }
@@ -869,6 +886,8 @@ export interface AnyCatalog {
   readonly $pattern: string;
   readonly $scope: string;
   hasKey(key: string): boolean;
+  /** Declared vocabulary, as opposed to merely region-admitted — see the impl. */
+  isEnumeratedKey(key: string): boolean;
   hasGroup(path: string): boolean;
   leaf(key: string): LeafMeta | undefined;
   keysMatching(pattern: PermissionPattern): PermissionKey[];
@@ -981,6 +1000,25 @@ export class Catalog<C extends CatalogInput = CatalogInput> {
 
   hasKey(key: string): boolean {
     return this.leaves.has(key) || this.admittingRegion(key) !== undefined;
+  }
+
+  /**
+   * Whether this key is ENUMERATED vocabulary — declared as a leaf, whether
+   * owned or materialized from an import's attached document — as opposed to
+   * merely admitted, sight unseen, by an open non-strict import region.
+   *
+   * The distinction only matters in one place, and it matters a lot there:
+   * the rule that a bare global `*` confers only declared vocabulary. That
+   * rule exists so a typo in a foreign namespace does not pass for exactly
+   * the broadly-privileged people who review and test the gate. An open
+   * region made `hasKey` true for every string under it, so `zoom.host_typo`
+   * became "declared" and rode in on every `*` grant — the same failure the
+   * rule was written to prevent, one level down. A grant that NAMES the
+   * namespace (`zoom.*`, `zoom.meetings.*`) still confers it: that grant was
+   * written by someone who knew the region was open.
+   */
+  isEnumeratedKey(key: string): boolean {
+    return this.leaves.has(key);
   }
 
   hasGroup(path: string): boolean {
