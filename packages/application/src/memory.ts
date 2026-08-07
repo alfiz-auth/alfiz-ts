@@ -34,7 +34,15 @@ const matchesGrant = (row: GrantRow, filter?: GrantFilter): boolean => {
     return false;
   }
   if (filter?.scope !== undefined && row.scope !== filter.scope) return false;
-  if (filter?.roleId !== undefined && row.roleId !== filter.roleId) return false;
+  // Only a string is a roleId filter — an explicit `null` off the wire is
+  // not "grants with no role", which on a nullable column would mean every
+  // pattern grant there is. Kept in step with the Prisma driver deliberately:
+  // a filter that means different things on two drivers is a wrong answer on
+  // at least one of them.
+  if (filter?.roleId !== undefined) {
+    if (typeof filter.roleId !== "string") return false;
+    if (row.roleId !== filter.roleId) return false;
+  }
   return true;
 };
 
@@ -64,7 +72,20 @@ export function memoryDriver(): StorageDriver {
   let prunedThrough = 0;
 
   return {
+    // Process-lifetime only. Declared so a deployment can refuse to boot on
+    // it rather than discover it the first time a revoke does not survive a
+    // restart — see `StorageDriver.durable`.
+    durable: false,
+    driverName: "memory",
+
     async insertGrant(row) {
+      // `id` is a primary key in the schema fragment, so Prisma rejects a
+      // duplicate and this driver must too — a `Map.set` silently REPLACED
+      // the live row, which turns a caller-chosen id (an org snapshot
+      // supplies its own) into a rewrite of somebody else's grant.
+      if (grants.has(row.id)) {
+        throw new Error(`alfiz: a grant with id ${JSON.stringify(row.id)} already exists`);
+      }
       grants.set(row.id, clone(row));
     },
     async deleteGrant(id) {
@@ -86,6 +107,9 @@ export function memoryDriver(): StorageDriver {
     },
 
     async insertRevoke(row) {
+      if (revokes.has(row.id)) {
+        throw new Error(`alfiz: a revoke with id ${JSON.stringify(row.id)} already exists`);
+      }
       revokes.set(row.id, clone(row));
     },
     async deleteRevoke(id) {
@@ -158,6 +182,11 @@ export function memoryDriver(): StorageDriver {
     },
 
     async insertRequest(request) {
+      if (requests.has(request.id)) {
+        throw new Error(
+          `alfiz: a request with id ${JSON.stringify(request.id)} already exists`,
+        );
+      }
       requests.set(request.id, clone(request));
     },
     async updateRequest(request) {
@@ -210,6 +239,18 @@ export function memoryDriver(): StorageDriver {
       audit.push(clone(event));
     },
     async listAudit(filter?: AuditFilter) {
+      // Refused here for the same reason the Prisma driver refuses it: an
+      // epoch-millisecond bound with a fraction has no meaning, and letting
+      // numeric comparison quietly accept one made the same filter select a
+      // different span on the two drivers.
+      for (const field of ["from", "to"] as const) {
+        const value = filter?.[field];
+        if (value !== undefined && !Number.isSafeInteger(value)) {
+          throw new TypeError(
+            `alfiz: listAudit ${field} must be an integer epoch-millisecond value, received ${JSON.stringify(value)}`,
+          );
+        }
+      }
       let rows = [...audit].sort((a, b) =>
         a.at !== b.at ? a.at - b.at : a.id < b.id ? -1 : a.id > b.id ? 1 : 0,
       );
@@ -237,7 +278,13 @@ export function memoryDriver(): StorageDriver {
         const limit = filter?.limit ?? rows.length;
         return rows.slice(0, limit).map(clone);
       }
+      // `slice(-0)` is `slice(0)` — the whole table — and a negative limit
+      // becomes `slice(n)`, which returns MORE rows than asked for and drops
+      // the oldest. The Prisma driver short-circuits both; so does this one,
+      // or the audit log is an unbounded read away from any caller who can
+      // put a number in a filter.
       const limit = filter?.limit ?? rows.length;
+      if (limit <= 0) return [];
       return rows.slice(-limit).map(clone);
     },
 
@@ -252,7 +299,21 @@ export function memoryDriver(): StorageDriver {
     },
     async eventsSince(seq, limit) {
       if (seq < prunedThrough) return { gap: true };
-      const matched = events.filter((e) => e.seq > seq).slice(0, limit);
+      const take = limit === undefined ? undefined : Math.max(0, Math.trunc(limit));
+      const page = events.filter((e) => e.seq > seq).slice(0, take);
+      // Same contiguity rule the Prisma driver enforces: a hole in the
+      // sequence stops the page, so a cursor never advances past an
+      // invalidation the reader has not actually been handed. Unreachable in
+      // this driver (append is synchronous), and pinned here so the two
+      // drivers agree — the conformance suite is what a third-party driver
+      // is graded against.
+      const matched: typeof page = [];
+      let expected = seq + 1;
+      for (const e of page) {
+        if (e.seq !== expected) break;
+        matched.push(e);
+        expected += 1;
+      }
       return {
         upTo: matched.length > 0 ? matched[matched.length - 1]!.seq : seq,
         events: matched.map((e) => clone(e.event)),

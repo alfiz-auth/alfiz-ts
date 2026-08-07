@@ -73,6 +73,18 @@ export interface PrismaDriverOptions {
    * would have rejected alone.
    */
   lock?: (<T>(key: string, fn: () => Promise<T>) => Promise<T>) | undefined;
+  /**
+   * The sentinel your Prisma client uses to write SQL NULL into a nullable
+   * `Json` column — `Prisma.DbNull`. Needed only to CLEAR a role's
+   * `requestable` policy; every other write passes a real value.
+   *
+   * It is an option rather than an import because this package deliberately
+   * keeps `@prisma/client` out of its dependency graph (see the module
+   * header). Defaults to `null`, which is correct for the bundled memory
+   * driver and for any client that accepts it; pass `Prisma.DbNull` if your
+   * client rejects a bare `null` on a Json column.
+   */
+  jsonNull?: unknown;
 }
 
 // ---------------------------------------------------------------------------
@@ -83,9 +95,30 @@ export interface PrismaDriverOptions {
 const toJson = (value: unknown): InputJsonValue => value as InputJsonValue;
 const fromJson = <T>(value: unknown): T => value as T;
 
-const toBig = (value: number): bigint => BigInt(value);
+/**
+ * Epoch-millisecond values cross into `BigInt` columns here, and `BigInt`
+ * throws a bare `RangeError` on anything non-integral — `0.5`, `NaN`, a
+ * numeric string. Those reach this driver from the wire (`{"filter":{"from":
+ * 0.5}}`, `{"op":"epoch.since","seq":0.5}`), where the answer should be a
+ * typed error rather than an untyped 500 out of the storage layer; the
+ * memory driver, comparing numbers, filtered them without complaint.
+ *
+ * Refused rather than rounded, and refused identically in `memoryDriver`.
+ * Rounding cannot make the two drivers agree — a `from` bound would have to
+ * round up and a `to` bound down to match numeric comparison — and a filter
+ * that means a different span on two drivers is a wrong answer on one of
+ * them. There is no sensible epoch-millisecond value with a fraction.
+ */
+const toBig = (value: number): bigint => {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    throw new TypeError(
+      `alfiz: expected an integer epoch-millisecond value, received ${JSON.stringify(value)}`,
+    );
+  }
+  return BigInt(value);
+};
 const optToBig = (value: number | undefined): bigint | null =>
-  value === undefined ? null : BigInt(value);
+  value === undefined ? null : toBig(value);
 const optFromBig = (value: bigint | null): number | undefined =>
   value === null ? undefined : Number(value);
 const optFromStr = (value: string | null): string | undefined =>
@@ -258,6 +291,7 @@ export function prismaDriver(
   options?: PrismaDriverOptions,
 ): StorageDriver {
   const externalLock = options?.lock;
+  const jsonNull = options?.jsonNull ?? null;
   const locks = new Map<string, Promise<unknown>>();
 
   const exclusive = <T>(key: string, fn: () => Promise<T>): Promise<T> => {
@@ -289,7 +323,17 @@ export function prismaDriver(
       where.subject = { in: [...filter.subjects] };
     }
     if (filter?.scope !== undefined) where.scope = filter.scope;
-    if (filter?.roleId !== undefined) where.roleId = filter.roleId;
+    if (filter?.roleId !== undefined) {
+      // `roleId` is a nullable column, and Prisma reads `{ roleId: null }` as
+      // `IS NULL` — so a JSON body carrying an explicit `null` (which the
+      // wire layer forwards verbatim) turned "grants of this role" into
+      // "every pattern grant in the organization". Dropping the clause would
+      // be no better: that is the same widening by another route. A filter
+      // naming a role that cannot exist matches nothing, which is what the
+      // memory driver already answers.
+      if (typeof filter.roleId !== "string") return null;
+      where.roleId = filter.roleId;
+    }
     return where;
   };
 
@@ -307,17 +351,23 @@ export function prismaDriver(
   };
 
   return {
+    durable: true,
+    driverName: "prisma",
+
     // -- grants ---------------------------------------------------------------
     async insertGrant(row) {
       await db.alfizGrant.create({ data: grantToDb(row) });
     },
     async deleteGrant(id) {
       // Read first, then deleteMany: Prisma's `delete` throws when the row is
-      // absent, and the contract wants `null` back instead.
+      // absent, and the contract wants `null` back instead. The affected-row
+      // count decides the answer — discarding it made a concurrent deleter
+      // look like our own success, and the Application audits a second
+      // `grant.delete` for a row it did not remove.
       const existing = await db.alfizGrant.findUnique({ where: { id } });
       if (existing === null) return null;
-      await db.alfizGrant.deleteMany({ where: { id } });
-      return grantFromDb(existing);
+      const { count } = await db.alfizGrant.deleteMany({ where: { id } });
+      return count === 0 ? null : grantFromDb(existing);
     },
     async listGrants(filter?: GrantFilter) {
       const where = grantWhere(filter);
@@ -347,8 +397,8 @@ export function prismaDriver(
     async deleteRevoke(id) {
       const existing = await db.alfizRevoke.findUnique({ where: { id } });
       if (existing === null) return null;
-      await db.alfizRevoke.deleteMany({ where: { id } });
-      return revokeFromDb(existing);
+      const { count } = await db.alfizRevoke.deleteMany({ where: { id } });
+      return count === 0 ? null : revokeFromDb(existing);
     },
     async listRevokes(filter?: RevokeFilter) {
       const where: AlfizRevokeWhere = {};
@@ -360,12 +410,32 @@ export function prismaDriver(
 
     // -- roles ----------------------------------------------------------------
     async upsertRole(role) {
-      // delete + create, not upsert: clearing the nullable `requestable` Json
-      // column on downgrade would need Prisma's DbNull sentinel, which this
-      // package cannot reference without depending on @prisma/client. The
-      // Application serializes organizational writes, so the window is benign.
-      await db.alfizRole.deleteMany({ where: { id: role.id } });
-      await db.alfizRole.create({ data: roleToDb(role) });
+      // Update-then-create, never delete-then-create. The old comment
+      // claimed the delete/create window was benign because "the Application
+      // serializes organizational writes" — it does not: only `groups`,
+      // `reporting`, `request:*` and `audit` take the lock, and role writes
+      // never did. So the window was real, and while it was open every grant
+      // conferring the role denied ("unknown roles confer nothing"), a
+      // failure in the create half destroyed the role outright, and two
+      // concurrent updates collided on the primary key.
+      //
+      await db.alfizRole.upsert({
+        where: { id: role.id },
+        create: roleToDb(role),
+        update: {
+          name: role.name,
+          description: role.description ?? null,
+          patterns: toJson(role.patterns),
+          // Explicit on every update, unlike the create half: a role that
+          // LOST its requestable policy must have the column cleared, and
+          // omitting the field would silently keep the old policy alive —
+          // a de-privileging edit that did not de-privilege.
+          requestable:
+            role.requestable === undefined
+              ? toJson(jsonNull)
+              : toJson(role.requestable),
+        },
+      });
     },
     async getRole(id) {
       const row = await db.alfizRole.findUnique({ where: { id } });
@@ -816,14 +886,35 @@ function eventMethods(
       const head = await epoch.findUnique({ where: { id: 1 } });
       if (head === null) return { upTo: seq, events: [] };
       if (BigInt(seq) < head.prunedThrough) return { gap: true };
+      // A NEGATIVE `take` means "the last N rows" to Prisma, which would
+      // hand back the newest event and an `upTo` at head — retiring every
+      // invalidation in between. The caller's limit is wire-supplied
+      // (`epoch.since`), so it is clamped here rather than trusted.
+      const take = Math.max(0, Math.trunc(limit ?? 0)) || undefined;
       const rows = await event.findMany({
         where: { seq: { gt: BigInt(seq) } },
         orderBy: { seq: "asc" },
-        take: limit,
+        ...(take === undefined ? {} : { take }),
       });
+      // `seq` is allocated by an atomic increment and the row is inserted
+      // afterwards, so there is always a window where N+1 is committed and N
+      // is not. Returning [N+1] with `upTo: N+1` retires N forever — the
+      // poller advances its cursor past an invalidation it never saw, and
+      // that node serves the revoked grant until its blind TTL. Stop at the
+      // first discontinuity instead; the caller comes back for the rest.
+      const contiguous: typeof rows = [];
+      let expected = BigInt(seq) + 1n;
+      for (const row of rows) {
+        if (row.seq !== expected) break;
+        contiguous.push(row);
+        expected += 1n;
+      }
       return {
-        upTo: rows.length > 0 ? Number(rows[rows.length - 1]!.seq) : seq,
-        events: rows.map((row) => fromJson<InvalidationEvent>(row.payload)),
+        upTo:
+          contiguous.length > 0
+            ? Number(contiguous[contiguous.length - 1]!.seq)
+            : seq,
+        events: contiguous.map((row) => fromJson<InvalidationEvent>(row.payload)),
       };
     },
     async pruneEvents(cutoff) {

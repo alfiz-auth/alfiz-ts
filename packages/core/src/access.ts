@@ -84,6 +84,40 @@ export const PROVENANCE_KINDS = [
  *
  * Returns `null` when valid, else the human-readable reason.
  */
+/** The fields each provenance kind declares — nothing else is persisted. */
+const PROVENANCE_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  admin: ["actorUserId"],
+  request: ["requestId", "approvedBy"],
+  dissolution: ["virtualParentId", "originalGrantId"],
+  merge: ["source"],
+  import: ["source"],
+  reconciler: ["integrationId"],
+  system: ["note"],
+};
+
+/**
+ * Reduce a caller-supplied provenance to exactly the fields its kind
+ * declares.
+ *
+ * Provenance was validated and then stored verbatim, so whatever else the
+ * caller sent was persisted with the row: unbounded extra fields, and — from
+ * a JSON body — a live own `__proto__` property, which is a landmine for any
+ * driver that later merges the round-tripped JSON with `Object.assign`.
+ * Nothing reads provenance for an authorization decision (verified), so this
+ * is about what the row *carries*, not about what it confers.
+ *
+ * Validation stays separate and still runs first: this copies known fields,
+ * it does not decide whether they are acceptable.
+ */
+export function normalizeProvenance(provenance: Provenance): Provenance {
+  const source = provenance as unknown as Record<string, unknown>;
+  const out: Record<string, unknown> = { kind: source.kind };
+  for (const field of PROVENANCE_FIELDS[source.kind as string] ?? []) {
+    if (source[field] !== undefined) out[field] = source[field];
+  }
+  return out as unknown as Provenance;
+}
+
 export function validateProvenance(provenance: Provenance): string | null {
   if (provenance === null || typeof provenance !== "object") {
     return `provenance is required: an object with a kind of ${PROVENANCE_KINDS.join(" | ")}`;
@@ -154,11 +188,28 @@ export function validateGrantRow(row: GrantRow): GrantRowIssue | null {
   return null;
 }
 
+/**
+ * Whether a row's time bound has passed — the one reading of `expiresAt`,
+ * so no surface can disagree with another about whether a row is live.
+ *
+ * An expiry the engine cannot compare counts as EXPIRED. The naive
+ * `expiresAt <= now` fails open on every value that is not a usable number:
+ * `NaN <= now` is `false`, and so is any string that coerces to `NaN`, so a
+ * row carrying an expiry the engine cannot honour read as "never expires" —
+ * the maximally permissive reading of the one field whose entire purpose is
+ * to take access away. A just-in-time elevation became permanent. Failing
+ * closed here means a malformed row denies, which is recoverable; the other
+ * direction is not.
+ */
 export function isExpired(
   row: { expiresAt?: number | undefined },
   now: number,
 ): boolean {
-  return row.expiresAt !== undefined && row.expiresAt <= now;
+  if (row.expiresAt === undefined || row.expiresAt === null) return false;
+  if (typeof row.expiresAt !== "number" || !Number.isFinite(row.expiresAt)) {
+    return true;
+  }
+  return row.expiresAt <= now;
 }
 
 /** The patterns a grant confers: its own, or its role's. Unknown roles confer nothing. */

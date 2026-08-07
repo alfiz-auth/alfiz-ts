@@ -177,6 +177,38 @@ export function patternsIntersect(
   return aPrefix.startsWith(bPrefix) || bPrefix.startsWith(aPrefix);
 }
 
+/**
+ * Set CONTAINMENT between two patterns: is every key `inner` could match also
+ * matched by `outer`?
+ *
+ * Distinct from {@link patternsIntersect}, and the distinction is the whole
+ * point wherever one pattern is a ceiling on another. `docs.*` and
+ * `docs.files.read` intersect, and so do `docs.files.*` and `docs.*` — but
+ * only one of each pair is *contained* by the other. A ceiling checked with
+ * intersection would admit a proposal strictly broader than the limit, which
+ * is the failure mode a ceiling exists to prevent.
+ *
+ * - `*` contains everything, and is contained only by `*`.
+ * - A subtree pattern contains a concrete key iff it matches it.
+ * - `a.*` contains `a.b.*` (a subtree of a subtree), never the reverse.
+ * - A concrete pattern contains only itself.
+ */
+export function patternContains(
+  outer: PermissionPattern,
+  inner: PermissionPattern,
+): boolean {
+  if (outer === "*") return true;
+  if (inner === "*") return false;
+  const outerWild = outer.endsWith(".*");
+  const innerWild = inner.endsWith(".*");
+  if (!outerWild) return !innerWild && outer === inner;
+  if (!innerWild) return patternMatchesKey(outer, inner);
+  // Both subtrees: `a.b.*` ⊆ `a.*` iff the inner prefix extends the outer.
+  const outerPrefix = outer.slice(0, -1); // "a."
+  const innerPrefix = inner.slice(0, -1); // "a.b."
+  return innerPrefix.startsWith(outerPrefix);
+}
+
 /** Splits a key into its segments. */
 export function segmentsOf(key: PermissionKey): string[] {
   return key.split(".");

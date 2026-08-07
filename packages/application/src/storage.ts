@@ -79,6 +79,23 @@ export interface AuditFilter {
 }
 
 export interface StorageDriver {
+  /**
+   * Whether rows written here survive the process. Optional and advisory:
+   * absent means "not declared", which is how every driver written before
+   * this field reads.
+   *
+   * It exists because nothing at runtime distinguished `memoryDriver()` from
+   * a database — the quickstart shows the former with "swap this" in a
+   * comment — and the failure is asymmetric. Positive access (an `everyone`
+   * grant, a seeded role) is routinely re-created by boot code; the negative
+   * layer (`active: false`, personal revokes) exists only in the store. A
+   * store that vanishes therefore comes back *more* permissive than it went
+   * away. A deployment can now refuse to boot on `durable === false`.
+   */
+  readonly durable?: boolean;
+  /** Human-readable driver name, for that same boot check and for logs. */
+  readonly driverName?: string;
+
   // -- grants ---------------------------------------------------------------
   insertGrant(row: GrantRow): Promise<void>;
   /** Returns the deleted row, or null when absent. */

@@ -25,8 +25,53 @@ export function formatAlternatives(values: readonly string[]): string {
   return `${quoted.slice(0, -1).join(", ")}, or ${quoted.at(-1)}`;
 }
 
+/**
+ * The bound on a runtime-supplied string echoed back in a message. Keys,
+ * scope ids, and principal ids are caller data — a scope id is `docs.doc:`
+ * plus something that was very likely a URL segment a moment ago — so a
+ * message quoting one must not be sizeable by whoever supplied it. Without
+ * a bound, a 200 KB permission string becomes a 200 KB message retained by
+ * every log line, every `Error` still on the stack, and every wire error
+ * body built from it.
+ */
+const ECHO_LIMIT = 120;
+
+/** Bound an echoed value, naming what was dropped rather than hiding it. */
+export function boundEcho(value: string, limit = ECHO_LIMIT): string {
+  return value.length <= limit
+    ? value
+    : `${value.slice(0, limit)}…(+${value.length - limit} more)`;
+}
+
+// C0, DEL, C1, and the two Unicode line separators — every character a log
+// reader or a terminal treats as a control rather than as text.
+// eslint-disable-next-line no-control-regex
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g;
+
+const escapeControl = (c: string): string => {
+  const code = c.charCodeAt(0);
+  return code <= 0xff
+    ? `\\x${code.toString(16).padStart(2, "0")}`
+    : `\\u${code.toString(16).padStart(4, "0")}`;
+};
+
+/**
+ * Bound an echoed value AND neutralize it, for the positions that
+ * interpolate it *unquoted* — `forbidden: docs.files.read at docs.doc:123
+ * for user:u1`. An id carrying a newline forges a whole extra log line, and
+ * one carrying an ANSI escape repaints the terminal of whoever tails that
+ * log; both are writable by anyone who can reach a denied route. The quoted
+ * positions in this file get the same guarantee free from `JSON.stringify`
+ * — this is how the unquoted ones earn it.
+ */
+export function safeEcho(value: string, limit = ECHO_LIMIT): string {
+  return boundEcho(value.replace(CONTROL_CHARS, escapeControl), limit);
+}
+
 const principalLabel = (p: PrincipalRef): string =>
-  "userId" in p ? `user:${p.userId}` : `service:${p.serviceId}`;
+  "userId" in p
+    ? `user:${safeEcho(p.userId)}`
+    : `service:${safeEcho(p.serviceId)}`;
 
 export class AccessDeniedError extends Error {
   override name = "AccessDeniedError";
@@ -45,8 +90,8 @@ export class AccessDeniedError extends Error {
   }) {
     const what = options.permission
       ? Array.isArray(options.permission)
-        ? `any of [${options.permission.join(", ")}]`
-        : String(options.permission)
+        ? `any of [${options.permission.map((k) => safeEcho(k)).join(", ")}]`
+        : safeEcho(String(options.permission))
       : "access";
     const who = options.principal
       ? ` for ${principalLabel(options.principal)}`
@@ -59,7 +104,7 @@ export class AccessDeniedError extends Error {
           : "";
     super(
       options.message ??
-        `${options.reason}: ${what}${options.scope ? ` at ${options.scope}` : ""}${who}${how}`,
+        `${options.reason}: ${what}${options.scope ? ` at ${safeEcho(options.scope)}` : ""}${who}${how}`,
     );
     this.reason = options.reason;
     this.permission = options.permission;
@@ -124,7 +169,9 @@ export interface UnknownPermissionDetails {
 export function formatUnknownPermission(
   options: UnknownPermissionDetails,
 ): string {
-  const value = JSON.stringify(options.permission);
+  // Bounded before quoting: the permission is a runtime string on the paths
+  // this error exists to cover, so its length is the caller's to choose.
+  const value = JSON.stringify(boundEcho(options.permission));
   const suggestion = options.suggestion ?? undefined;
   const didYouMean = options.didYouMean ?? [];
   const extras =
@@ -249,7 +296,7 @@ export class UnresolvedScopeError extends Error {
             ? ` (and ${resolved.length - shown.length} more)`
             : "");
     super(
-      `snapshot cannot resolve the ancestor chain of ${JSON.stringify(options.scope)} synchronously: ` +
+      `snapshot cannot resolve the ancestor chain of ${JSON.stringify(boundEcho(options.scope))} synchronously: ` +
         (options.declared
           ? `scope type ${JSON.stringify(options.scopeType)} is hierarchical`
           : `scope type ${JSON.stringify(options.scopeType)} is not declared in the catalog` +
@@ -281,7 +328,7 @@ export class MissingConditionError extends Error {
 
   constructor(permission: PermissionKey, shape: string) {
     super(
-      `${JSON.stringify(permission)} is declared \`requiresCondition: true\` — ` +
+      `${JSON.stringify(boundEcho(permission))} is declared \`requiresCondition: true\` — ` +
         `every ${shape} gate for it must pass \`{ condition: () => … }\` ` +
         `evaluating the resource predicate the catalog promises. ` +
         `Holding the permission is necessary but not sufficient by declaration.`,

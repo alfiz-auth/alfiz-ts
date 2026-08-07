@@ -81,7 +81,9 @@ export interface AlfizGrantDelegate {
   findMany(args?: { where?: AlfizGrantWhere }): Promise<AlfizGrantRecord[]>;
   /** `SELECT count(*)`: sizing a grant set without materializing it. */
   count(args?: { where?: AlfizGrantWhere }): Promise<number>;
-  deleteMany(args: { where: { id: string } }): Promise<unknown>;
+  /** Returns the affected-row count: the caller distinguishes a delete it
+   * performed from one a concurrent actor already did. */
+  deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -115,7 +117,9 @@ export interface AlfizRevokeDelegate {
   create(args: { data: AlfizRevokeCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRevokeRecord | null>;
   findMany(args?: { where?: AlfizRevokeWhere }): Promise<AlfizRevokeRecord[]>;
-  deleteMany(args: { where: { id: string } }): Promise<unknown>;
+  /** Returns the affected-row count: the caller distinguishes a delete it
+   * performed from one a concurrent actor already did. */
+  deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -140,12 +144,48 @@ export interface AlfizRoleCreateData {
   requestable?: InputJsonValue;
 }
 
+/**
+ * The update half of `upsertRole`. Fields are optional, mirroring Prisma's
+ * generated update inputs.
+ *
+ * Unlike the create form, `requestable` is written on EVERY update — a role
+ * that lost its requestable policy must have the column cleared, and
+ * omitting the field would silently keep the old policy alive, so a
+ * de-privileging edit would not de-privilege. Clearing a nullable `Json`
+ * column is the one place a client needs its own sentinel
+ * (`Prisma.DbNull`), which this package cannot name without taking
+ * `@prisma/client` as a dependency; `PrismaDriverOptions.jsonNull` supplies
+ * it and the driver casts it at the boundary, alongside its other casts.
+ */
+export interface AlfizRoleUpdateData {
+  name?: string;
+  description?: string | null;
+  patterns?: InputJsonValue;
+  requestable?: InputJsonValue;
+}
+
 export interface AlfizRoleDelegate {
   create(args: { data: AlfizRoleCreateData }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizRoleRecord | null>;
   /** The batch read behind `getRoles`: `WHERE id IN (...)` when filtered. */
   findMany(args?: { where?: { id?: StringWhere } }): Promise<AlfizRoleRecord[]>;
-  deleteMany(args: { where: { id: string } }): Promise<unknown>;
+  /**
+   * One atomic statement, so `upsertRole` never has to delete first — the
+   * same shape `AlfizGroupDelegate` already uses.
+   *
+   * Every grant conferring a role denies while that role is unreadable
+   * ("unknown roles confer nothing"), so a delete-then-create window was a
+   * live authorization outage; a failure between the two halves lost the
+   * role outright; and two concurrent writers collided on the primary key.
+   */
+  upsert(args: {
+    where: { id: string };
+    create: AlfizRoleCreateData;
+    update: AlfizRoleUpdateData;
+  }): Promise<unknown>;
+  /** Returns the affected-row count: the caller distinguishes a delete it
+   * performed from one a concurrent actor already did. */
+  deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +213,9 @@ export interface AlfizGroupDelegate {
   }): Promise<unknown>;
   findUnique(args: { where: { id: string } }): Promise<AlfizGroupRecord | null>;
   findMany(): Promise<AlfizGroupRecord[]>;
-  deleteMany(args: { where: { id: string } }): Promise<unknown>;
+  /** Returns the affected-row count: the caller distinguishes a delete it
+   * performed from one a concurrent actor already did. */
+  deleteMany(args: { where: { id: string } }): Promise<{ count: number }>;
 }
 
 export interface AlfizGroupParentRecord {

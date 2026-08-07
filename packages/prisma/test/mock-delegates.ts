@@ -143,6 +143,31 @@ export function mockDelegates(): AlfizPrismaDelegates {
         if (id !== undefined) rows = rows.filter((r) => matchString(r.id, id));
         return rows.map(clone);
       },
+      async upsert({ where, create, update }) {
+        const existing = roles.get(where.id);
+        if (existing === undefined) {
+          const row: AlfizRoleRecord = clone({
+            id: create.id,
+            name: create.name,
+            description: create.description,
+            patterns: create.patterns,
+            requestable: create.requestable ?? null,
+          });
+          roles.set(row.id, row);
+          return clone(row);
+        }
+        const row: AlfizRoleRecord = clone({
+          id: existing.id,
+          name: update.name,
+          description: update.description,
+          patterns: update.patterns,
+          // The update half is explicit about clearing, so `null` here is a
+          // real "no requestable policy" rather than "leave it alone".
+          requestable: update.requestable ?? null,
+        });
+        roles.set(row.id, row);
+        return clone(row);
+      },
       async deleteMany({ where }) {
         const existed = roles.delete(where.id);
         return { count: existed ? 1 : 0 };
