@@ -68,6 +68,48 @@ export interface ProviderCapabilities {
 export type PrincipalRef = { userId: string } | { serviceId: string };
 
 /**
+ * The one discriminant for {@link PrincipalRef}, so no two readers of a
+ * principal can disagree about who it names.
+ *
+ * The union admits exactly one of the two keys, but that is a *compile-time*
+ * guarantee and it only binds literal call sites: a claims object widened
+ * through `as`, a spread of two sources, or a JSON body straight off the
+ * wire can all carry both. When they do, "pick whichever key I test first"
+ * is the worst possible answer — the Client keyed its cache by one half
+ * while the provider answered for the other, so a user's entry held a
+ * service's authority and the user's own revokes were skipped as
+ * inapplicable. Reading the same field in both places would only hide the
+ * ambiguity behind whichever half won; there is no correct interpretation of
+ * a principal that names two principals, so this refuses it.
+ *
+ * A programming error, on the footing of `UnknownPermissionError`: map it to
+ * 500, never 403. Nobody was denied — the question was malformed.
+ */
+export function principalKind(
+  principal: PrincipalRef,
+): { kind: "user"; id: string } | { kind: "service"; id: string } {
+  const hasUser =
+    "userId" in principal && (principal as { userId?: unknown }).userId != null;
+  const hasService =
+    "serviceId" in principal &&
+    (principal as { serviceId?: unknown }).serviceId != null;
+  if (hasUser && hasService) {
+    throw new TypeError(
+      "alfiz: a principal names both a userId and a serviceId — it must name exactly one. " +
+        "A check cannot be evaluated for two principals, and answering for either one " +
+        "would cache one principal's authority under the other's key.",
+    );
+  }
+  if (hasUser) return { kind: "user", id: (principal as { userId: string }).userId };
+  if (hasService) {
+    return { kind: "service", id: (principal as { serviceId: string }).serviceId };
+  }
+  throw new TypeError(
+    "alfiz: a principal names neither a userId nor a serviceId — it must name exactly one.",
+  );
+}
+
+/**
  * Everything the Client needs to evaluate a principal: their subject closure
  * and the access rows visible to it. Diagnostics are surfaced, never
  * silently dropped.

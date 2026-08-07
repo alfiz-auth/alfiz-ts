@@ -16,6 +16,7 @@
  */
 
 import type { GrantRow, RoleDef } from "./access.js";
+import { isExpired } from "./access.js";
 import type { CatalogDocument } from "./catalog.js";
 import type { PermissionKey, PermissionPattern } from "./grammar.js";
 import { patternMatchesKey } from "./grammar.js";
@@ -62,9 +63,12 @@ export function wildcardDrift(input: {
 
   const findings: WildcardDriftFinding[] = [];
   if (gainedKeys.length > 0) {
-    const live = input.grants.filter(
-      (g) => g.expiresAt === undefined || g.expiresAt > input.now,
-    );
+    // The same reading of `expiresAt` the evaluator uses. Filtering by hand
+    // here made the review surface disagree with `can()` about which rows are
+    // live: a row with an uncomparable expiry was live in checks and absent
+    // from this report — the one combination that hides a live grant from
+    // the surface built to find live grants.
+    const live = input.grants.filter((g) => !isExpired(g, input.now));
     for (const grant of live) {
       if (grant.pattern === undefined || !isWildcard(grant.pattern)) continue;
       const gained = gainedKeys.filter((k) =>

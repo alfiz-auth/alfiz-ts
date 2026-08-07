@@ -70,6 +70,7 @@ import {
   planVirtualParentDissolution,
   runAutoStages,
   unknownPermissionContext,
+  normalizeProvenance,
   validateProvenance,
   validateGrantRow,
   validateJustification,
@@ -82,7 +83,12 @@ import type {
   PrincipalEntitlements,
   SodViolation,
 } from "@alfiz/core";
-import { checkSodConstraints, entitlementsOf, wildcardDrift } from "@alfiz/core";
+import {
+  checkSodConstraints,
+  entitlementsOf,
+  principalKind,
+  wildcardDrift,
+} from "@alfiz/core";
 import { randomUUID } from "node:crypto";
 import { computeAuditHash } from "./audit-chain.js";
 import type { StorageDriver, StoredUser } from "./storage.js";
@@ -307,6 +313,8 @@ export class AlfizApplication<
   private groupTopology: {
     parents: Map<string, readonly string[]>;
     expiresAt: number;
+    /** Event-log head when this snapshot was taken; null when not persisting. */
+    seq: number | null;
   } | null = null;
   private groupTopologyFetch: Promise<Map<string, readonly string[]>> | null =
     null;
@@ -342,6 +350,31 @@ export class AlfizApplication<
     this.orgRoot = options.orgRoot ?? true;
     this.now = options.clock ?? Date.now;
     this.newId = options.ids ?? randomUUID;
+    // A catalog with a hierarchical scope type and no resolver is the one
+    // brown-field shape that fails OPEN: `() => []` truncates every chain,
+    // so an ancestor revoke — which the README says wins "at that scope and
+    // every descendant", not configurable — silently stops applying to the
+    // descendants it was written for. Nothing said so before; a missing
+    // resolver looked exactly like a flat deployment.
+    //
+    // A warning rather than a throw, because refusing construction would
+    // break running deployments on a patch upgrade — including ones whose
+    // hierarchical types are declared but never checked against. It becomes
+    // an error in the next minor; the changelog says so.
+    if (options.ancestry === undefined) {
+      const hierarchical = [...this.catalog.scopeTypes.entries()]
+        .filter(([, meta]) => meta.parent !== null || meta.multiParent)
+        .map(([type]) => type);
+      if (hierarchical.length > 0) {
+        console.warn(
+          `alfiz: this catalog declares hierarchical scope types (${hierarchical.join(", ")}) but createApplication got no \`ancestry\` resolver. ` +
+            "Every ancestor chain will be empty, so a revoke made at a parent scope will NOT suppress access on its descendants — " +
+            "the one rule Alfiz states as non-configurable. Pass `ancestry: parentPointerResolver(...)` (or your own resolver); " +
+            "a resolver that cannot answer must THROW rather than return a partial chain, so the check fails closed. " +
+            "This becomes an error in the next minor.",
+        );
+      }
+    }
     this.resolveAncestors = options.ancestry ?? (() => []);
     this.groupTopologyTtl = options.groupTopologyTtlMs ?? 30_000;
     this.sodEnforce = options.sod?.enforce ?? "off";
@@ -539,6 +572,12 @@ export class AlfizApplication<
     if (issue) throw new ProviderWriteRejectedError(issue, "validation");
   }
 
+  /** Validate, then keep only the fields the kind declares. */
+  private cleanProvenance(provenance: Provenance): Provenance {
+    this.assertProvenance(provenance);
+    return normalizeProvenance(provenance);
+  }
+
   /**
    * The unknown-pattern rejection, with the group-path near-miss named,
    * edit-distance typos suggested, and undeclared namespaces called out —
@@ -618,17 +657,58 @@ export class AlfizApplication<
    * every parent edge, and re-reading the whole group table per subject miss
    * is the dominant cost of `getSubjectAccess`. Local group writes bust this
    * synchronously (see `emit`); the TTL bounds cross-process staleness.
+   *
+   * When events are persisted the TTL is NOT the only check. A client that
+   * replays an invalidation busts its own entry and immediately refetches —
+   * from here. If this cache is warm and stale, the client stores the stale
+   * closure as freshly validated and then *renews* it on every quiet
+   * revalidation, so the entry never lapses and no further event ever
+   * targets it: a reparented group could stay live indefinitely, worse than
+   * the blind TTL it replaced. Comparing the event-log head costs one
+   * single-row read on a path that already issues several, and makes the
+   * refetch that follows an invalidation actually see the write.
    */
+  /**
+   * The event-log head, or `null` when this Application does not persist
+   * events (nothing to compare against — the TTL is the whole bound, as
+   * documented). An unreadable log answers `NaN`, which equals no recorded
+   * seq, so a cache built under a readable log is dropped rather than
+   * trusted while the log is down.
+   */
+  private async currentEpochSeq(): Promise<number | null> {
+    if (!this.epoch) return null;
+    try {
+      return await this.epoch.head();
+    } catch {
+      return Number.NaN;
+    }
+  }
+
   private async groupParentMap(): Promise<Map<string, readonly string[]>> {
     if (this.groupTopologyTtl <= 0) {
       const groups = await this.storage.listGroups();
       return new Map(groups.map((g) => [g.id, g.parents]));
     }
     const cached = this.groupTopology;
-    if (cached && cached.expiresAt > this.now()) return cached.parents;
+    if (cached && cached.expiresAt > this.now()) {
+      const seq = await this.currentEpochSeq();
+      if (seq === cached.seq) return cached.parents;
+      // The log moved (or became unreadable) since this snapshot: drop it
+      // rather than build a closure on it.
+      this.groupTopology = null;
+      this.groupTopologyGen++;
+    }
     if (this.groupTopologyFetch) return this.groupTopologyFetch;
     const generation = this.groupTopologyGen;
-    const fetching = this.storage.listGroups().then((groups) => {
+    // Both reads start inside ONE promise that is registered synchronously
+    // below — awaiting the seq out here would let concurrent misses slip past
+    // the in-flight check and each issue their own `listGroups`, which is the
+    // fan-out this cache exists to prevent.
+    const fetching = (async () => {
+      const [seqAtFetch, groups] = await Promise.all([
+        this.currentEpochSeq(),
+        this.storage.listGroups(),
+      ]);
       const parents = new Map<string, readonly string[]>(
         groups.map((g) => [g.id, g.parents]),
       );
@@ -636,10 +716,11 @@ export class AlfizApplication<
         this.groupTopology = {
           parents,
           expiresAt: this.now() + this.groupTopologyTtl,
+          seq: seqAtFetch,
         };
       }
       return parents;
-    });
+    })();
     this.groupTopologyFetch = fetching;
     try {
       return await fetching;
@@ -649,8 +730,12 @@ export class AlfizApplication<
   }
 
   async getSubjectAccess(principal: PrincipalRef): Promise<SubjectAccessData> {
-    if ("serviceId" in principal) {
-      const closure = [...computeServiceClosure(principal.serviceId)];
+    // The same discriminant the Client keys its cache by — see
+    // `principalKind`. Reading the halves in a different order here is how a
+    // principal naming both got a service's closure stored under a user's key.
+    const who = principalKind(principal);
+    if (who.kind === "service") {
+      const closure = [...computeServiceClosure(who.id)];
       const grants = await this.storage.listGrants({ subjects: closure });
       const { roles, unresolvedRoleIds } = await this.resolveRoles(grants);
       return {
@@ -666,7 +751,7 @@ export class AlfizApplication<
     }
 
     const [stored, groupParents] = await Promise.all([
-      this.storage.getUser(principal.userId),
+      this.storage.getUser(who.id),
       this.groupParentMap(),
     ]);
     // A principal the identity provider authenticated but Alfiz never
@@ -675,7 +760,7 @@ export class AlfizApplication<
     // holds: without matching rows they can do nothing. Inactive means an
     // EXPLICIT active:false — offboarding, not absence.
     const user: StoredUser = stored ?? {
-      userId: principal.userId,
+      userId: who.id,
       active: true,
       groupIds: [],
       orgIds: [],
@@ -790,11 +875,28 @@ export class AlfizApplication<
         }
       }
     }
-    if (input.expiresAt !== undefined && input.expiresAt <= this.now()) {
-      throw new ProviderWriteRejectedError(
-        "expiresAt is already in the past",
-        "validation",
-      );
+    if (input.expiresAt !== undefined && input.expiresAt !== null) {
+      // Shape before value: the past-expiry guard below is a comparison, and
+      // a comparison against `NaN` — which is what an arithmetic slip or an
+      // ISO string arriving over the wire produces — is `false` in both
+      // directions, so a malformed bound slipped past the write path AND
+      // read as "never expires" at every check. The evaluator now fails
+      // closed on such a row; this stops it being stored at all.
+      if (
+        typeof input.expiresAt !== "number" ||
+        !Number.isFinite(input.expiresAt)
+      ) {
+        throw new ProviderWriteRejectedError(
+          `expiresAt must be a finite epoch-millisecond number — received ${JSON.stringify(input.expiresAt)}`,
+          "validation",
+        );
+      }
+      if (input.expiresAt <= this.now()) {
+        throw new ProviderWriteRejectedError(
+          "expiresAt is already in the past",
+          "validation",
+        );
+      }
     }
   }
 
@@ -838,7 +940,7 @@ export class AlfizApplication<
       pattern: input.pattern,
       scope: input.scope ?? GLOBAL_SCOPE,
       expiresAt: input.expiresAt,
-      provenance,
+      provenance: this.cleanProvenance(provenance),
       createdAt: this.now(),
     };
     const invalid = validateGrantRow(row);
@@ -854,16 +956,32 @@ export class AlfizApplication<
    * violations never block unrelated writes — the report owns those — and
    * non-user subjects pass through (see `ApplicationOptions.sod`).
    */
-  private async assertSodAllows(row: GrantRow): Promise<void> {
+  private async assertSodAllows(
+    row: GrantRow,
+    /**
+     * Rows written earlier in the same batch. `contextFor` reads storage,
+     * and nothing in a batch is in storage yet, so without this each row was
+     * judged against a world containing none of its siblings — and the two
+     * halves of a constraint, submitted together, both passed. A batch is
+     * one write as far as the constraint is concerned.
+     */
+    pending: readonly GrantRow[] = [],
+  ): Promise<void> {
     if (this.sodEnforce !== "reject") return;
     const constraints = this.catalog.sodConstraints;
     if (constraints.length === 0) return;
     const parsed = parseSubject(row.subject);
     if (parsed?.kind !== "user") return;
     const { ctx } = await this.contextFor({ userId: parsed.id });
-    const before = checkSodConstraints(ctx, this.catalog, constraints);
+    const siblings = pending.filter((r) => r.subject === row.subject);
+    const baseGrants = [...ctx.rows.grants, ...siblings];
+    const before = checkSodConstraints(
+      { ...ctx, rows: { ...ctx.rows, grants: baseGrants } },
+      this.catalog,
+      constraints,
+    );
     const after = checkSodConstraints(
-      { ...ctx, rows: { ...ctx.rows, grants: [...ctx.rows.grants, row] } },
+      { ...ctx, rows: { ...ctx.rows, grants: [...baseGrants, row] } },
       this.catalog,
       constraints,
     );
@@ -961,7 +1079,13 @@ export class AlfizApplication<
     await this.assertGrantWritable(input);
     const row = this.buildGrantRow(input, input.provenance);
     await this.assertSodAllows(row);
-    await this.storage.insertGrant(row);
+    // Audit BEFORE the row, not after. The seam has no transaction, so one
+    // of the two can fail alone, and the orders are not equivalent: audit
+    // last means a failed append leaves a live, unaudited grant — the exact
+    // state an attacker who can break audit writes would want. Audit first
+    // means a failed insert leaves an entry for a grant that never existed,
+    // which over-reports rather than under-reports, and which the invariant
+    // this class already states ("no row without its audit entry") permits.
     await this.audit(input.provenance, "grant.create", row.id, {
       subject: row.subject,
       roleId: row.roleId,
@@ -969,6 +1093,7 @@ export class AlfizApplication<
       scope: row.scope,
       expiresAt: row.expiresAt,
     });
+    await this.storage.insertGrant(row);
     this.emitSubject(row.subject);
     await this.flushEvents();
     return row;
@@ -993,16 +1118,54 @@ export class AlfizApplication<
       await this.assertGrantWritable(input);
     }
     const rows = inputs.map((input) => this.buildGrantRow(input, provenance));
-    for (const row of rows) {
-      await this.assertSodAllows(row);
+    for (const [index, row] of rows.entries()) {
+      await this.assertSodAllows(row, rows.slice(0, index));
     }
-    for (const row of rows) {
-      await this.storage.insertGrant(row);
-    }
+    // Audited first, for the reason `createGrant` states, and recording what
+    // the batch CONFERS rather than only how many rows it wrote — a bulk
+    // write later deleted otherwise left a log that never said what was
+    // granted to whom.
     await this.audit(provenance, "grant.create_bulk", this.newId(), {
       count: rows.length,
       grantIds: rows.map((r) => r.id),
+      grants: rows.map((r) => ({
+        id: r.id,
+        subject: r.subject,
+        roleId: r.roleId,
+        pattern: r.pattern,
+        scope: r.scope,
+        expiresAt: r.expiresAt,
+      })),
     });
+    // "One bad assignment rejects the whole batch instead of leaving a
+    // half-imported tenant" covered VALIDATION only: a driver error on row N
+    // left rows 1..N-1 live while the caller saw a rejection and, reasonably,
+    // retried — duplicating access under fresh ids. Without a transaction on
+    // the seam, compensation is the honest approximation: undo what landed,
+    // then report the original failure.
+    const written: GrantRow[] = [];
+    try {
+      for (const row of rows) {
+        await this.storage.insertGrant(row);
+        written.push(row);
+      }
+    } catch (error) {
+      for (const row of written.reverse()) {
+        try {
+          await this.storage.deleteGrant(row.id);
+        } catch {
+          // Best effort: the original failure is the one worth reporting,
+          // and `reconcileRows()` is the sweep for whatever survives.
+        }
+      }
+      await this.audit(provenance, "grant.create_bulk_rolled_back", this.newId(), {
+        attempted: rows.length,
+        undone: written.length,
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      await this.flushEvents();
+      throw error;
+    }
     for (const subject of new Set(rows.map((r) => r.subject))) {
       this.emitSubject(subject);
     }
@@ -1078,7 +1241,7 @@ export class AlfizApplication<
       userId: input.userId,
       pattern: input.pattern,
       scope,
-      provenance: input.provenance,
+      provenance: this.cleanProvenance(input.provenance),
       createdAt: this.now(),
     };
     await this.storage.insertRevoke(row);
@@ -1609,10 +1772,20 @@ export class AlfizApplication<
     request = result.request;
     await this.storage.insertRequest(request);
     await this.audit(
-      { kind: "system", note: `request by ${input.requesterUserId}` },
+      // Attributed to the requester, not to "system". `actorOf` maps a
+      // `system` provenance to the literal actor `"system"` and drops the
+      // note, so `listAuditEvents({ actor: userId })` returned nothing for
+      // the one action in the request lifecycle a person actually initiated
+      // — approve, deny, and cancel all name someone.
+      { kind: "admin", actorUserId: input.requesterUserId },
       "request.submit",
       request.id,
-      { roleId: input.roleId, pattern: input.pattern, scope },
+      {
+        roleId: input.roleId,
+        pattern: input.pattern,
+        scope,
+        requesterUserId: input.requesterUserId,
+      },
     );
     if (result.grantPlan) {
       await this.writeGrantFromPlan(result.grantPlan);
@@ -1641,6 +1814,15 @@ export class AlfizApplication<
     request: AccessRequest,
     deciderUserId: string,
   ): Promise<boolean> {
+    // Maker is never checker. A request is an escalation the requester is
+    // asking someone else to vouch for, so approving your own defeats the
+    // whole mechanism — and both routes into this method were open to it:
+    // a requester who happens to hold the named approver role, and one
+    // holding the administrative override, which exists for stages nobody
+    // can fill, not for self-service. The override is deliberately included:
+    // an approver pool of one is a directory problem, and answering it by
+    // approving yourself is exactly what an access review will flag.
+    if (deciderUserId === request.requesterUserId) return false;
     const stage = request.stages[request.stageIndex];
     const decider = await this.contextFor({ userId: deciderUserId });
     if (!decider.data.active) return false;

@@ -295,6 +295,10 @@ describe("publishing", () => {
           entries: [{ pattern: "zoom.host", scopes: [] }],
           keys: ["zoom.host"],
           regions: [],
+          // The declared posture rides along, so a consumer reconstructing
+          // this manifest gets the strictness the publisher declared rather
+          // than defaulting to permissive.
+          strict: false,
         },
       ],
     });

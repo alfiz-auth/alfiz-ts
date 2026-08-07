@@ -1,5 +1,212 @@
 # Changelog
 
+## 0.7.1 — the adversarial-review release
+
+A security review run as seven independent adversarial passes: the Provider
+API, the evaluation engine, the cache and invalidation tiers, the
+administrative write paths, error and listing surfaces, the storage seam, and
+brown-field configuration. It added **261 tests** (677 → 938) and fixed the
+defects they found. No API removals; two behavior changes are called out below.
+
+### Fixed — wrong answers
+
+- **An expiry the engine could not compare read as "never expires."**
+  `isExpired` was `expiresAt !== undefined && expiresAt <= now`, and every
+  comparison against `NaN` is `false` — so a grant carrying `NaN`, or an ISO
+  string that coerces to it, was honored forever, and the write path accepted
+  it because it guarded with the same comparison. A time-boxed elevation
+  became permanent. Expiry now fails closed on any non-finite value, the write
+  path rejects one with a message naming the field, and `listWildcardDrift`
+  shares the evaluator's reading — the row was previously live in checks and
+  invisible in the report built to find live rows.
+- **A gate could check a wildcard.** Under `externalPermissions: "warn"` or
+  `"allow"`, `can(p, "zoom.meetings.*")` was evaluated as a key, silently
+  changing the question from "may this principal do X" to "does this principal
+  hold a wildcard covering X" — permissive for the broadly privileged, denying
+  for everyone the gate was written for. `Catalog` has guarded this for owned
+  keys from the start; the external-permission door now holds the same line.
+- **A principal naming both a `userId` and a `serviceId` cached one
+  principal's authority under the other's key.** The Client keyed on `userId`,
+  the Application answered on `serviceId`; the union type only binds literal
+  call sites, so a widened claims object or a JSON body reached it. The cached
+  payload carried `userId: null`, which also skipped that user's personal
+  revokes and forced `active: true`. `principalKind()` is now the single
+  discriminant both sides read, and it refuses the ambiguity rather than
+  picking a winner.
+- **`listGrants({ roleId: null })` returned every pattern grant in the
+  organization** on the Prisma driver (`roleId IS NULL` on a nullable column)
+  and nothing on the memory driver. Only a string is a `roleId` filter now, on
+  both.
+- **A hole in the event sequence was reported as replayed.** `seq` is
+  allocated before the row is inserted, so N+1 can be visible while N is not;
+  `eventsSince` returned `[N+1]` with `upTo: N+1` and the poller advanced its
+  cursor past an invalidation it never saw. Both drivers now stop at the first
+  discontinuity. A negative `limit` — reachable from `epoch.since` — also
+  reached Prisma as a negative `take`, which means "the last N rows"; clamped.
+- **The Application's group-topology cache outlived the invalidation that
+  should have busted it.** A client replaying an event busts its entry and
+  immediately refetches — from an Application whose topology cache was still
+  warm — then stores the stale closure as freshly validated and *renews* it on
+  every quiet revalidation, so it never lapsed. A reparented group could stay
+  live indefinitely: worse than the blind TTL the epoch replaced. The cache is
+  now validated against the event-log head.
+- **The shared cache (L2) failed open while the epoch was unreadable.** With
+  `knownSeq` frozen, the "written under the current head" test kept saying yes
+  to a pre-revocation envelope and re-populated L1 in a loop — bounded only by
+  the store's own TTL, 20× the documented fallback. The L2 now goes cold while
+  the log is unreadable, and the seq check is ANDed with the wall-clock bound
+  rather than replacing it.
+- **L2 entries were not namespaced by deployment**, so two deployments sharing
+  one RESP service read each other's closures. The default key prefix now
+  carries a catalog fingerprint, and an envelope whose payload names a
+  different principal is a miss rather than an answer.
+
+### Fixed — the Provider API
+
+- **`org.applySnapshot` wrote straight to the storage driver**, bypassing
+  every provider-side rule the module's own header promises it applies —
+  minting grants no write path can produce, installing group-parent cycles
+  `setGroupParents` rejects. It also deleted before it validated, with the
+  audit append last: a malformed row destroyed the organization, answered
+  `500`, and recorded nothing. The snapshot is now validated whole before
+  anything is touched, and the write order no longer exposes a window with
+  global grants live and their matching revokes gone.
+- **The handler's secret had no strength floor** while `createServiceKeyShim`
+  next door enforces sixteen characters — and an unset environment variable
+  reaches this option as `""` or as the literal string `"undefined"`, a
+  credential guessable on the first try. Refused at construction.
+- **Operation smuggling.** `/v1/ping/v1/org.exportSnapshot` is `ping` to a
+  proxy, a WAF, a rate limiter, and the access log, and was
+  `org.exportSnapshot` here. An ambiguous path is refused; a mount path that
+  merely contains `/v1/` still resolves. A malformed percent-escape no longer
+  throws a `URIError` out of the mounted route.
+- **Missing body fields produced `500`s carrying raw `TypeError` messages.**
+  Named parameters are checked at dispatch and answer `422 validation`.
+- **`HostedProvider` would send the bearer token anywhere.** `""`,
+  `"//evil.example"`, and `http://` were all accepted. The endpoint is parsed
+  and required to be https (loopback http excepted) at construction,
+  redirects are refused rather than followed with the credential attached, and
+  a malformed far-side answer raises `ProviderTransportError` instead of
+  becoming a `GrantRow[]` that is actually `undefined`.
+
+### Fixed — administration
+
+- **A requester could approve their own request** — through a named approver
+  role they happened to hold, or through the `decide_request` override.
+  `canDecide` refuses `decider === requester`, which also drops self-requests
+  from `listApproverQueue`.
+- **Separation of duty was bypassable by batching.** `createGrants` evaluated
+  each row against storage, which contained none of its siblings, so both
+  halves of a constraint submitted together both passed. A batch is now one
+  write as far as a constraint is concerned.
+- **A privileged write could outlive its audit entry.** Audit is appended
+  before the row, so a failed append aborts the write instead of leaving it
+  live and unrecorded. `createGrants` compensates its partial rows and records
+  what it conferred, not only how many rows it wrote.
+- **The reserved `alfiz_internal` namespace was reserved against `namespaces`
+  and `imports`, but not against declared permission keys** — so an
+  application could mint vocabulary that `alfiz_internal.*` grants sweep up,
+  and under `includeAlfizInternal: false` could define
+  `alfiz_internal.access.view_as`, the exact key `assertCanViewAs` gates on.
+- **`request.submit` was audited as `system`**, making the one action in the
+  request lifecycle a person initiates the only one not attributable to them.
+- Provenance is reduced to the fields its kind declares before storage, so a
+  JSON body cannot persist unbounded extra fields or a live own `__proto__`.
+
+### Fixed — information disclosure
+
+- **Scope ids and principal ids reached error messages raw.** A scope id is
+  `docs.doc:` plus something that was a URL segment a moment ago, so an
+  unauthenticated visitor could write newlines and ANSI escapes into the
+  host's logs — forging log lines and repainting the terminal of whoever tails
+  them. Control characters are escaped and every echo is bounded; a 200 KB
+  permission string no longer produces a 200 KB message on every log line and
+  wire error built from it.
+- **The did-you-mean suggester crossed into `alfiz_internal.*`**, answering
+  "does this deployment mount Alfiz administration, and what are its
+  privileged operations called" from a typo in an application namespace. A
+  typo *inside* the reserved namespace still gets its fix.
+- The `externalPermissions: "warn"` report set was unbounded and keyed by a
+  caller-supplied string; it is capped. That path also ran an O(catalog)
+  edit-distance scan on *every* check before deciding whether to throw —
+  roughly 16 ms per check on a 4,000-key catalog, including on the
+  synchronous snapshot surface. The scan now runs only where a message will
+  actually exist.
+
+### Fixed — catalog documents and brown-field defaults
+
+- **`catalogFromDocument` validated only `formatVersion`.** It is the
+  federation and codegen read path, and a published document is
+  registry-adjacent input: it accepted a leaf whose key is a wildcard (a
+  checkable "key"), a leaf outside the document's own namespaces (which a bare
+  `*` grant then confers), duplicate keys where the last silently won with
+  wider scopes, a key that is also a group path, and cyclic scope-type
+  parentage. It now enforces what `defineCatalog` enforces.
+- **`imports[].strict` was lost on every document round-trip**, so every
+  federated consumer — and `alfiz-verify` itself — graded against a laxer
+  catalog than the publisher wrote. The manifest carries it.
+- **`conventions: { depth: 2 }`** — the README's own endorsed two-level
+  configuration — produced twelve unfixable lint errors from Alfiz's own admin
+  keys, whose only workarounds were disabling the check or the admin surface.
+  The reserved namespace is exempt, as `unreferenced-leaf` already was.
+- `memoryDriver()` was indistinguishable from a database at runtime.
+  `StorageDriver` gained advisory `durable` / `driverName` fields so a
+  deployment can refuse to boot on a non-durable store. The failure is
+  asymmetric: positive access is routinely re-seeded by boot code, while the
+  negative layer (`active: false`, personal revokes) exists only in the store.
+- The memory driver silently overwrote a duplicate primary key that the schema
+  and Prisma reject, and `listAudit({ limit: 0 })` returned the entire audit
+  table (`slice(-0)` is `slice(0)`) while a negative limit dropped the oldest
+  rows. Non-integer epoch bounds now behave identically on both drivers
+  instead of throwing a bare `RangeError` on one.
+
+### Behavior changes
+
+- `createApplication` now **warns** when the catalog declares hierarchical
+  scope types and no `ancestry` resolver was passed. Without one every
+  ancestor chain is empty, so a revoke made at a parent scope does not
+  suppress access on its descendants — the one rule Alfiz documents as not
+  configurable. **This becomes an error in the next minor.** A resolver that
+  cannot answer must throw, never return a partial chain.
+- A principal naming both `userId` and `serviceId` now throws rather than
+  being resolved in favour of whichever half is read first.
+
+### Known open findings
+
+Fifteen findings are recorded as `it.fails` tests in the `security-*` suites.
+They assert the secure behavior, pass while the finding is open, and turn red
+the moment it is fixed — so no fix lands silently and no finding quietly rots.
+In severity order:
+
+- **HIGH** — a request may propose any pattern, `*` included, and an `auto`
+  approval stage grants it with no human in the loop. `requestable` bounds who
+  approves and for how long, but never *what* may be requested.
+- **HIGH** — `updateRole` can rewrite a role's patterns while a request
+  referencing it is pending, so an approver reviews one thing and grants
+  another. `deleteRole` already guards this.
+- **MEDIUM** — `upsertRole` on Prisma is a non-atomic `deleteMany` + `create`:
+  the role is transiently unreadable (every grant of it denies), durably lost
+  if the write half fails, and concurrent updates collide. The in-code claim
+  that the Application serializes role writes does not hold today.
+- **MEDIUM** — a backwards wall-clock step (NTP correction, VM resume) extends
+  the subject and object TTLs and suspends epoch revalidation. The TTL
+  arithmetic needs a monotonic source.
+- **MEDIUM** — an ancestry resolver that swallows its own error and returns
+  `[]` silently drops ancestor revokes. Only the missing-resolver case warns;
+  a lying resolver cannot be detected without a contract change.
+- **MEDIUM** — `snapshot.can` trusts `parent: null` without consulting the
+  resolver, so a mis-declared flat scope type makes the snapshot disagree with
+  `client.can` in the permissive direction.
+- **MEDIUM** — an unenumerated key under a non-strict import region is
+  `hasKey`-true, so a bare `*` confers it: the namespace-anchor rule's own
+  failure mode, one level down.
+- **LOW** — `deleteGrant` reports a deletion it may not have performed under a
+  concurrent deleter; the delegate signature discards the affected-row count.
+- **LOW** — client/provider clock skew: expiry is evaluated on the checking
+  process's clock, and the provider does not filter expired rows.
+- **LOW** — a non-durable store loses the negative layer asymmetrically across
+  a restart. Now declarable via `durable`, not yet enforced.
+
 ## 0.7.0 — the enterprise release: safe by default, reviewable by construction
 
 > **Breaking.** Two defaults flip to their safe settings (event persistence

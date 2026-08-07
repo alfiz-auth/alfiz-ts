@@ -79,6 +79,97 @@ export interface HostedProviderTarget {
   fetchImpl?: typeof fetch | undefined;
 }
 
+/**
+ * Resolve and vet the base URL before the organization's bearer token is
+ * attached to it.
+ *
+ * `url` is configuration — frequently an environment variable, sometimes a
+ * per-tenant database row — and the previous `url.replace(/\/$/, "")` was
+ * happy to accept anything a string can hold. `""` produced the relative
+ * `/v1/ping`; `"//evil.example"` produced a protocol-relative reference that
+ * ships the credential to a host the attacker names; `"http://…"` sent it in
+ * plaintext. The module header and the OpenAPI document both say this seam
+ * runs over HTTPS — this is where that stops being a comment.
+ *
+ * Loopback over plain HTTP stays allowed: local development against a
+ * handler on `localhost` is a real workflow, and it is not a network hop.
+ */
+export function assertProviderEndpoint(url: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new ProviderTransportError(
+      `the provider url must be absolute, with a scheme and a host — received ${JSON.stringify(url)}`,
+    );
+  }
+  const loopback =
+    parsed.hostname === "localhost" ||
+    parsed.hostname === "127.0.0.1" ||
+    parsed.hostname === "[::1]" ||
+    parsed.hostname === "::1";
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    throw new ProviderTransportError(
+      `the provider url must be https (or http on loopback for local development) — ` +
+        `${JSON.stringify(url)} would send the link secret over ${parsed.protocol}//`,
+    );
+  }
+  return `${parsed.origin}${parsed.pathname.replace(/\/$/, "")}`;
+}
+
+/**
+ * The named result field each operation's answer must carry, mirroring
+ * `REQUIRED_FIELDS` on the serving side.
+ *
+ * Casting the payload to `T` made every method's return type a promise the
+ * far side had to keep and nothing checked: a `200 {}` gave
+ * `listGrants(): GrantRow[]` the value `undefined`, which the caller cannot
+ * defend against because the signature says it cannot happen. The failure
+ * then surfaced somewhere else entirely, as a `TypeError` in caller code.
+ *
+ * Presence, not shape — and presence specifically, because a legitimately
+ * `null` answer (`getPublishedCatalog` on a provider that has none) is a
+ * field that IS there. Operations returning the whole object (`capabilities`,
+ * `getSubjectAccess`, the epoch reads) are absent from the map by design.
+ */
+type ResultKind = "array" | "value" | "nullable";
+const RESULT_FIELDS: Readonly<Record<string, readonly [string, ResultKind]>> = {
+  resolveAncestors: ["ancestors", "array"],
+  check: ["allowed", "value"],
+  "epoch.head": ["seq", "value"],
+  createGrant: ["grant", "value"],
+  createGrants: ["grants", "array"],
+  listGrants: ["grants", "array"],
+  countGrants: ["count", "value"],
+  createRevoke: ["revoke", "value"],
+  listRevokes: ["revokes", "array"],
+  submitRequest: ["request", "value"],
+  decideRequest: ["request", "value"],
+  cancelRequest: ["request", "value"],
+  listRequests: ["requests", "array"],
+  listApproverQueue: ["requests", "array"],
+  // A provider with nothing published answers `null`, legitimately.
+  getPublishedCatalog: ["published", "nullable"],
+  getPublishedImports: ["published", "nullable"],
+  listRoles: ["roles", "array"],
+  createRole: ["role", "value"],
+  updateRole: ["role", "value"],
+  listGroups: ["groups", "array"],
+  createGroup: ["group", "value"],
+  updateGroup: ["group", "value"],
+  setGroupParents: ["group", "value"],
+  getGroupMembers: ["userIds", "array"],
+  getReportingEdges: ["edges", "value"],
+  listAuditEvents: ["events", "array"],
+  getGrantUsage: ["usage", "array"],
+  getRevokeUsage: ["usage", "array"],
+  getRoleUsage: ["usage", "array"],
+  getPermissionUsage: ["usage", "array"],
+  getScopeTypeUsage: ["usage", "array"],
+  "org.exportSnapshot": ["snapshot", "value"],
+  "org.applySnapshot": ["applied", "value"],
+};
+
 /** The transport failed — as opposed to the far side answering with an error. */
 export class ProviderTransportError extends Error {
   override name = "ProviderTransportError";
@@ -94,8 +185,15 @@ export class HostedProvider extends AlfizProviderBase {
   override readonly epoch: EpochSource;
   override readonly resolveAncestors: (scope: ScopeId) => Promise<ScopeId[]>;
 
+  /** The vetted, normalized base — computed once, at construction. */
+  private readonly base: string;
+
   constructor(private readonly target: HostedProviderTarget) {
     super();
+    // Fail here, not on the first call: an unusable or unsafe endpoint is a
+    // configuration error, and finding it at startup beats finding it when
+    // the first administrative write ships the org's credential somewhere.
+    this.base = assertProviderEndpoint(target.url);
     this.epoch = {
       head: async () => (await this.call<{ seq: number }>("epoch.head", {})).seq,
       since: (seq, limit) =>
@@ -112,8 +210,8 @@ export class HostedProvider extends AlfizProviderBase {
    * re-throw error envelopes typed.
    */
   async call<T>(op: ProviderOp, params: Record<string, unknown>): Promise<T> {
-    const { url, secret, timeoutMs = 15_000, fetchImpl = fetch } = this.target;
-    const endpoint = url.replace(/\/$/, "") + providerOpPath(op);
+    const { secret, timeoutMs = 15_000, fetchImpl = fetch } = this.target;
+    const endpoint = this.base + providerOpPath(op);
     let response: Response;
     try {
       response = await fetchImpl(endpoint, {
@@ -123,6 +221,12 @@ export class HostedProvider extends AlfizProviderBase {
           authorization: `Bearer ${secret}`,
         },
         body: JSON.stringify(params),
+        // Never chase a redirect while carrying the organization's
+        // credential. A cross-origin hop is only safe because the Fetch spec
+        // strips `Authorization` — that is the runtime's property to
+        // guarantee, not this code's — and a same-origin hop would silently
+        // replay an administrative POST at a path nobody chose.
+        redirect: "error",
         signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
@@ -157,6 +261,39 @@ export class HostedProvider extends AlfizProviderBase {
         `provider call to ${endpoint} answered ${response.status}`,
         response.status,
       );
+    }
+    // The contract says every success is a JSON *object* — never a bare
+    // array, primitive, or null. Casting whatever arrived to `T` made this
+    // the one place a trust boundary was crossed on the far side's word: a
+    // `200 null` became a `TypeError` deep in a caller destructuring the
+    // named result field, and a `200 {}` became `listGrants(): GrantRow[]`
+    // returning `undefined` — a type the caller cannot defend against
+    // because the signature promises it cannot happen.
+    if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new ProviderTransportError(
+        `provider call to ${endpoint} answered ${response.status} with ${
+          Array.isArray(payload) ? "an array" : JSON.stringify(payload)
+        }, not the JSON object the contract requires`,
+        response.status,
+      );
+    }
+    const expected = RESULT_FIELDS[op];
+    if (expected !== undefined) {
+      const [field, kind] = expected;
+      const value = (payload as Record<string, unknown>)[field];
+      const ok =
+        kind === "array"
+          ? Array.isArray(value)
+          : kind === "nullable"
+            ? Object.hasOwn(payload, field)
+            : value !== undefined && value !== null;
+      if (!ok) {
+        throw new ProviderTransportError(
+          `provider call to ${endpoint} answered ${response.status} without a usable ${JSON.stringify(field)} field — ` +
+            `the ${op} result must carry ${kind === "array" ? "an array" : "a value"} there`,
+          response.status,
+        );
+      }
     }
     return payload as T;
   }

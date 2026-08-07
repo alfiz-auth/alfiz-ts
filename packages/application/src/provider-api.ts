@@ -51,6 +51,7 @@ import {
   ProviderWriteRejectedError,
   createAlfizClient,
   providerErrorStatus,
+  safeEcho,
   toProviderWireError,
 } from "@alfiz/core";
 import type { AlfizClient } from "@alfiz/core";
@@ -89,6 +90,30 @@ export interface ProviderHandlerOptions {
 const digest = (value: string): Buffer =>
   createHash("sha256").update(value).digest();
 
+/**
+ * The floor on the handler's shared secret, matching the one
+ * `createServiceKeyShim` already enforces on service keys. This credential is
+ * strictly more powerful than a service key — it reads the whole
+ * organization and can replace it — so it cannot hold a weaker rule.
+ *
+ * The shapes this catches are not hypothetical: `process.env.X ?? ""` and
+ * `` `${process.env.X}` `` (the literal string `"undefined"`) are how a
+ * missing environment variable reaches this option, and the second one is a
+ * credential an attacker can guess on the first try.
+ */
+const MIN_SECRET_LENGTH = 16;
+
+function assertUsableSecret(secret: string): void {
+  if (typeof secret !== "string" || secret.trim().length < MIN_SECRET_LENGTH) {
+    throw new Error(
+      `alfiz: the provider handler's secret must be at least ${MIN_SECRET_LENGTH} characters — ` +
+        "it is the only credential guarding every provider operation, including reading and " +
+        "replacing the entire organization. A missing environment variable reaches this option " +
+        'as "" or as the literal string "undefined"; both are refused here rather than served.',
+    );
+  }
+}
+
 function secretMatches(header: string | null, secret: string): boolean {
   if (!header) return false;
   const raw = header.startsWith("Bearer ")
@@ -100,6 +125,57 @@ function secretMatches(header: string | null, secret: string): boolean {
 const KNOWN_OPS: ReadonlySet<string> = new Set(
   PROVIDER_OPERATIONS.map((o) => o.op),
 );
+
+/**
+ * The named body fields each operation cannot run without, checked at the
+ * dispatch site so an absent parameter answers `422 validation` instead of
+ * reaching a provider method as a property read on `undefined` and
+ * surfacing as a `500` carrying a raw `TypeError` message.
+ *
+ * Only genuinely required fields are listed: an operation whose parameter is
+ * an optional filter (`listGrants`, `listRequests`, `listAuditEvents`)
+ * belongs nowhere here, because absent means "no filter" for those by
+ * contract. Provenance and input *shapes* stay the provider's to validate —
+ * this is presence, not schema.
+ */
+const REQUIRED_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  getSubjectAccess: ["principal"],
+  resolveAncestors: ["scope"],
+  check: ["principal", "key"],
+  "epoch.since": ["seq"],
+  createGrant: ["input"],
+  createGrants: ["inputs", "provenance"],
+  deleteGrant: ["grantId", "provenance"],
+  createRevoke: ["input"],
+  deleteRevoke: ["revokeId", "provenance"],
+  deleteSubject: ["subject", "provenance"],
+  deleteScope: ["scope", "provenance"],
+  submitRequest: ["input"],
+  decideRequest: ["requestId", "decision"],
+  cancelRequest: ["requestId", "byUserId"],
+  listApproverQueue: ["approverUserId"],
+  publishCatalog: ["document", "provenance"],
+  publishImports: ["manifest", "provenance"],
+  createRole: ["input", "provenance"],
+  updateRole: ["roleId", "input", "provenance"],
+  deleteRole: ["roleId", "provenance"],
+  createGroup: ["input", "provenance"],
+  updateGroup: ["groupId", "input", "provenance"],
+  setGroupParents: ["groupId", "parents", "provenance"],
+  deleteGroup: ["groupId", "provenance"],
+  setGroupMembership: ["userId", "groupIds", "provenance"],
+  getGroupMembers: ["groupId"],
+  setUserActive: ["userId", "active", "provenance"],
+  setReportingEdge: ["userId", "provenance"],
+  dissolveVirtualParent: ["groupId", "provenance"],
+  reportMetrics: ["batch"],
+  getGrantUsage: ["query"],
+  getRevokeUsage: ["query"],
+  getRoleUsage: ["query"],
+  getPermissionUsage: ["query"],
+  getScopeTypeUsage: ["query"],
+  "org.applySnapshot": ["snapshot", "source"],
+};
 
 /**
  * The evaluator behind the `check` operation: one client per handler,
@@ -167,9 +243,93 @@ async function exportOrgSnapshot(storage: StorageDriver): Promise<OrgSnapshot> {
 }
 
 /**
+ * A row array field that must be present, and every element of which must be
+ * an object carrying its identifying key — `idField` differs by collection
+ * (users key on `userId`, everything else on `id`), and getting it wrong
+ * would reject a well-formed snapshot rather than a malformed one.
+ */
+function requireRows(
+  value: unknown,
+  field: string,
+  idField: string,
+): readonly any[] {
+  if (!Array.isArray(value)) {
+    throw new ProviderWriteRejectedError(
+      `snapshot.${field} must be an array`,
+      "validation",
+    );
+  }
+  for (const [index, row] of value.entries()) {
+    if (row === null || typeof row !== "object" || Array.isArray(row)) {
+      throw new ProviderWriteRejectedError(
+        `snapshot.${field}[${index}] must be an object`,
+        "validation",
+      );
+    }
+    if (typeof (row as Record<string, unknown>)[idField] !== "string") {
+      throw new ProviderWriteRejectedError(
+        `snapshot.${field}[${index}] must carry a string ${idField}`,
+        "validation",
+      );
+    }
+  }
+  return value;
+}
+
+/**
+ * Prove the snapshot is whole and well-formed BEFORE anything is deleted.
+ *
+ * The apply below is a destructive replace with no transaction under it, so
+ * validation is the only thing standing between a malformed payload and an
+ * organization that no longer exists. Without this pass a `null` in a late
+ * array threw after the earlier phases had already deleted, the caller saw a
+ * 500 and believed nothing had happened, and the audit append — the last
+ * statement — never ran.
+ *
+ * Row *contents* are validated by the provider surface everywhere else; here
+ * there is no provider surface to validate them, which is finding-shaped in
+ * itself and noted on `org.applySnapshot` in the OpenAPI document.
+ */
+function validateOrgSnapshot(input: ApplyOrgSnapshotInput): void {
+  if (typeof input?.source !== "string" || input.source.length === 0) {
+    throw new ProviderWriteRejectedError(
+      "an org snapshot must name its source",
+      "validation",
+    );
+  }
+  const snapshot = input.snapshot as OrgSnapshot | undefined;
+  if (snapshot === null || typeof snapshot !== "object") {
+    throw new ProviderWriteRejectedError(
+      "org.applySnapshot needs a snapshot object",
+      "validation",
+    );
+  }
+  requireRows(snapshot.groups, "groups", "id");
+  requireRows(snapshot.roles, "roles", "id");
+  requireRows(snapshot.users, "users", "userId");
+  requireRows(snapshot.globalGrants, "globalGrants", "id");
+  requireRows(snapshot.globalRevokes, "globalRevokes", "id");
+  requireRows(snapshot.pendingGlobalRequests, "pendingGlobalRequests", "id");
+  if (input.authority !== undefined && typeof input.authority !== "boolean") {
+    throw new ProviderWriteRejectedError(
+      "snapshot authority must be a boolean when present",
+      "validation",
+    );
+  }
+}
+
+/**
  * Replace the org-domain dataset with the snapshot: groups, roles, users'
  * org-domain fields, global-scope rows, and pending global requests. Local
  * instance-scoped rows are untouched — they were never org-domain data.
+ *
+ * Write ORDER is load-bearing. The seam has no transaction primitive, so the
+ * intermediate states this produces are states concurrent checks really
+ * observe. Revokes are therefore installed before any grant moves and
+ * retired only once the new grants are in place: at no instant does the
+ * store hold a set of global grants with its matching negative layer
+ * missing, which is the one interleaving that answers ALLOW where the
+ * correct answer is DENY.
  */
 async function applyOrgSnapshot(
   storage: StorageDriver,
@@ -177,9 +337,19 @@ async function applyOrgSnapshot(
   now: number,
   newId: () => string,
 ): Promise<void> {
+  validateOrgSnapshot(input);
   const { snapshot } = input;
   const keepGroups = new Set(snapshot.groups.map((g) => g.id));
   const keepRoles = new Set(snapshot.roles.map((r) => r.id));
+
+  // The negative layer goes in first and comes out last.
+  const staleRevokes = await storage.listRevokes({ scope: "*" });
+  const incomingRevokes = new Set(snapshot.globalRevokes.map((r) => r.id));
+  for (const row of snapshot.globalRevokes) {
+    if (!staleRevokes.some((existing) => existing.id === row.id)) {
+      await storage.insertRevoke(row);
+    }
+  }
 
   for (const group of snapshot.groups) await storage.upsertGroup(group);
   for (const existing of await storage.listGroups()) {
@@ -195,10 +365,10 @@ async function applyOrgSnapshot(
     await storage.deleteGrant(row.id);
   }
   for (const row of snapshot.globalGrants) await storage.insertGrant(row);
-  for (const row of await storage.listRevokes({ scope: "*" })) {
-    await storage.deleteRevoke(row.id);
+
+  for (const row of staleRevokes) {
+    if (!incomingRevokes.has(row.id)) await storage.deleteRevoke(row.id);
   }
-  for (const row of snapshot.globalRevokes) await storage.insertRevoke(row);
 
   for (const request of snapshot.pendingGlobalRequests) {
     const existing = await storage.getRequest(request.id);
@@ -209,13 +379,15 @@ async function applyOrgSnapshot(
   await storage.appendAudit({
     id: newId(),
     at: now,
-    actor: `import:${input.source}`,
+    actor: `import:${safeEcho(input.source, 200)}`,
     action: input.authority ? "org.authority_received" : "org.sync_applied",
-    target: input.source,
+    target: safeEcho(input.source, 200),
     detail: {
       groups: snapshot.groups.length,
       roles: snapshot.roles.length,
       globalGrants: snapshot.globalGrants.length,
+      globalRevokes: snapshot.globalRevokes.length,
+      users: snapshot.users.length,
       authority: input.authority,
     },
   });
@@ -245,10 +417,23 @@ export async function handleProviderOp(
   if (!KNOWN_OPS.has(op)) {
     return apiError(404, "unknown_op", `unknown operation ${JSON.stringify(op)}`);
   }
-  // Body fields are validated by the provider methods they reach, exactly
-  // as every other runtime-string input is; the wire layer only routes.
+  // Body field VALUES are validated by the provider methods they reach,
+  // exactly as every other runtime-string input is; the wire layer only
+  // routes. Field PRESENCE is this layer's job, though — a missing named
+  // parameter never reaches a provider method as anything but a property
+  // read on `undefined`, and the contract promises a typed envelope
+  // (`protocol.ts`, the OpenAPI `ErrorEnvelope`), not a raw `TypeError`
+  // message describing this file's internals.
   const b = body as Record<string, any>;
   try {
+    for (const field of REQUIRED_FIELDS[op] ?? []) {
+      if (b[field] === undefined || b[field] === null) {
+        throw new ProviderWriteRejectedError(
+          `${op} requires the ${JSON.stringify(field)} field`,
+          "validation",
+        );
+      }
+    }
     const result = await (async (): Promise<Record<string, unknown>> => {
       switch (op as ProviderOp) {
         // -- transport / link ------------------------------------------------
@@ -492,12 +677,42 @@ export async function handleProviderOp(
             return unsupported("org snapshot operations require the storage option");
           }
           const input = body as unknown as ApplyOrgSnapshotInput;
+          // Shape first, so a malformed payload is a validation error
+          // whatever else is wrong with the request.
+          validateOrgSnapshot(input);
+          // An authority transfer the receiver cannot enact must not be
+          // reported as enacted. `orgRoot` is a constructor commitment, so
+          // without the hook the flag never flips: the sender demotes itself
+          // on a `{applied: true}` it should never have seen, and the
+          // organization is left with no authoritative writer at all.
+          //
+          // Only an actual CHANGE needs the hook — a snapshot restating the
+          // authority the receiver already holds transfers nothing, and is
+          // the ordinary shape of a routine read-model sync.
+          if (input.authority !== undefined && !options.onAuthorityChanged) {
+            // Whether the flag would actually move. A provider that cannot
+            // answer has no `orgRoot` flag to flip in the first place —
+            // this operation is storage-only, and a host may legitimately
+            // mount it without a full Application behind it.
+            let currentOrgRoot: boolean | undefined;
+            try {
+              currentOrgRoot = (await app.capabilities()).orgRoot;
+            } catch {
+              currentOrgRoot = undefined;
+            }
+            if (currentOrgRoot !== undefined && input.authority !== currentOrgRoot) {
+              return unsupported(
+                "this handler cannot accept an authority transfer: `orgRoot` is a constructor " +
+                  "commitment, so the host must supply `onAuthorityChanged` to rebuild its Application",
+              );
+            }
+          }
           await applyOrgSnapshot(options.storage, input, clock(), ids);
           if ("ingestEvents" in app && typeof app.ingestEvents === "function") {
             app.ingestEvents([{ type: "all" }]);
           }
-          if (input.authority !== undefined && options.onAuthorityChanged) {
-            await options.onAuthorityChanged(input.authority);
+          if (input.authority !== undefined) {
+            await options.onAuthorityChanged?.(input.authority);
           }
           return { applied: true };
         }
@@ -510,12 +725,56 @@ export async function handleProviderOp(
   }
 }
 
-/** The operation named by a request URL, or `null` when the path has no `/v1/` segment. */
+/**
+ * The operation named by a request URL, or `null` when the path does not
+ * name exactly one.
+ *
+ * `lastIndexOf` is deliberate — a handler mounted at `/api/v1/alfiz` must
+ * still route `/api/v1/alfiz/v1/ping` — but it also means a path carrying a
+ * SECOND `/v1/` segment is read differently here than by anything in front
+ * of it. `/v1/ping/v1/org.exportSnapshot` is `ping` to an nginx `location`,
+ * a WAF rule, a rate limiter, and the access log; it was
+ * `org.exportSnapshot` to this function. Whatever an operator believes they
+ * matched on, they matched on something this handler did not run, so an
+ * ambiguous path is refused rather than resolved.
+ */
 export function providerOpFromUrl(url: string): string | null {
-  const pathname = new URL(url).pathname;
+  let pathname: string;
+  try {
+    pathname = new URL(url).pathname;
+  } catch {
+    return null;
+  }
   const marker = pathname.lastIndexOf("/v1/");
   if (marker === -1) return null;
-  const op = decodeURIComponent(pathname.slice(marker + "/v1/".length));
+  // An EARLIER `/v1/` whose next segment is itself an operation name is the
+  // ambiguous shape: `/v1/ping/v1/org.exportSnapshot` reads as `ping` to
+  // anything matching on the first marker and as `org.exportSnapshot` here.
+  // A mount path that merely contains `/v1/` — `/api/v1/alfiz/v1/ping`, the
+  // case `lastIndexOf` exists for — is not ambiguous, because `alfiz` names
+  // no operation, so it keeps working.
+  for (let at = pathname.indexOf("/v1/"); at !== -1 && at < marker; ) {
+    const rest = pathname.slice(at + "/v1/".length);
+    const segment = rest.split("/", 1)[0] ?? "";
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(segment);
+    } catch {
+      decoded = segment;
+    }
+    if (KNOWN_OPS.has(decoded)) return null;
+    at = pathname.indexOf("/v1/", at + 1);
+  }
+  let op: string;
+  try {
+    // A malformed percent-escape (`/v1/ping%FF`) is a valid URL and an
+    // invalid decode. Left unguarded it threw a `URIError` clean out of the
+    // mounted route, where what the caller sees is whatever the host
+    // framework does with an exception — often a stack-trace 500.
+    op = decodeURIComponent(pathname.slice(marker + "/v1/".length));
+  } catch {
+    return null;
+  }
   return op.length > 0 ? op : null;
 }
 
@@ -528,6 +787,7 @@ export function providerOpFromUrl(url: string): string | null {
 export function createProviderHandler(
   options: ProviderHandlerOptions,
 ): (request: Request) => Promise<Response> {
+  assertUsableSecret(options.secret);
   return async (request: Request): Promise<Response> => {
     if (request.method !== "POST") {
       const { status, body } = apiError(405, "method_not_allowed", "POST only");

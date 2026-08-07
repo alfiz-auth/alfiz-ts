@@ -644,6 +644,14 @@ const ALFIZ_INTERNAL_GROUPS: Record<string, GroupInput> = {
 };
 
 export type AlfizInternalKey = EntryKeys<(typeof ALFIZ_INTERNAL_BLOCKS)[number]>;
+
+/**
+ * Every key Alfiz itself ships in the reserved namespace — the complete set
+ * of keys allowed to exist there, whatever a catalog declares.
+ */
+const SHIPPED_INTERNAL_KEYS: ReadonlySet<string> = new Set(
+  ALFIZ_INTERNAL_BLOCKS.flatMap((block) => Object.keys(block.leaves)),
+);
 export type AlfizInternalGroupPath = Prefixes<AlfizInternalKey>;
 
 // ---------------------------------------------------------------------------
@@ -740,6 +748,19 @@ export interface ImportManifestEntry {
   keys: readonly PermissionKey[];
   /** Declared wildcards that could not be enumerated (empty when `enumerated`). */
   regions: readonly PermissionPattern[];
+  /**
+   * Whether the source declared this import `strict` — an open region that
+   * admits ONLY the keys it enumerates.
+   *
+   * Carried on the manifest because it was previously not carried anywhere:
+   * `strict` lived in the source module, never on the wire, so every
+   * reconstruction defaulted to permissive. A federated consumer, and
+   * `alfiz-verify` itself, then graded against a *laxer* catalog than the one
+   * the publisher wrote — the strictness silently evaporated at exactly the
+   * boundary it was declared to survive. Absent reads as `false`, which is
+   * how manifests written before this field behave.
+   */
+  strict?: boolean;
 }
 
 /**
@@ -1310,7 +1331,31 @@ export function defineCatalog<const C extends CatalogInput>(
       continue;
     }
     const ns = namespaceOf(key);
-    if (ns !== null && ns !== ALFIZ_INTERNAL_NAMESPACE && !declared.has(ns)) {
+    if (ns === ALFIZ_INTERNAL_NAMESPACE) {
+      // The reserved namespace was exempted from the containment check so
+      // Alfiz's OWN shipped keys could pass it — but the exemption applied to
+      // every key alike, so an application could mint vocabulary inside the
+      // administration namespace. That is not a collision, which is already a
+      // hard error; it is a key `alfiz_internal.*` grants and roles sweep up,
+      // and with `includeAlfizInternal: false` an application could define
+      // `alfiz_internal.access.view_as` outright — the exact key
+      // `assertCanViewAs` gates on. README calls this namespace one that "can
+      // never collide with yours"; only Alfiz declares in it.
+      // Only Alfiz's own keys, and only when Alfiz is the one adding them:
+      // under `includeAlfizInternal: false` nothing in this namespace is
+      // shipped, so any key here came from the application — including, in
+      // the sharpest case, its own `alfiz_internal.access.view_as`, which is
+      // the exact key `assertCanViewAs` gates on.
+      const shipped =
+        input.includeAlfizInternal !== false && SHIPPED_INTERNAL_KEYS.has(key);
+      if (!shipped) {
+        err(
+          key,
+          `${ALFIZ_INTERNAL_NAMESPACE} is reserved for Alfiz itself — an application never declares permissions in it`,
+        );
+        continue;
+      }
+    } else if (ns !== null && !declared.has(ns)) {
       err(
         key,
         `the first segment ${JSON.stringify(ns)} is not a declared namespace — add it to \`namespaces\`; catalogs must be federation-shaped from the first commit`,
@@ -1541,6 +1586,9 @@ export function defineCatalog<const C extends CatalogInput>(
       entries,
       keys: concreteKeys,
       regions: regionPatterns,
+      // Travels with the manifest, so a reconstruction is as strict as the
+      // declaration it reconstructs.
+      strict: spec.strict === true,
     });
   }
 
@@ -1800,18 +1848,28 @@ export function closestPatterns(
   expected: "key" | "pattern",
   limit = 3,
 ): string[] {
+  // `alfiz_internal.*` is reserved vocabulary that ships with every catalog,
+  // so it sits in `catalog.keys` for a deployment that never renders an admin
+  // surface. Suggesting it to a probe from an application namespace answers a
+  // question nobody asked — "does this deployment mount Alfiz's own
+  // administration, and what are its privileged keys called" — from a typo in
+  // `docs.*`. A typo *inside* the reserved namespace still gets its fix.
+  const internalProbe = namespaceOf(value) === ALFIZ_INTERNAL_NAMESPACE;
+  const admissible = (candidate: string): boolean =>
+    internalProbe || namespaceOf(candidate) !== ALFIZ_INTERNAL_NAMESPACE;
+  const catalogKeys = catalog.keys.filter(admissible);
   const candidates: string[] =
     expected === "key"
-      ? catalog.keys
+      ? catalogKeys
       : [
-          ...catalog.keys,
+          ...catalogKeys,
           // Every open region's prefix is registered as a group, so this
           // covers imported subtree patterns too — filtered, because a group
           // wildcard broader than an import is not a storable pattern and
           // must never be offered as a fix.
           ...[...catalog.groups.keys()]
             .map((path) => `${path}.*`)
-            .filter((p) => catalog.isKnownPattern(p)),
+            .filter((p) => admissible(p) && catalog.isKnownPattern(p)),
         ];
   const max = Math.min(4, Math.max(2, Math.floor(value.length / 4)));
   const scored: Array<{ candidate: string; distance: number }> = [];
@@ -1822,7 +1880,7 @@ export function closestPatterns(
   }
   const lastSegment = value.split(".").at(-1);
   if (lastSegment && lastSegment !== "" && !value.includes("*")) {
-    const sameLeaf = catalog.keys.filter(
+    const sameLeaf = catalogKeys.filter(
       (key) =>
         key !== value &&
         key.endsWith(`.${lastSegment}`) &&
@@ -1949,6 +2007,91 @@ export interface CatalogFromDocumentOptions {
   documents?: Record<string, CatalogDocument> | undefined;
 }
 
+/**
+ * The structural rules `defineCatalog` enforces on a literal, applied to a
+ * document instead.
+ *
+ * A published document is not trusted input the way a source module is: it
+ * arrives from a registry, a federated sibling, or a file fetched in CI, and
+ * this is the read path codegen and federation use. Checking only
+ * `formatVersion` meant a document could introduce things `defineCatalog`
+ * calls errors — and two of them are security-relevant rather than merely
+ * malformed:
+ *
+ * - a leaf whose key contains `*` becomes a "key" a gate can check, which is
+ *   the one thing `can` must never do (see `admittingRegion`);
+ * - a leaf outside the document's own namespaces becomes declared
+ *   vocabulary, and declared vocabulary is exactly what a bare `*` grant
+ *   confers — so an injected key rides in on every global grant.
+ *
+ * Duplicate keys mattered too: last-wins silently, and a second entry with a
+ * wider `scopes` list widened where the key could be granted.
+ */
+function assertDocumentStructure(document: CatalogDocument): void {
+  const problems: CatalogIssue[] = [];
+  const err = (path: string, message: string): void => {
+    problems.push({ severity: "error", path, message });
+  };
+  const namespaces = new Set(document.namespaces ?? []);
+  const seen = new Set<string>();
+  const groupPaths = new Set<string>((document.groups ?? []).map((g) => g.path));
+
+  for (const leaf of document.leaves ?? []) {
+    const key = leaf?.key;
+    if (typeof key !== "string") {
+      err(String(key), "every leaf needs a string key");
+      continue;
+    }
+    if (seen.has(key)) {
+      err(key, "is declared twice — a duplicate silently replaces the first");
+      continue;
+    }
+    seen.add(key);
+    const issue = validateKey(key);
+    if (issue !== null) {
+      err(key, issue.reason);
+      continue;
+    }
+    if (key.includes("*")) {
+      err(key, "a permission key is never a wildcard — a gate checks one concrete key");
+      continue;
+    }
+    const ns = namespaceOf(key);
+    if (ns === ALFIZ_INTERNAL_NAMESPACE) continue;
+    if (ns !== null && namespaces.size > 0 && !namespaces.has(ns)) {
+      err(
+        key,
+        `the first segment ${JSON.stringify(ns)} is not one of this document's namespaces — a document declares only what its publisher owns`,
+      );
+    }
+  }
+  for (const key of seen) {
+    if (groupPaths.has(key)) {
+      err(key, "is both a permission and a group path — group levels are folders, never permissions");
+    }
+  }
+
+  // Scope-type parentage must be a forest: a cycle makes ancestor resolution
+  // non-terminating for anything that walks it from a document-built catalog.
+  const parents = new Map<string, string | null>();
+  for (const type of document.scopeTypes ?? []) {
+    parents.set(type.type, type.parent ?? null);
+  }
+  for (const [type] of parents) {
+    const seenTypes = new Set<string>([type]);
+    let current = parents.get(type) ?? null;
+    while (current !== null) {
+      if (seenTypes.has(current)) {
+        err(type, `scope type parentage is cyclic through ${JSON.stringify(current)}`);
+        break;
+      }
+      seenTypes.add(current);
+      current = parents.get(current) ?? null;
+    }
+  }
+  if (problems.length > 0) throw new CatalogError(problems);
+}
+
 export function catalogFromDocument<
   K extends string = string,
   P extends string = string,
@@ -1966,6 +2109,7 @@ export function catalogFromDocument<
       },
     ]);
   }
+  assertDocumentStructure(document);
   // A document written before imports existed carries no `origin`; a
   // document is by definition what its publisher OWNS, so absent reads as
   // owned. Normalized here rather than at every read site.
@@ -2016,9 +2160,11 @@ export function catalogFromDocument<
         label: foreign?.groups.find((g) => g.path === at)?.label,
         description: undefined,
         scopes: wiring?.scopes ?? [],
-        // A reconstructed catalog cannot know the original `strict` flag —
-        // it was never on the wire. Permissive matches the default.
-        strict: false,
+        // The manifest carries `strict` now, so a reconstruction keeps the
+        // posture the publisher declared instead of quietly widening to the
+        // permissive default. Absent (a manifest written before the field)
+        // still reads as permissive, which is what those manifests meant.
+        strict: entry.strict === true,
       });
       groupPaths.add(at);
       for (const prefix of prefixesOf(at)) groupPaths.add(prefix);
@@ -2098,6 +2244,14 @@ export function lintCatalog(catalog: AnyCatalog): CatalogIssue[] {
   if (depth !== "any") {
     for (const leaf of catalog.leaves.values()) {
       if (!owned(leaf)) continue;
+      // Alfiz's own admin keys are three deep and are not the application's
+      // to reshape, so grading them against the application's convention
+      // made the README's own endorsed `conventions: { depth: 2 }` catalog
+      // fail `alfiz-verify` with twelve unfixable errors. The only ways out
+      // were turning off the check or the admin surface — which is how a
+      // verification step stops being run at all. `unreferenced-leaf`
+      // already exempts them.
+      if (namespaceOf(leaf.key) === ALFIZ_INTERNAL_NAMESPACE) continue;
       const actual = leaf.key.split(".").length;
       if (actual !== depth) {
         push(

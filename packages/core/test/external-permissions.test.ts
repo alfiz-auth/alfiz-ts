@@ -180,7 +180,10 @@ describe('externalPermissions: "allow" / "warn"', () => {
     const client = permissive("warn", "zoom.*");
     await client.can({ userId: "u1" }, "zoom.host");
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(String(warn.mock.calls[0]?.[0])).toMatch(/imports: \{ zoom:/);
+    // The namespace is quoted like every other echoed runtime string — the
+    // snippet stays pasteable, and a namespace carrying a newline or an ANSI
+    // escape cannot forge a second log line on its way to a shared sink.
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/imports: \{ "zoom":/);
     warn.mockRestore();
   });
 });

@@ -73,6 +73,7 @@ import {
   AccessDeniedError,
   MissingConditionError,
   UnknownPermissionError,
+  boundEcho,
 } from "./errors.js";
 import type { LooseKey, PermissionKey, PermissionPattern } from "./grammar.js";
 import { namespaceOf, patternMatchesKey } from "./grammar.js";
@@ -82,6 +83,7 @@ import type {
   PrincipalRef,
   SubjectAccessData,
 } from "./provider.js";
+import { principalKind } from "./provider.js";
 import type { LooseScopeId, ScopeId } from "./scopes.js";
 import { GLOBAL_SCOPE, objectClosureOf } from "./scopes.js";
 import type { SnapshotOptions } from "./snapshot.js";
@@ -159,7 +161,18 @@ export interface AlfizClientOptions {
    * it only at authenticated, private cache infrastructure.
    */
   cacheStore?: CacheStore;
-  /** Key prefix for L2 entries. Default "alfiz:v1:". */
+  /**
+   * Key prefix for L2 entries. Defaults to `"alfiz:v1:<catalog>:"`, where
+   * `<catalog>` is a short fingerprint of this catalog's declared
+   * namespaces — so two deployments that happen to share one RESP service
+   * do not read each other's closures.
+   *
+   * The fingerprint is a *separator*, not a secret: it stops an accident,
+   * not an attacker, and the store is inside the trust boundary either way.
+   * Set this explicitly when two deployments share a catalog and must still
+   * be kept apart (per-tenant instances of the same application), and keep
+   * it stable across a rollout — changing it is a cold cache, not an error.
+   */
   cacheKeyPrefix?: string;
   /**
    * Storage TTL (ms) for L2 entries. With epoch revalidation this only
@@ -253,8 +266,39 @@ interface ObjectCacheEntry {
   gen: number;
 }
 
-const principalKey = (p: PrincipalRef): string =>
-  "userId" in p ? `u:${p.userId}` : `s:${p.serviceId}`;
+/**
+ * How many distinct foreign permissions one client reports under
+ * `externalPermissions: "warn"` before it goes quiet. The reported-once set
+ * is keyed by a caller-supplied string, so on a runtime-string check path
+ * its size is chosen by whoever supplies the strings; a process that has
+ * already named this many undeclared permissions has made the point.
+ */
+const EXTERNAL_REPORT_CAP = 1024;
+
+/**
+ * A short, stable tag for a catalog, used to keep two deployments sharing
+ * one L2 store from reading each other's closures. Derived from the declared
+ * namespaces, which is what actually makes two catalogs different vocabulary
+ * — not a hash of the whole document, which would change on every harmless
+ * description edit and cold-start the cache with it.
+ *
+ * A separator, never a credential: FNV-1a, chosen for being short and
+ * dependency-free, and it never has to resist anything.
+ */
+function catalogFingerprint(catalog: AnyCatalog): string {
+  const source = [...catalog.namespaces].sort().join(",");
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < source.length; i++) {
+    hash ^= source.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return hash.toString(36);
+}
+
+const principalKey = (p: PrincipalRef): string => {
+  const who = principalKind(p);
+  return who.kind === "user" ? `u:${who.id}` : `s:${who.id}`;
+};
 
 /** Builds the pure-evaluation context from provider-supplied data. */
 export function toCheckContext(
@@ -374,6 +418,13 @@ export class AlfizClient<
   private readonly strict: boolean;
   private knownSeq: number | null = null;
   private lastValidatedAt = 0;
+  /**
+   * Set when an epoch read fails, cleared on the next one that succeeds.
+   * While it is set, `knownSeq` is a number this process can no longer
+   * vouch for, so the shared cache stops being an answer and the TTLs are
+   * the only bound — which is what the caching page promises for a failure.
+   */
+  private epochUnreadable = false;
   private validationGen = 0;
   private revalidating: Promise<void> | null = null;
   private readonly cacheStore: CacheStore | undefined;
@@ -388,7 +439,16 @@ export class AlfizClient<
   private readonly isUndeclared: (key: PermissionKey) => boolean;
   private readonly externalPermissions: "error" | "warn" | "allow";
   private readonly onExternalPermission: (info: ExternalPermissionInfo) => void;
-  /** Reported-once set, so a render loop warns once rather than per row. */
+  /**
+   * Reported-once set, so a render loop warns once rather than per row.
+   *
+   * Capped, because the key is a caller-supplied string: on a runtime-string
+   * check path the set is an attacker-sized structure in a long-lived
+   * process, and the "once" it buys is an ergonomic, not a guarantee. At the
+   * cap it stops growing and reporting rather than evicting — a process that
+   * has already logged {@link EXTERNAL_REPORT_CAP} distinct foreign
+   * permissions has made the point.
+   */
   private readonly reportedExternal = new Set<string>();
   /** `null` when metrics are off — the branch every check path tests first. */
   private readonly recorder: MetricsRecorder | null;
@@ -411,7 +471,8 @@ export class AlfizClient<
         : (options.revalidateAfterMs ??
           (options.provider.epoch !== undefined ? 5_000 : undefined));
     this.cacheStore = options.cacheStore;
-    this.cachePrefix = options.cacheKeyPrefix ?? "alfiz:v1:";
+    this.cachePrefix =
+      options.cacheKeyPrefix ?? `alfiz:v1:${catalogFingerprint(this.catalog)}:`;
     this.cacheStoreTtl =
       options.cacheStoreTtlMs ??
       (this.revalidateAfter !== undefined
@@ -428,12 +489,19 @@ export class AlfizClient<
     this.externalPermissions = options.externalPermissions ?? "error";
     this.onExternalPermission =
       options.onExternalPermission ??
-      ((info) =>
+      ((info) => {
+        // Both halves are the caller's runtime string — this warning exists
+        // precisely for the paths where the permission did not come from a
+        // literal — so both are quoted and bounded before they reach a log
+        // sink that is very often shared and very often tailed.
+        const permission = JSON.stringify(boundEcho(info.permission));
+        const namespace = JSON.stringify(boundEcho(info.namespace ?? ""));
         console.warn(
-          `alfiz: ${JSON.stringify(info.permission)} is in namespace ${JSON.stringify(info.namespace)}, ` +
+          `alfiz: ${permission} is in namespace ${namespace}, ` +
             `which this catalog neither owns nor imports — evaluated because \`externalPermissions\` is not "error". ` +
-            `Declare it: imports: { ${info.namespace}: { permissions: { ${JSON.stringify(info.permission)}: true } } }`,
-        ));
+            `Declare it: imports: { ${namespace}: { permissions: { ${permission}: true } } }`,
+        );
+      });
     this.recorder =
       options.metrics === undefined ? null : new MetricsRecorder(options.metrics);
 
@@ -629,6 +697,7 @@ export class AlfizClient<
   private async revalidate(epoch: NonNullable<AlfizProvider["epoch"]>): Promise<void> {
     try {
       const head = await epoch.head();
+      this.epochUnreadable = false;
       if (this.knownSeq === null) {
         // First contact happens before anything can be cached (this gate
         // precedes every cached read), so there is nothing to catch up on.
@@ -680,6 +749,13 @@ export class AlfizClient<
       // renews nothing, so entries lapse on their original TTL and the
       // next miss pays a full provider fetch. Retry next window.
       this.lastValidatedAt = this.now();
+      // ...and the L2 goes cold for the duration. `knownSeq` is frozen at
+      // whatever it was when the epoch went away, so the "written under the
+      // current head" test below would keep saying yes to a pre-revocation
+      // envelope forever — re-populating L1 on every lapse and re-serving it
+      // in a loop, bounded only by the shared store's own TTL. That is the
+      // opposite of the documented fallback.
+      this.epochUnreadable = true;
     }
   }
 
@@ -697,12 +773,23 @@ export class AlfizClient<
   }): boolean {
     if (envelope.v !== 1) return false;
     if (this.revalidateAfter !== undefined && this.provider.epoch !== undefined) {
+      // While the epoch is unreadable, `knownSeq` is a number we can no
+      // longer vouch for, so it proves nothing about this envelope.
+      if (this.epochUnreadable) return false;
       // Strict rule: written under exactly the current head, else discard.
       // Still a hit whenever writes are quiet — the common case. (A finer
       // rule could replay events between envelope.seq and knownSeq against
       // just this entry; start strict, it is trivially correct.)
+      //
+      // The wall-clock bound is checked TOO, not instead: seq equality says
+      // "no writes since", and `freshUntil` says "and not so long ago that
+      // the stated bound has lapsed". Either one alone leaves an envelope
+      // servable past a documented window.
       return (
-        typeof envelope.seq === "number" && envelope.seq === this.knownSeq
+        typeof envelope.seq === "number" &&
+        envelope.seq === this.knownSeq &&
+        typeof envelope.freshUntil === "number" &&
+        envelope.freshUntil > this.now()
       );
     }
     return (
@@ -717,6 +804,25 @@ export class AlfizClient<
     void store
       .set(key, JSON.stringify(envelope), this.cacheStoreTtl)
       .catch((error) => this.onCacheStoreError?.(error));
+  }
+
+  /**
+   * Whether an L2 payload is about the principal its key names. `cacheKey`
+   * is `u:<userId>` or `s:<serviceId>` (see `principalKey`); a user payload
+   * carries that `userId`, and a service payload carries `userId: null` and
+   * its own subject in the closure.
+   */
+  private l2PayloadMatches(cacheKey: string, data: SubjectAccessData): boolean {
+    if (cacheKey.startsWith("u:")) {
+      return data.userId === cacheKey.slice(2);
+    }
+    if (cacheKey.startsWith("s:")) {
+      return (
+        data.userId === null &&
+        data.closure.includes(`service:${cacheKey.slice(2)}`)
+      );
+    }
+    return false;
   }
 
   private async subjectFromL2(
@@ -734,6 +840,14 @@ export class AlfizClient<
         data?: SubjectAccessData;
       };
       if (!this.l2Fresh(envelope) || envelope.data === undefined) return null;
+      // The envelope must be about the principal we asked for. The shared
+      // store is inside the trust boundary — whoever can write to it can
+      // grant themselves access, and `cache.ts` says so — but a key layout
+      // that changed between releases, a half-finished migration, or a
+      // co-tenant sharing one RESP service are all *accidents*, and this
+      // module promises that anything unparseable or mismatched is "a miss,
+      // never an answer". A payload naming someone else is a mismatch.
+      if (!this.l2PayloadMatches(cacheKey, envelope.data)) return null;
       this.storeSubject(cacheKey, {
         data: envelope.data,
         expiresAt: this.now() + this.subjectTtl,
@@ -921,22 +1035,61 @@ export class AlfizClient<
     expected: "key" | "pattern",
     shape: PermissionSite,
   ): void {
-    const context = unknownPermissionContext(this.catalog, permission, expected);
+    // Built lazily. `unknownPermissionContext` runs a bounded edit-distance
+    // scan over every catalog key and group wildcard — fine on the throwing
+    // branch, which ends the request, but this method is also the *steady
+    // state* under `externalPermissions: "warn"`, where the same foreign key
+    // arrives on every render. Computing it before deciding put an O(catalog)
+    // scan on a path that then discarded it: ~16ms per check on a 4,000-key
+    // catalog, and the once-per-permission dedupe below saved none of it.
+    const contextOnce = () =>
+      unknownPermissionContext(this.catalog, permission, expected);
+    // A gate asks about one concrete key, and a wildcard is never one —
+    // whatever the external-permission policy says. `Catalog.admittingRegion`
+    // makes exactly this check for the keys it owns ("which would let a gate
+    // check a wildcard, the one thing `can` must never do"); this is the
+    // other door into evaluation, the one built for the runtime-string paths,
+    // and it has to hold the same line. Admitting one silently rewrites the
+    // question from "may this principal do X" to "does this principal hold a
+    // wildcard covering X" — which passes for the broadly-privileged
+    // reviewers and denies the users the gate was written for.
+    if (expected === "key" && permission.includes("*")) {
+      throw new UnknownPermissionError({
+        permission,
+        expected,
+        ...contextOnce(),
+      });
+    }
     const namespace = namespaceOf(permission);
-    const enumeratedImport =
-      namespace !== null && this.catalog.imports.get(namespace)?.enumerated;
+    const importEntry =
+      namespace === null ? undefined : this.catalog.imports.get(namespace);
+    const enumeratedImport = importEntry?.enumerated;
+    // The origin is the only part of the context this decision needs, and it
+    // is three lookups — the same derivation `unknownPermissionContext` does
+    // before it starts scanning. The scan is for the MESSAGE, so it happens
+    // only where a message is about to exist.
+    const namespaceOrigin =
+      importEntry !== undefined
+        ? "imported"
+        : namespace !== null && this.catalog.namespaces.includes(namespace)
+          ? "owned"
+          : "foreign";
     const admissible =
       this.externalPermissions !== "error" &&
-      context.namespaceOrigin === "foreign" &&
+      namespaceOrigin === "foreign" &&
       namespace !== null;
     if (!admissible || enumeratedImport === true) {
       throw new UnknownPermissionError({
         permission,
         expected,
-        ...context,
+        ...contextOnce(),
       });
     }
-    if (this.externalPermissions === "warn" && !this.reportedExternal.has(permission)) {
+    if (
+      this.externalPermissions === "warn" &&
+      !this.reportedExternal.has(permission) &&
+      this.reportedExternal.size < EXTERNAL_REPORT_CAP
+    ) {
       this.reportedExternal.add(permission);
       this.onExternalPermission({ permission, expected, namespace, shape });
     }
